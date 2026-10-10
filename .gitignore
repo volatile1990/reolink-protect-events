@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+config.json
+*.sqlite*
+health.json
+deployment.json
+*.jpg
+*.jpeg
+*.mp4
+.env
+secrets/
+backups/
+features.json
+feature-deployment.json
