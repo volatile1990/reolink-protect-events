@@ -197,10 +197,65 @@ class NativeContractTests(unittest.TestCase):
         self.assertNotIn("coord", thumbs[0])
         self.assertIn("jsonb_array_length", sql)
         self.assertIn('COALESCE(events."thumbnailFullfovId",EXCLUDED."thumbnailFullfovId")', sql)
+        # The timeline's false/NULL selector and full-FoV's true selector must
+        # resolve independently; one full-FoV row cannot serve both routes.
+        self.assertEqual(sql.count("INSERT INTO thumbnails"), 2)
+        self.assertEqual(sql.count(JPEG.hex()), 2)
+        self.assertIn(sql_text(native_id("preview-thumbnail", START, INTERVAL["eventId"])), sql)
+        self.assertNotEqual(native_id("preview-thumbnail", START, INTERVAL["eventId"]),
+                            thumbs[0]["croppedId"])
+        self.assertEqual(event["thumbnailFullfov"], thumbs[0]["croppedId"])
         for thumbnail in (Thumbnail(b"not a JPEG", START), Thumbnail(JPEG, START, width=999),
                           Thumbnail(JPEG[:-2], START), Thumbnail(JPEG, True)):
             with self.assertRaises(ValueError):
                 adapter().build_interval_sql(INTERVAL, thumbnail)
+
+    def test_preview_repair_plan_is_readonly_and_bounded(self):
+        candidate = {"eventId": INTERVAL["eventId"], "cameraId": INTERVAL["cameraId"],
+                     "start": START, "fullfovId": native_id("thumbnail", START, INTERVAL["eventId"])}
+        seen = []
+        def execute(sql):
+            seen.append(sql)
+            return json.dumps(schema_fixture() if "information_schema" in sql else [candidate])
+        db = adapter(execute)
+        self.assertEqual(db.preview_repair_candidates(64), [candidate])
+        self.assertIn("BEGIN READ ONLY", seen[-1])
+        self.assertIn("ROLLBACK", seen[-1])
+        self.assertNotIn("INSERT ", seen[-1])
+        for limit in (0, 257, True, "128"):
+            with self.assertRaises(ValueError):
+                db.preview_repair_candidates(limit)
+
+    def test_preview_repair_copies_existing_bytes_and_preserves_detection(self):
+        candidate = {"eventId": INTERVAL["eventId"], "cameraId": INTERVAL["cameraId"],
+                     "start": START, "fullfovId": native_id("thumbnail", START, INTERVAL["eventId"])}
+        sql = adapter().build_preview_repair_sql(candidate)
+        self.assertIn("FOR UPDATE OF e", sql)
+        self.assertIn("reolinkProtectEvents", sql)
+        self.assertIn('e."deletedAt" IS NULL', sql)
+        self.assertIn("f.timestamp,f.content,NULL", sql)
+        self.assertIn("(e.locked OR f.locked)", sql)
+        self.assertNotIn("INSERT INTO events", sql)
+        self.assertNotIn("DELETE ", sql)
+        self.assertNotIn('INSERT INTO "smartDetectObjects"', sql)
+        update = sql.split("UPDATE events e SET", 1)[1].split("SELECT json_build_object", 1)[0]
+        for field in ("start=", '"end"=', "metadata=", "locked=", '"smartDetectTypes"=', '"thumbnailFullfovId"='):
+            self.assertNotIn(field, update)
+        with self.assertRaises(ValueError):
+            adapter().build_preview_repair_sql(dict(candidate, fullfovId="x'; DELETE FROM events;"))
+
+    def test_preview_repair_does_not_resurrect_concurrently_retired_event(self):
+        candidate = {"eventId": INTERVAL["eventId"], "cameraId": INTERVAL["cameraId"],
+                     "start": START, "fullfovId": native_id("thumbnail", START, INTERVAL["eventId"])}
+        seen = []
+        def execute(sql):
+            seen.append(sql)
+            return json.dumps(schema_fixture()) if "information_schema" in sql else "\n"
+        self.assertIsNone(adapter(execute).repair_preview_thumbnail(candidate))
+        self.assertNotIn("INSERT INTO events", seen[-1])
+        for bad in (dict(candidate, eventId="../event"), dict(candidate, start=True)):
+            with self.assertRaises(ValueError):
+                adapter().repair_preview_thumbnail(bad)
 
     def test_actual_db_result_drives_ds_representation(self):
         db_result = {"id": INTERVAL["eventId"], "end": START + 1000,

@@ -312,13 +312,15 @@ ROLLBACK;
         event = {"id": event_id, "modelKey": "event", "type": "smartDetectZone",
                  "camera": camera_id, "start": start, "end": end, "score": None,
                  "smartDetectTypes": classes, "metadata": metadata,
-                 "thumbnail": "e-" + event_id, "heatmap": "e-" + event_id}
+                 "thumbnail": "e-" + event_id, "thumbnailFullfov": None,
+                 "heatmap": "e-" + event_id}
         eid, cid = sql_text(event_id), sql_text(camera_id)
         owner_predicate = "metadata::jsonb->'reolinkProtectEvents'->>'owner'=" + sql_text(OWNER)
         class_sql = _sql_json(classes)
         objects = {kind: native_id("object", start, event_id + ":" + kind) for kind in classes}
         tid = native_id("track", start, event_id)
         thumb_id = None
+        preview_id = None
         lines = ["BEGIN;", "SET LOCAL statement_timeout = '10s';",
                  "SET LOCAL lock_timeout = '2s';",
                  "SELECT pg_advisory_xact_lock(hashtextextended(%s,0));" % sql_text(OWNER + ":" + event_id),
@@ -332,10 +334,19 @@ ROLLBACK;
         if thumbnail:
             width, height = thumbnail.dimensions()
             thumb_id = native_id("thumbnail", start, event_id)
+            preview_id = native_id("preview-thumbnail", start, event_id)
+            event["thumbnailFullfov"] = thumb_id
             sid = sql_text(thumb_id)
             lines.append("INSERT INTO thumbnails (id,\"cameraId\",\"eventId\",width,height,timestamp,content,\"isFullfov\",locked,\"createdAt\",\"updatedAt\")\n"
                 "VALUES (%s,%s,NULL,%d,%d,%d,decode('%s','hex'),true,false,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)\n"
                 "ON CONFLICT (id) DO NOTHING;" % (sid, cid, width, height, thumbnail.timestamp, thumbnail.content.hex()))
+            # Protect's default timeline route selects isFullfov=false OR NULL;
+            # its full-FoV route selects true. NULL uses the existing default
+            # preview branch without claiming a measured object crop. Both
+            # variants contain the genuine recorded full-frame JPEG.
+            lines.append("INSERT INTO thumbnails (id,\"cameraId\",\"eventId\",width,height,timestamp,content,\"isFullfov\",locked,\"createdAt\",\"updatedAt\")\n"
+                "VALUES (%s,%s,NULL,%d,%d,%d,decode('%s','hex'),NULL,false,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)\n"
+                "ON CONFLICT (id) DO NOTHING;" % (sql_text(preview_id), cid, width, height, thumbnail.timestamp, thumbnail.content.hex()))
             metadata["detectedThumbnails"] = [{"objectId": objects[kind], "clockBestWall": thumbnail.timestamp,
                 "type": kind, "croppedId": thumb_id, "attributes": {"objectType": kind, "zone": [1], "adapterVirtualZone": True}}
                 for kind in classes]
@@ -343,15 +354,17 @@ ROLLBACK;
         # finished interval, unlock an operator's favorite, or reset deletedAt.
         end_sql = "NULL" if end is None else str(end)
         thumb_sql = "NULL" if thumb_id is None else sql_text(thumb_id)
+        preview_sql = "NULL" if preview_id is None else sql_text(preview_id)
         lines.append("INSERT INTO events (id,type,start,\"end\",\"cameraId\",score,\"smartDetectTypes\",metadata,locked,\"thumbnailId\",\"thumbnailFullfovId\",\"createdAt\",\"updatedAt\")\n"
             "VALUES (%s,'smartDetectZone',%d,%s,%s,NULL,%s,%s,false,%s,%s,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)\n"
             "ON CONFLICT (id) DO UPDATE SET \"end\"=CASE WHEN EXCLUDED.\"end\" IS NULL THEN events.\"end\" ELSE GREATEST(events.\"end\",EXCLUDED.\"end\") END,\n"
             "metadata=((events.metadata::jsonb || EXCLUDED.metadata::jsonb) || jsonb_build_object('detectedThumbnails',CASE WHEN jsonb_array_length(COALESCE(events.metadata::jsonb->'detectedThumbnails','[]'::jsonb))>0 THEN events.metadata::jsonb->'detectedThumbnails' ELSE EXCLUDED.metadata::jsonb->'detectedThumbnails' END,'zonesStatus',jsonb_build_object('1',jsonb_build_object('status',CASE WHEN events.\"end\" IS NOT NULL OR EXCLUDED.\"end\" IS NOT NULL THEN 'leave' ELSE 'enter' END))))::json,\n"
-            "\"thumbnailId\"=COALESCE(events.\"thumbnailId\",EXCLUDED.\"thumbnailId\"),\"thumbnailFullfovId\"=COALESCE(events.\"thumbnailFullfovId\",EXCLUDED.\"thumbnailFullfovId\"),\"updatedAt\"=CURRENT_TIMESTAMP;"
-            % (eid, start, end_sql, cid, class_sql, _sql_json(metadata), thumb_sql, thumb_sql))
+            "\"thumbnailId\"=CASE WHEN events.\"thumbnailId\" IS NULL OR (events.\"thumbnailId\"=events.\"thumbnailFullfovId\" AND events.\"thumbnailId\"=EXCLUDED.\"thumbnailFullfovId\") THEN EXCLUDED.\"thumbnailId\" ELSE events.\"thumbnailId\" END,\"thumbnailFullfovId\"=COALESCE(events.\"thumbnailFullfovId\",EXCLUDED.\"thumbnailFullfovId\"),\"updatedAt\"=CURRENT_TIMESTAMP;"
+            % (eid, start, end_sql, cid, class_sql, _sql_json(metadata), preview_sql, thumb_sql))
         if thumb_id:
-            lines.append("UPDATE thumbnails SET \"eventId\"=%s WHERE id=%s AND \"cameraId\"=%s AND (\"eventId\" IS NULL OR \"eventId\"=%s);"
-                         % (eid, sql_text(thumb_id), cid, eid))
+            for variant_id in (thumb_id, preview_id):
+                lines.append("UPDATE thumbnails SET \"eventId\"=%s WHERE id=%s AND \"cameraId\"=%s AND (\"eventId\" IS NULL OR \"eventId\"=%s);"
+                             % (eid, sql_text(variant_id), cid, eid))
         label_names = ["eventType:smartDetectZone", "camera:" + camera_id, "zone:" + camera_id + ":1"]
         label_names += ["smartDetectType:" + kind for kind in classes]
         for name in label_names:
@@ -382,7 +395,7 @@ ROLLBACK;
         for kind, oid in objects.items():
             names = [name for name in label_names if not name.startswith("smartDetectType:")]
             lines.append(detection_label(oid, names + ["smartDetectType:" + kind]))
-        lines.append("SELECT json_build_object('id',id,'modelKey','event','type',type,'camera',\"cameraId\",'start',start,'end',\"end\",'score',score,'smartDetectTypes',\"smartDetectTypes\",'metadata',metadata,'thumbnail','e-'||id,'heatmap','e-'||id) FROM events WHERE id=%s;" % eid)
+        lines.append("SELECT json_build_object('id',id,'modelKey','event','type',type,'camera',\"cameraId\",'start',start,'end',\"end\",'score',score,'smartDetectTypes',\"smartDetectTypes\",'metadata',metadata,'thumbnail','e-'||id,'thumbnailFullfov',\"thumbnailFullfovId\",'heatmap','e-'||id) FROM events WHERE id=%s;" % eid)
         lines.append("COMMIT;")
         return "\n".join(lines) + "\n", event
 
@@ -392,6 +405,86 @@ ROLLBACK;
         event = _read_json_output(self.execute(sql))
         if not isinstance(event, dict) or event.get("id") != interval["eventId"]:
             raise NativeError("Native event persistence returned an unexpected identity")
+        return event
+
+    def preview_repair_candidates(self, limit=128):
+        """List live owned events missing the default thumbnail variant."""
+        if type(limit) is not int or not 1 <= limit <= 256:
+            raise ValueError("Invalid preview repair limit")
+        self._ensure_guard()
+        sql = """BEGIN READ ONLY;
+SET LOCAL statement_timeout='10s';
+SELECT COALESCE(jsonb_agg(jsonb_build_object('eventId',r.id,'cameraId',r."cameraId",
+ 'start',r.start,'fullfovId',r."thumbnailFullfovId")),'[]'::jsonb) FROM (
+ SELECT e.id,e."cameraId",e.start,e."thumbnailFullfovId" FROM events e
+ JOIN thumbnails f ON f.id=e."thumbnailFullfovId" AND f."eventId"=e.id AND f."cameraId"=e."cameraId"
+ WHERE e.metadata::jsonb->'reolinkProtectEvents'->>'owner'=%s
+ AND e.type='smartDetectZone' AND e."deletedAt" IS NULL AND f."isFullfov" IS TRUE
+ AND octet_length(f.content) BETWEEN 1 AND 2097152
+ AND (e."thumbnailId" IS NULL OR e."thumbnailId"=e."thumbnailFullfovId")
+ AND NOT EXISTS (SELECT 1 FROM thumbnails p WHERE p."eventId"=e.id
+  AND (p."isFullfov" IS NULL OR p."isFullfov" IS FALSE) AND p.content IS NOT NULL)
+ ORDER BY e.start LIMIT %d) r;
+ROLLBACK;
+""" % (sql_text(OWNER), limit)
+        result = _read_json_output(self.execute(sql))
+        if not isinstance(result, list):
+            raise NativeError("Unexpected preview repair plan")
+        return result
+
+    def build_preview_repair_sql(self, candidate):
+        """Copy existing real bytes without changing the detection graph."""
+        eid = sql_text(_identifier(candidate.get("eventId"), "eventId"))
+        cid = sql_text(_identifier(candidate.get("cameraId"), "cameraId"))
+        start = _millis(candidate.get("start"), "start")
+        fid = sql_text(_identifier(candidate.get("fullfovId"), "fullfovId"))
+        pid = sql_text(native_id("preview-thumbnail", start, candidate["eventId"]))
+        owner = sql_text(OWNER)
+        return """BEGIN;
+SET LOCAL statement_timeout='10s';
+SET LOCAL lock_timeout='2s';
+SELECT pg_advisory_xact_lock(hashtextextended(%s,0));
+WITH eligible AS (
+ SELECT e.id,e."cameraId",e.locked FROM events e
+ WHERE e.id=%s AND e."cameraId"=%s AND e.start=%d AND e."thumbnailFullfovId"=%s
+ AND e.type='smartDetectZone' AND e."deletedAt" IS NULL
+ AND e.metadata::jsonb->'reolinkProtectEvents'->>'owner'=%s
+ AND (e."thumbnailId" IS NULL OR e."thumbnailId"=e."thumbnailFullfovId")
+ FOR UPDATE OF e
+), inserted AS (
+ INSERT INTO thumbnails (id,"cameraId","eventId",width,height,timestamp,content,"isFullfov",locked,"createdAt","updatedAt")
+ SELECT %s,e."cameraId",e.id,f.width,f.height,f.timestamp,f.content,NULL,(e.locked OR f.locked),CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
+ FROM eligible e JOIN thumbnails f ON f.id=%s AND f."eventId"=e.id AND f."cameraId"=e."cameraId"
+ WHERE f."isFullfov" IS TRUE AND octet_length(f.content) BETWEEN 1 AND 2097152
+ ON CONFLICT (id) DO NOTHING RETURNING "eventId"
+)
+UPDATE events e SET "thumbnailId"=%s,"updatedAt"=CURRENT_TIMESTAMP
+ WHERE e.id IN (SELECT "eventId" FROM inserted);
+SELECT json_build_object('id',e.id,'modelKey','event','type',e.type,'camera',e."cameraId",
+ 'start',e.start,'end',e."end",'score',e.score,'smartDetectTypes',e."smartDetectTypes",'metadata',e.metadata,
+ 'thumbnail','e-'||e.id,'thumbnailFullfov',e."thumbnailFullfovId",'heatmap','e-'||e.id)
+ FROM events e WHERE e.id=%s AND e."cameraId"=%s AND e.start=%d AND e."deletedAt" IS NULL
+ AND e.metadata::jsonb->'reolinkProtectEvents'->>'owner'=%s AND e."thumbnailId"=%s
+ AND EXISTS (SELECT 1 FROM thumbnails p WHERE p.id=%s AND p."eventId"=e.id
+  AND p."cameraId"=e."cameraId" AND (p."isFullfov" IS NULL OR p."isFullfov" IS FALSE));
+COMMIT;
+""" % (sql_text(OWNER + ":" + candidate["eventId"]), eid, cid, start, fid, owner,
+       pid, fid, pid, eid, cid, start, owner, pid, pid)
+
+    def repair_preview_thumbnail(self, candidate):
+        sql = self.build_preview_repair_sql(candidate)
+        self._ensure_guard()
+        output = self.execute(sql)
+        # A concurrent retention removal or operator thumbnail change can make
+        # the guarded UPDATE/SELECT empty. Nothing may resurrect that event.
+        try:
+            event = _read_json_output(output)
+        except NativeError:
+            if output.strip() == "":
+                return None
+            raise
+        if not isinstance(event, dict) or event.get("id") != candidate["eventId"]:
+            raise NativeError("Unexpected repaired preview identity")
         return event
 
     def delete_owned_event(self, event_id):

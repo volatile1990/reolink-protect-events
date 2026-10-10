@@ -13,7 +13,7 @@ flowchart LR
     J --> P[Atomic Protect PostgreSQL event + object + search labels]
     P --> D[Loopback updates-ds native event lifecycle]
     D --> U[Protect timeline, Find Anything and native alarm processing]
-    V[Existing Protect recording] -->|historical snapshot at source time| T[Native detection thumbnail]
+    V[Existing Protect recording] -->|historical snapshot at source time| T[Native preview and full-frame thumbnails]
     T --> P
 ```
 
@@ -33,6 +33,8 @@ For outdoor cameras configure the bridge's `onvif.motion_event_policy` as `none`
 Repeated pushes extend the same class interval. Clear pushes close it. Camera reconnects, bridge restarts, replay gaps and the configured stale timeout close the previous interval with an explicit reason. Simultaneous different classes get separate native intervals. Timestamps refer to the bridge's UTC receipt of the camera push, retaining the original .NET timestamp in provenance.
 
 The camera does not supply confidence, object coordinates, embeddings or spatial tracks through this bridge. Those fields are omitted. Protect's native search accepts unknown confidence, including with its default 30% filter. Thumbnails show the recorded full frame, without fabricated boxes. Zone 1 is explicitly an adapter integration rule covering the whole camera, not a claim about a Reolink spatial zone. Facial identification, license plate attributes, re-identification and line crossing are outside this source contract.
+
+Protect's timeline preview and full-frame view use separate thumbnail lookups. Each imported snapshot therefore has two independent thumbnail IDs linked to the same event: a default preview row (`isFullfov=NULL`, accepted by Protect as the standard preview) and a full-frame row (`isFullfov=true`). Both retain the same recorded full-frame JPEG and its actual dimensions. The preview row does not claim a detected object crop; Protect can fit the full frame into its small timeline tile. `events.thumbnailId` references the preview, while `events.thumbnailFullfovId` references the full frame. Find Anything's `detectedThumbnails[].croppedId` remains a reference to the recorded image, without invented spatial coordinates.
 
 ## Deployment
 
@@ -54,17 +56,28 @@ Enable `none` on outdoor bridges **after** verifying the native path. The featur
 
 Persistent deployment directory: `/data/reolink-protect-events`. Service: `reolink-protect-native-events.service`. Releases are addressed by package hash. The SQLite source journal, outbox and retry state survive service restarts. `health.json` distinguishes healthy capture from healthy native delivery and includes per-camera poll health, import retries, replay gaps and thumbnail failures.
 
-An optional read-only check for a **real** already imported event verifies its class filters, graph, thumbnail, track response and selected camera flags:
+An optional read-only check for a **real** already imported event verifies its class filters, graph, both thumbnail paths, track response and selected camera flags:
 
 ```console
 python tools/verify_native.py --event-id YOUR_NATIVE_EVENT_ID --camera-id YOUR_CAMERA_ID
 ```
+
+Use `--expected-class animal` or `--expected-class vehicle` for a corresponding real camera detection; the default is `person`. The check requires HTTP 200 and a non-empty JPEG with positive image dimensions from `/api/events/<id>/thumbnail?w=48&h=48`, the same path with `isFullfov=false`, and `/api/events/<id>/thumbnail?isFullfov=true`. The JSON fields `timelineThumbnailApi` and `timelineThumbnailExplicitApi` report the standard previews; the existing `thumbnailApi` field continues to report the full-frame image. The tool saves no images and performs only API GET requests and database read-only queries. Protect may populate its own thumbnail cache when serving a GET.
 
 Never publish credentials, camera images, recordings, the SQLite journal or full console/bootstrap responses. Synthetic fixtures in `tests/` are offline only; production validation must use independently verified camera-originated evidence.
 
 ## Recovery and operational limits
 
 `python tools/deploy.py rollback` restores the prior service/config release without replacing the journal. `python tools/enable_features.py rollback` restores the backed-up UI and camera fields only if ownership/hash/current-value checks still match; restart Protect afterward. Restore the prior outdoor bridge policies when reverting to a deployment without native imports. Existing recordings and operator favorites are never deleted by deployment.
+
+For events imported before the separate timeline preview was added, review and apply the preview repair:
+
+```console
+python tools/repair_previews.py plan
+python tools/repair_previews.py apply
+```
+
+The repair supplies the missing default preview from the existing recorded JPEG while preserving the full-frame thumbnail and source classification. Run `tools/verify_native.py` for a real affected event afterward to check both API image paths.
 
 Native graph writes are transactional and use deterministic event IDs. A failed event retries with backoff without blocking other cameras. Delivery to the DS WebSocket has no application ACK: a crash after acceptance can repeat a notification or custom alarm action, although the stored event remains unique. Updates and late thumbnails do not resurrect events already purged or deleted by Protect. Imported graphs use Protect's existing retention/foreign-key relationships; the separate source journal retains 30 days.
 

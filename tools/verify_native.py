@@ -25,13 +25,37 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
  def redirect_request(self,*args): raise RuntimeError('redirect_rejected')
 op=urllib.request.build_opener(urllib.request.ProxyHandler({}),NoRedirect(),
  urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
+def jpeg_dimensions(raw):
+ if raw[:2]!=b'\xff\xd8' or raw[-2:]!=b'\xff\xd9': return None
+ pos=2
+ while pos<len(raw):
+  if raw[pos]!=0xff: return None
+  while pos<len(raw) and raw[pos]==0xff: pos+=1
+  if pos>=len(raw): return None
+  marker=raw[pos];pos+=1
+  if marker in (0xda,0xd9): return None
+  if marker==0x01 or 0xd0<=marker<=0xd8: continue
+  if pos+2>len(raw): return None
+  size=int.from_bytes(raw[pos:pos+2],'big')
+  if size<2 or pos+size>len(raw): return None
+  if marker in (0xc0,0xc1,0xc2,0xc3,0xc5,0xc6,0xc7,0xc9,0xca,0xcb,0xcd,0xce,0xcf):
+   if size<8: return None
+   height=int.from_bytes(raw[pos+3:pos+5],'big')
+   width=int.from_bytes(raw[pos+5:pos+7],'big')
+   return {'width':width,'height':height} if width>0 and height>0 else None
+  pos+=size
+ return None
+
 def get(path,binary=False):
  req=urllib.request.Request('https://127.0.0.1:7443'+path,headers=headers,method='GET')
  try:
   with op.open(req,timeout=15) as r:
    raw=r.read(10000001)
    if len(raw)>10000000: raise RuntimeError('response_limit')
-   if binary: return {'status':r.status,'bytes':len(raw),'sha256':hashlib.sha256(raw).hexdigest(),'contentType':r.headers.get('Content-Type')}
+   if binary:
+    dimensions=jpeg_dimensions(raw)
+    return {'status':r.status,'bytes':len(raw),'sha256':hashlib.sha256(raw).hexdigest(),'contentType':r.headers.get('Content-Type'),
+     'isJpeg':dimensions is not None,'dimensions':dimensions}
    return {'status':r.status,'body':json.loads(raw)}
  except urllib.error.HTTPError as e: return {'status':e.code,'body':None}
 def text(value): return "convert_from(decode('"+str(value).encode().hex()+"','hex'),'UTF8')"
@@ -98,6 +122,8 @@ graph=sql("""SELECT json_build_object(
  'deleted',(SELECT "deletedAt" IS NOT NULL FROM events WHERE id="""+eid+"""),
  'foreignKeys',COALESCE((SELECT json_agg(json_build_object('table',r.relname,'name',p.conname,'definition',pg_get_constraintdef(p.oid))) FROM pg_constraint p JOIN pg_class r ON r.oid=p.conrelid JOIN pg_namespace n ON n.oid=r.relnamespace WHERE p.contype='f' AND n.nspname='public' AND r.relname IN ("""+table_sql+""")),'[]'::json));""")
 thumb_result=get('/api/events/'+event_id+'/thumbnail?isFullfov=true',binary=True)
+timeline_thumb_result=get('/api/events/'+event_id+'/thumbnail?w=48&h=48',binary=True)
+timeline_explicit_result=get('/api/events/'+event_id+'/thumbnail?w=48&h=48&isFullfov=false',binary=True)
 tracks_result=get('/api/events/'+event_id+'/smartDetectTrack')
 tracks_body=tracks_result.get('body') or {}
 tracks_summary={'status':tracks_result['status'],'samples':len(tracks_body.get('payload',[])),'event':tracks_body.get('event'),'camera':tracks_body.get('camera')}
@@ -105,9 +131,12 @@ objects=graph.get('objects',[])
 positive=all(s['status']==200 and s['found'] for s in searches if s['class'] in expected_types)
 negative=all(s['status']==200 and not s['found'] for s in searches if s['class'] not in expected_types)
 true_graph=(graph['eventRows']==1 and sorted(o['type'] for o in objects)==expected_types and graph['spatialAreaRows']==0 and all(not o['confidenceKeyPresent'] and not o['spatialCoordPresent'] for o in objects))
-ok=(positive and negative and true_graph and event.get('type')=='smartDetectZone' and sorted(event.get('smartDetectTypes',[]))==expected_types and graph['readOnly']=='on' and event_filter['found'] and not graph['deleted'])
+def valid_thumbnail(result): return result.get('status')==200 and result.get('bytes',0)>0 and result.get('isJpeg') is True
+thumbnail_paths_valid=all(valid_thumbnail(result) for result in (thumb_result,timeline_thumb_result,timeline_explicit_result))
+ok=(positive and negative and true_graph and event.get('type')=='smartDetectZone' and sorted(event.get('smartDetectTypes',[]))==expected_types and graph['readOnly']=='on' and event_filter['found'] and not graph['deleted'] and thumbnail_paths_valid)
 print(json.dumps({'ok':ok,'event':event_summary,'eventApiStatus':event_result['status'],'eventFilteredApi':event_filter,'searchFilters':searches,'graph':graph,
- 'thumbnailApi':thumb_result,'tracksApi':tracks_summary,'protectVersion':boot.get('nvr',{}).get('version'),'cameras':camera_status,
+ 'thumbnailApi':thumb_result,'timelineThumbnailApi':timeline_thumb_result,'timelineThumbnailExplicitApi':timeline_explicit_result,
+ 'thumbnailPathsValid':thumbnail_paths_valid,'tracksApi':tracks_summary,'protectVersion':boot.get('nvr',{}).get('version'),'cameras':camera_status,
  'limits':{'spatialTracksExpected':False,'confidenceExpected':False,'apiGETOnly':True,'databaseReadOnly':True,'imagesOrVideoSaved':False}}))
 raise SystemExit(0 if ok else 1)
 '''
