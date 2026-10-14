@@ -289,9 +289,9 @@ class RecoveryTests(unittest.TestCase):
         before=protect.settings_digest(self.config,self.api.boot)
         report=self.run_repair()
         self.assertTrue(report['ok']);self.assertTrue(report['restoredOriginalTcp']);self.assertEqual(report['recordingProfiles'],2)
-        self.assertEqual(self.probes,[1]);self.assertEqual(protect.settings_digest(self.config,self.api.boot),before)
+        self.assertEqual(self.probes,[1,1]);self.assertEqual(protect.settings_digest(self.config,self.api.boot),before)
         report=self.run_repair(5)
-        self.assertTrue(report['ok']);self.assertEqual(report['recordingProfiles'],1);self.assertEqual(self.probes,[1,0])
+        self.assertTrue(report['ok']);self.assertEqual(report['recordingProfiles'],1);self.assertEqual(self.probes,[1,1,0,0])
         self.assertEqual([flag for _,flag in self.api.patches],[True,None,True,None])
         self.assertNotIn('PRIVATE_URL_SECRET',json.dumps(report))
     def test_ambiguous_true_response_still_restores_original(self):
@@ -324,10 +324,12 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(read_json(self.root/'recovery.json')['maintenanceOwner'],owner)
     def test_post_repair_active_failure_is_not_reported_as_success(self):
         cid=self.config['bridges'][0]['cameraId']
+        results=iter([{'ok':True},{'ok':False}])
         report=recovery.rebuild(self.config,self.root,cid,api=self.api,fetch=metrics,
-            probe=lambda *_a,**_k:{'ok':False},sleep=lambda _:None)
+            probe=lambda *_a,**_k:next(results),sleep=lambda _:None)
         self.assertFalse(report['ok']);self.assertTrue(report['restoredOriginalTcp'])
         self.assertEqual(report['errorCode'],'recovery_active_verification_failed')
+        self.assertFalse(report['postRepairActiveProbe']['ok'])
     def test_pending_true_flag_is_restored_after_process_restart(self):
         cid=self.config['bridges'][0]['cameraId']
         receipt={'schemaVersion':1,'cameraId':cid,'phase':'toggle-dispatching',

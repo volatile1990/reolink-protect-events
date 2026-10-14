@@ -247,8 +247,9 @@ class Update:
                 attempts = self.state.setdefault('repairAttempts', [])
                 need(cid not in attempts, 'release_recorder_repair_limit')
                 attempts.append(cid)
+                self.state['evidence']['repair-trigger-' + cid] = row
                 self.persist()  # Charge the attempt before an ambiguous remote dispatch.
-                repair = self.backend.udm({'action': 'recover', 'cameraId': cid, 'owner': self.state['owner']}, timeout=180)
+                repair = self.backend.udm({'action': 'recover', 'cameraId': cid, 'owner': self.state['owner']}, timeout=300)
                 self.state['evidence']['repair-' + cid] = repair
                 self.persist()
                 need(repair.get('ok') is True and repair.get('restoredOriginalTcp') is True, 'native_recorder_repair_failed')
@@ -277,6 +278,8 @@ class Update:
             need(restored.get('ok') is True, 'bridge_rollback_failed')
             results.append(restored)
         need(all(r.get('ok') is True for r in results), 'release_rollback_failed')
+        need(all(self.state['evidence'].get('repair-' + cid, {}).get('restoredOriginalTcp') is True
+                 for cid in self.state.get('repairAttempts', [])), 'recorder_original_settings_unverified')
         health = self.backend.udm({'action': 'health', 'mode': 'full'}, timeout=180)
         self.state['evidence']['rollback-native-media'] = health
         self.persist()

@@ -10,6 +10,15 @@ from .media_health import source_health
 from .protect import automatic_channel, recording_ends, selected_cameras, settings_digest
 from .safety import OperationError, error_code, maintenance_blocks, need, read_json, write_json
 
+MEDIA_SETTLEMENT_SECONDS = 45
+MEDIA_SETTLEMENT_MAX_ATTEMPTS = 3
+MEDIA_PROBE_SECONDS = 8
+# probe_ubv bounds its metadata GET at 5 s, setup at 8 s and close at 0.1 s.
+# Reserve those limits before starting a fresh eight-second stream, in addition
+# to the source helper's existing four-second total request deadline.
+MEDIA_PROBE_RESERVE_SECONDS = 5 + 8 + MEDIA_PROBE_SECONDS + .1
+SOURCE_READ_RESERVE_SECONDS = 4
+
 
 def _camera(config, bootstrap, camera_id):
     return next(c for c in selected_cameras(config, bootstrap) if c['id']==camera_id)
@@ -42,6 +51,63 @@ def _wait(config,api,receipt,temporary,checkpoint,*,clock,sleep,wait_seconds):
         consecutive=consecutive+1 if ready else 0
         if consecutive>=2:return boot
         need(clock()<deadline,'recovery_settlement_timeout');sleep(min(2,max(0,deadline-clock())))
+
+
+def _empty_waitable_probe(value):
+    """Retry only a healthy transport that delivered absolutely no UBV bytes."""
+    if not isinstance(value,dict) or value.get('ok') is not False or 'errorCode' not in value or value['errorCode'] is not None:
+        return False
+    checks=value.get('checks')
+    return (type(value.get('websocketFrames')) is int and value['websocketFrames']==0
+        and type(value.get('binaryBytesDiscarded')) is int and value['binaryBytesDiscarded']==0
+        and value.get('tracks')==[] and isinstance(checks,dict)
+        and checks.get('transport') is True and checks.get('parser') is False
+        and checks.get('videoPictures') is False and checks.get('continuousMediaTimes') is True)
+
+
+def _source_guard(config,camera,fetch):
+    bridge=next(b for b in config['bridges']if b['cameraId']==camera['id'])
+    source=source_health(fetch(bridge));need(source['ok'],'recovery_source_unhealthy')
+    if camera.get('thirdPartyCameraInfo',{}).get('enableRtspAudio') is True:
+        need(all(s['audioAvailable']and s['audioMetadataCurrent']for s in source['streams']),
+             'recovery_source_audio_unhealthy')
+
+
+def _media_wait(config,root,api,fetch,probe,receipt,temporary,*,clock,sleep,maintenance_owner=None):
+    """Prove native Automatic before/after restore; only empty readiness may wait."""
+    from .ubv import probe_ubv
+    probe=probe or probe_ubv;deadline=clock()+MEDIA_SETTLEMENT_SECONDS
+    field='temporaryActiveProbe'if temporary else'postRepairActiveProbe'
+    path=Path(root)/'recovery.json'
+    for attempt in range(1,MEDIA_SETTLEMENT_MAX_ATTEMPTS+1):
+        need(not maintenance_blocks(root,maintenance_owner),'recovery_maintenance_active')
+        remaining=deadline-clock()
+        reserve=SOURCE_READ_RESERVE_SECONDS+MEDIA_PROBE_RESERVE_SECONDS
+        need(remaining>reserve,'recovery_active_settlement_timeout')
+        boot=api(config,'/api/bootstrap',timeout=min(8,remaining-reserve))
+        camera=_guard(config,boot,receipt,temporary)
+        need(camera.get('state')=='CONNECTED'and camera.get('hasRecordingStarted') is True
+             and camera.get('videoReconfigurationInProgress') is False,'recovery_camera_not_ready')
+        need(deadline-clock()>reserve,'recovery_active_settlement_timeout')
+        _source_guard(config,camera,fetch)
+        need(deadline-clock()>=MEDIA_PROBE_RESERVE_SECONDS,'recovery_active_settlement_timeout')
+        need(not maintenance_blocks(root,maintenance_owner),'recovery_maintenance_active')
+        receipt['phase']='temporary-media-settling'if temporary else'restored-media-settling'
+        receipt[field+'Attempts']=attempt;write_json(path,receipt)
+        verify=probe(config,camera,automatic_channel(camera),seconds=MEDIA_PROBE_SECONDS)
+        receipt[field]=verify;write_json(path,receipt)
+        if verify.get('ok') is True:
+            remaining=deadline-clock();need(remaining>0,'recovery_active_settlement_timeout')
+            final=api(config,'/api/bootstrap',timeout=min(8,remaining));_guard(config,final,receipt,temporary)
+            need(clock()<=deadline,'recovery_active_settlement_timeout')
+            receipt[field+'SettlementSeconds']=round(MEDIA_SETTLEMENT_SECONDS-(deadline-clock()),3)
+            write_json(path,receipt);return verify
+        need(_empty_waitable_probe(verify),'recovery_active_verification_failed')
+        if attempt==MEDIA_SETTLEMENT_MAX_ATTEMPTS:break
+        remaining=deadline-clock()
+        need(remaining>reserve+1,'recovery_active_settlement_timeout')
+        sleep(1)
+    raise OperationError('recovery_active_settlement_timeout')
 
 
 def _restore(config,root,api,receipt,*,clock,sleep,wait_seconds,maintenance_owner=None):
@@ -87,6 +153,7 @@ def resume_pending(config,root,*,api=None,fetch=None,probe=None,clock=None,sleep
     api=api or protect_json;fetch=fetch or bridge_metrics;clock=clock or time.monotonic;sleep=sleep or time.sleep
     result={'cameraId':receipt.get('cameraId'),'resumed':True,'ok':False,'restoredOriginalTcp':False}
     try:
+        need(type(wait_seconds)is int and 4<=wait_seconds<=45,'recovery_wait_invalid')
         need(not maintenance_blocks(root,maintenance_owner),'recovery_maintenance_active')
         need(maintenance_owner is None or receipt.get('maintenanceOwner')==maintenance_owner,
              'recovery_receipt_owner_changed')
@@ -94,16 +161,10 @@ def resume_pending(config,root,*,api=None,fetch=None,probe=None,clock=None,sleep
              'recovery_receipt_scope_invalid')
         _restore(config,root,api,receipt,clock=clock,sleep=sleep,wait_seconds=wait_seconds,
                  maintenance_owner=maintenance_owner)
-        from .ubv import probe_ubv
         boot=api(config,'/api/bootstrap');camera=_guard(config,boot,receipt,False)
-        bridge=next(b for b in config['bridges']if b['cameraId']==receipt['cameraId'])
-        source=source_health(fetch(bridge));need(source['ok'],'recovery_source_unhealthy')
-        if camera.get('thirdPartyCameraInfo',{}).get('enableRtspAudio')is True:
-            need(all(s['audioAvailable']and s['audioMetadataCurrent']for s in source['streams']),
-                 'recovery_source_audio_unhealthy')
-        need(not maintenance_blocks(root,maintenance_owner),'recovery_maintenance_active')
-        verify=(probe or probe_ubv)(config,camera,automatic_channel(camera),seconds=8)
-        result['postRepairActiveProbe']=verify;need(verify.get('ok')is True,'recovery_active_verification_failed')
+        verify=_media_wait(config,root,api,fetch,probe,receipt,False,clock=clock,sleep=sleep,
+                           maintenance_owner=maintenance_owner)
+        result['postRepairActiveProbe']=verify
         boot=api(config,'/api/bootstrap');camera=_guard(config,boot,receipt,False)
         latest=recording_ends(camera);checkpoint=receipt.get('checkpoint',{});now=int(time.time()*1000)
         need(set(checkpoint)==set(latest)and all(type(end)in(int,float)and type(checkpoint[q])in(int,float)
@@ -116,6 +177,7 @@ def resume_pending(config,root,*,api=None,fetch=None,probe=None,clock=None,sleep
     except Exception as error:
         result['errorCode']=error_code(error,'recovery_resume_failed')
         result['restoredOriginalTcp']=receipt.get('restoredOriginalTcp')is True
+        if 'postRepairActiveProbe' in receipt:result['postRepairActiveProbe']=receipt['postRepairActiveProbe']
         if result['restoredOriginalTcp']:
             receipt['phase']='complete';receipt['verificationErrorCode']=result['errorCode'];write_json(path,receipt)
     return result
@@ -142,11 +204,7 @@ def rebuild(config,root,camera_id,*,api=None,fetch=None,probe=None,clock=None,sl
         third=camera.get('thirdPartyCameraInfo',{})
         need(camera.get('rtspClient')=='gstreamer'and 'forceTcp'in third and third['forceTcp']is None,
              'recovery_requires_original_null_tcp')
-        bridge=next(b for b in config['bridges']if b['cameraId']==camera_id)
-        source=source_health(fetch(bridge));need(source['ok'],'recovery_source_unhealthy')
-        if third.get('enableRtspAudio')is True:
-            need(all(s['audioAvailable']and s['audioMetadataCurrent']for s in source['streams']),
-                 'recovery_source_audio_unhealthy')
+        _source_guard(config,camera,fetch)
         receipt={'schemaVersion':1,'cameraId':camera_id,'atMs':int(time.time()*1000),'phase':'prepared',
             'maintenanceOwner':maintenance_owner,
             'originalSettingsSha256':settings_digest(config,before),
@@ -159,6 +217,9 @@ def rebuild(config,root,camera_id,*,api=None,fetch=None,probe=None,clock=None,sl
         try:
             _patch(config,root,api,camera_id,True,maintenance_owner)
             _wait(config,api,receipt,True,receipt['checkpoint'],clock=clock,sleep=sleep,wait_seconds=wait_seconds)
+            verify=_media_wait(config,root,api,fetch,probe,receipt,True,clock=clock,sleep=sleep,
+                               maintenance_owner=maintenance_owner)
+            result['temporaryActiveProbe']=verify
             receipt['phase']='temporary-ready';write_json(path,receipt)
         except Exception as error:phase_error=error
         finally:
@@ -170,11 +231,9 @@ def rebuild(config,root,camera_id,*,api=None,fetch=None,probe=None,clock=None,sl
         ends=recording_ends(camera)
         need(all(type(end)in(int,float)and type(receipt['checkpoint'].get(q))in(int,float)
                  and end>receipt['checkpoint'][q] for q,end in ends.items()),'recovery_recordings_not_advancing')
-        from .ubv import probe_ubv
-        need(not maintenance_blocks(root,maintenance_owner),'recovery_maintenance_active')
-        verify=(probe or probe_ubv)(config,camera,automatic_channel(camera),seconds=8)
+        verify=_media_wait(config,root,api,fetch,probe,receipt,False,clock=clock,sleep=sleep,
+                           maintenance_owner=maintenance_owner)
         result['postRepairActiveProbe']=verify
-        need(verify.get('ok')is True,'recovery_active_verification_failed')
         after=api(config,'/api/bootstrap');camera=_guard(config,after,receipt,False)
         latest=recording_ends(camera);now=int(time.time()*1000)
         need(all(type(end)in(int,float)and end>receipt['checkpoint'][q]and -5000<=now-end<=120000
@@ -187,6 +246,8 @@ def rebuild(config,root,camera_id,*,api=None,fetch=None,probe=None,clock=None,sl
         result['errorCode']=error_code(error,'recorder_recovery_failed')
         if receipt is not None:
             result['restoredOriginalTcp']=receipt.get('restoredOriginalTcp')is True
+            for field in ('temporaryActiveProbe','postRepairActiveProbe'):
+                if field in receipt:result[field]=receipt[field]
             if result['restoredOriginalTcp']:
                 receipt['phase']='complete';write_json(path,receipt)
             elif isinstance(error,OperationError)and error.code in('recovery_settings_drift','recovery_force_tcp_drift'):

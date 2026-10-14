@@ -156,6 +156,36 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(report['errorCode'],'source_unhealthy_no_recorder_repair')
         self.assertFalse(any(r[0]=='udm'and r[1]['action']=='recover'for r in self.backend.calls))
         self.assertEqual(report['status'],'rolled-back')
+    def test_healthy_media_cannot_clear_marker_without_original_recorder_setting_proof(self):
+        for outcome in ('restored', 'not-restored', 'lost-ack'):
+            with self.subTest(outcome=outcome):
+                backend=FakeBackend();directory=Path(self.temp.name)/outcome;base=backend.udm
+                cid=backend.identities[IPS[0]]
+                def dispatch(request,timeout=None):
+                    result=base(request,timeout)
+                    if request['action']=='health' and request.get('cameraIds'):
+                        target=next(row for row in result['cameras'] if row['cameraId']==cid)
+                        target.update(ok=False,protectHealthy=False,cause='native_empty')
+                        result['ok']=False
+                    if request['action']=='recover':
+                        self.assertEqual(timeout,300)
+                        before=json.loads((directory/'update.json').read_text())
+                        self.assertIn(cid,before['repairAttempts'])
+                        self.assertEqual(before['evidence']['repair-trigger-'+cid]['cause'],'native_empty')
+                        if outcome=='lost-ack':raise TimeoutError('PRIVATE_UPSTREAM_TOKEN')
+                        return {'ok':False,'restoredOriginalTcp':outcome=='restored',
+                                'errorCode':'synthetic_native_still_empty'}
+                    return result
+                backend.udm=dispatch
+                report=Update(backend,directory).run()
+                self.assertFalse(backend.applied,'owned images must still be restored')
+                if outcome=='restored':
+                    self.assertEqual(report['status'],'rolled-back',report)
+                    self.assertIsNone(backend.marker)
+                else:
+                    self.assertEqual(report['status'],'failed',report)
+                    self.assertFalse(report['rollback']['ok'])
+                    self.assertIsNotNone(backend.marker,'healthy frames cannot prove forceTcp restoration')
     def test_unrelated_unhealthy_source_during_canary_never_repairs_healthy_target(self):
         self.backend.source_bad_ip=IPS[1];report=self.execute()
         self.assertEqual(report['errorCode'],'unrelated_camera_health_failed',report)

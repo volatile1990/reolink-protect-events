@@ -92,6 +92,10 @@ owned maintenance marker and reports failure. Resume finishes that restoration
 using the frozen workers. OS locks release automatically after a controller
 crash. A mismatched receipt, foreign maintenance marker or configuration drift
 requires investigation; the controller never resets unrelated camera settings.
+Every charged recorder repair also needs an explicit original-TCP restoration
+receipt before maintenance can clear. Healthy playback alone does not supply
+that proof after a missing or failed repair response. The triggering camera
+health row is retained before dispatch for diagnosis.
 
 A resume can use a corrected read-only health checker from the current clean
 repository; its source revision/hash is recorded separately. Every mutating
@@ -118,6 +122,16 @@ For a healthy source with a repeated native failure it can perform the audited,
 camera-scoped `forceTcp: null → true → null` recorder rebuild. The original setting
 must be restored; fresh recording progress and a real Automatic stream are then
 required. Settings for every other camera and the NVR are checked for preservation.
+The temporary TCP phase must itself deliver a valid Automatic stream before
+the original setting is restored. Both media phases have a 45-second budget and
+at most three sequential eight-second probes, reserving bounded source/stream
+setup time before dispatch. Only a stream with zero WebSocket frames, zero
+binary bytes, no tracks and no transport/parser error can wait for readiness.
+Received corrupt bytes, invalid AAC, broken clocks or an unhealthy source fail
+immediately. Every attempt rechecks fresh source media and the exact settings
+digest; original-setting restoration still runs in `finally`. A lost PATCH
+response requires reading back the exact temporary or original settings guard,
+and a crash receipt restores the original setting before testing playback.
 Attempts are charged before dispatch, limited to two per camera in 24 hours with
 a 15-minute cooldown. Crash recovery first settles a pending original-setting
 restoration. Source faults remain the NAS watchdog's responsibility.
