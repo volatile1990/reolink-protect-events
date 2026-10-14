@@ -253,6 +253,8 @@ class Update:
                 self.state['evidence']['repair-' + cid] = repair
                 self.persist()
                 need(repair.get('ok') is True and repair.get('restoredOriginalTcp') is True, 'native_recorder_repair_failed')
+                self.state.setdefault('recorderReadyAfterMs', {})[cid] = int(time.time() * 1000)
+                self.persist()
             checked = self.backend.udm({'action': 'health', 'mode': 'full', 'cameraIds': camera_ids})
             need(sorted(checked.get('activeProbeCameraIds', [])) == sorted(camera_ids), 'native_active_probe_coverage_failed')
             return checked
@@ -280,10 +282,13 @@ class Update:
         need(all(r.get('ok') is True for r in results), 'release_rollback_failed')
         need(all(self.state['evidence'].get('repair-' + cid, {}).get('restoredOriginalTcp') is True
                  for cid in self.state.get('repairAttempts', [])), 'recorder_original_settings_unverified')
+        recording_boundary = int(time.time() * 1000)
+        self.state['evidence']['rollback-recording-boundary-ms'] = recording_boundary
+        self.persist()
         health = self.backend.udm({'action': 'health', 'mode': 'full'}, timeout=180)
         self.state['evidence']['rollback-native-media'] = health
         self.persist()
-        decoded = self.backend.decode()
+        decoded = self.backend.decode(not_before_ms=recording_boundary)
         self.state['evidence']['rollback-real-decodes'] = decoded
         self.persist()
         gate_decode(decoded)
@@ -349,11 +354,13 @@ class Update:
                     self.state['evidence'][name + '-health'] = health
                     self.persist()
                     need(health.get('ok') is True, 'camera_native_media_failed')
-                    decoded = self.backend.decode([ip], not_before_ms=activation)
+                    recording_boundary = max(activation, self.state.get('recorderReadyAfterMs', {}).get(cid, 0))
+                    decoded = self.backend.decode([ip], not_before_ms=recording_boundary)
                     self.state['evidence'][name + '-decode'] = decoded
                     self.persist()
                     gate_decode(decoded, full=False)
-                    return {'ok': True, 'health': health, 'decode': decoded, 'afterActivationMs': activation}
+                    return {'ok': True, 'health': health, 'decode': decoded, 'afterActivationMs': activation,
+                            'afterRecorderReadyMs': recording_boundary}
                 self.step(name, verify)
                 status = self.backend.nas({'mode': 'resume', 'baseline': self.state['baseline'], 'release': self.state['release']})
                 need(status.get('ok') is True, 'bridge_resume_failed')

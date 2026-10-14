@@ -27,6 +27,11 @@ MAX_LOG_BYTES = 131072
 EXPORT_WINDOW_SECONDS = 24
 EXPORT_WINDOW_MS = EXPORT_WINDOW_SECONDS * 1000
 MIN_RECORDED_SECONDS = 19
+EXPORT_RETRY_WAIT_SECONDS = 120
+EXPORT_RETRY_POLL_SECONDS = 10
+SUBPROCESS_CLEANUP_RESERVE_SECONDS = 2
+EXPORT_RETRY_ERRORS = frozenset(('decode_export_timeout','decode_export_http_500',
+                                  'decode_export_http_503','decode_recording_audio_missing'))
 DEFAULT_CONFIG = '/data/reolink-protect-events/config.json'
 
 
@@ -136,9 +141,25 @@ def context():
   need(isinstance(release,str)and re.fullmatch('/data/reolink-protect-events/releases/[a-f0-9]{16,64}',release),'decode_release_path_invalid')
   path=private_path(release,directory=True);need(path.is_dir(),'decode_release_unavailable')
  bootstrap=protect_json(config,'/api/bootstrap');cameras=selected_cameras(config,bootstrap)
+ need(bootstrap['nvr'].get('isRecordingDisabled')is False,'decode_global_recording_disabled')
  wanted=payload['ips'];need(isinstance(wanted,list)and wanted and len(set(wanted))==len(wanted),'decode_scope_invalid')
  rows=[c for c in cameras if c['host']in wanted];need(len(rows)==len(wanted),'decode_scope_invalid')
  return config,rows
+
+def current_source(bridge,camera):
+ need(camera.get('state')=='CONNECTED'and camera.get('isConnected')is not False
+      and camera.get('hasRecordingStarted')is True and camera.get('videoReconfigurationInProgress')is False,'decode_camera_not_ready')
+ metrics=bridge_metrics(bridge);streams=metrics.get('streams',[])
+ need(isinstance(streams,list)and 1<=len(streams)<=8,'decode_source_profiles_invalid')
+ relevant=[s for s in streams if isinstance(s,dict)and s.get('profile')in ('main','sub')]
+ by={s['profile']:s for s in relevant};need(len(relevant)==len(by),'decode_source_profiles_changed')
+ expected={'main'}|({'sub'}if len(qualities(camera))==2 else set());need(set(by)==expected,'decode_source_profiles_changed')
+ need(metrics.get('status')=='ready'and all(s.get('liveVideo')is True and s.get('videoReady')is True
+      and type(s.get('lastVideoAgeMs'))in(int,float)and 0<=s['lastVideoAgeMs']<=5000 for s in by.values()),'decode_source_unhealthy')
+ if camera.get('thirdPartyCameraInfo',{}).get('enableRtspAudio')is True:
+  need(all((s.get('audio')or{}).get('available')is True and(s.get('audio')or{}).get('metadataCurrent')is True
+       and(s.get('audio')or{}).get('sampleRate')==16000 for s in by.values()),'decode_source_audio_unhealthy')
+ return by
 
 def uri_for(bridge,profile):
  soap=('<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:m="http://www.onvif.org/ver10/media/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><s:Body><m:GetStreamUri><m:StreamSetup><tt:Stream>RTP-Unicast</tt:Stream><tt:Transport><tt:Protocol>RTSP</tt:Protocol></tt:Transport></m:StreamSetup><m:ProfileToken>'+profile+'</m:ProfileToken></m:GetStreamUri></s:Body></s:Envelope>').encode()
@@ -159,10 +180,7 @@ def uri_for(bridge,profile):
 def discover():
  config,cameras=context();bridges={b['cameraId']:b for b in config['bridges']};out=[];now=int(time.time()*1000)
  for camera in cameras:
-  bridge=bridges[camera['id']];streams=bridge_metrics(bridge).get('streams',[])
-  need(isinstance(streams,list)and 1<=len(streams)<=8,'decode_source_profiles_invalid')
-  by={s.get('profile'):s for s in streams if isinstance(s,dict)and s.get('profile')in ('main','sub')}
-  expected={'main'}|({'sub'}if len(qualities(camera))==2 else set());need(set(by)==expected,'decode_source_profiles_changed')
+  bridge=bridges[camera['id']];by=current_source(bridge,camera)
   channels={c['id']:c for c in camera['channels']if c.get('enabled')is True}
   stats=camera.get('stats',{}).get('video',{})
   for quality,key,channel in qualities(camera):
@@ -184,14 +202,20 @@ def export():
  config,cameras=context();p=payload['profile'];camera=next((c for c in cameras if c['id']==p['cameraId']and c['host']==p['host']),None)
  need(camera is not None,'decode_camera_mapping_changed')
  expected=[q for q in qualities(camera)if q[0]==p['quality']and q[2]==p['channel']];need(len(expected)==1,'decode_export_profile_scope')
+ bridge=next(b for b in config['bridges']if b['cameraId']==camera['id']);current_source(bridge,camera)
  start,end=p['startMs'],p['endMs'];now=int(time.time()*1000)
  need(type(start)is int and type(end)is int and end-start==EXPORT_WINDOW_MS and 0<start<end<=now,'decode_export_time_scope')
  stats=camera.get('stats',{}).get('video',{});recording_end=stats.get(expected[0][1],camera.get(expected[0][1]))
- need(type(recording_end)is int and end<=recording_end,'decode_recording_range_unavailable')
+ need(type(recording_end)is int and -5000<=now-recording_end<=120000,'decode_recording_index_stale')
+ recording_start=stats.get('recordingStart',camera.get('recordingStart'))
+ need(type(recording_start)is int and recording_start<=start and end<=recording_end,'decode_recording_range_unavailable')
  if payload.get('notBeforeMs')is not None:need(start>=payload['notBeforeMs'],'decode_new_recording_pending')
  path='/api/video/export?'+urllib.parse.urlencode({'camera':camera['id'],'start':start,'end':end,'channel':p['channel']})
- status,content=get_bytes('http://127.0.0.1:7080'+path,owner_headers(config),timeout=35,limit=67108864)
- need(status==200 and content and b'ftyp'in content[:64],'decode_export_rejected')
+ try:status,content=get_bytes('http://127.0.0.1:7080'+path,owner_headers(config),timeout=35,limit=67108864)
+ except TimeoutError:raise OperationError('decode_export_timeout')from None
+ if status in(500,503):raise OperationError('decode_export_http_'+str(status))
+ need(status==200,'decode_export_rejected')
+ need(content and b'ftyp'in content[:64],'decode_export_payload_invalid')
  sys.stdout.buffer.write(content);sys.stdout.buffer.flush()
 
 try:
@@ -479,7 +503,7 @@ async def _rtsp_decode(profile,exe,duration):
         await proxy.close()
 
 
-async def _recorded_decode(profile,exe,probe,duration,ssh,payload):
+async def _recorded_once(profile,exe,probe,duration,ssh,payload):
     row=dict(_public_profile(profile),startMs=profile['startMs'],endMs=profile['endMs'],
              requestedExportSeconds=EXPORT_WINDOW_SECONDS,minimumRecordedSeconds=MIN_RECORDED_SECONDS,ok=False)
     server=None;content=None
@@ -496,11 +520,21 @@ async def _recorded_decode(profile,exe,probe,duration,ssh,payload):
         need(code==0 and not errors.strip(),'decode_recording_probe_failed')
         streams=_project_streams(json.loads(raw));row['streams']=streams
         videos=[s for s in streams if s.get('codec_type')=='video'];audios=[s for s in streams if s.get('codec_type')=='audio']
-        need(len(videos)==1 and len(audios)==1,'decode_recording_tracks_invalid')
-        video,audio=videos[0],audios[0]
+        need(len(videos)==1,'decode_recording_tracks_invalid')
+        video=videos[0]
         metadata_match=(video.get('codec_name')==profile['expectedCodec'] and
             (video.get('width'),video.get('height'))==(profile['expectedWidth'],profile['expectedHeight']))
-        row['videoMetadataPreserved']=metadata_match;row.update(timeline_comparison(video,audio))
+        row['videoMetadataPreserved']=metadata_match
+        need(metadata_match,'decode_recording_video_metadata_changed')
+        if len(streams)==1 and not audios:
+            # Missing AAC can describe a muxer/export transition. It is not a
+            # payload-decode success; only this exact expected video shape can
+            # request one completely newer recording interval.
+            timeline_comparison(video,video)
+            need(float(video['duration'])>=MIN_RECORDED_SECONDS,'decode_recording_export_too_short')
+            raise OperationError('decode_recording_audio_missing')
+        need(len(streams)==2 and len(audios)==1,'decode_recording_tracks_invalid')
+        audio=audios[0];row.update(timeline_comparison(video,audio))
         # Protect can trim the requested interval at GOP/recording boundaries.
         # A larger request reserves room for that trim without reducing the
         # minimum delivered payload or any actual video/audio decode check.
@@ -515,6 +549,59 @@ async def _recorded_decode(profile,exe,probe,duration,ssh,payload):
     finally:
         if server is not None:server.close()
         content=None
+
+
+async def _retry_recording_profile_inner(profile,payload,ssh,*,clock=None,sleep=None):
+    """Wait only for a newer ready index; open no native/RTSP/media viewers."""
+    clock=clock or time.monotonic;sleep=sleep or asyncio.sleep
+    deadline=clock()+EXPORT_RETRY_WAIT_SECONDS
+    boundary=max(profile['endMs']+1,payload.get('notBeforeMs')or 0)
+    request=dict(payload,action='discover',ips=[profile['host']],notBeforeMs=boundary)
+    while True:
+        remaining=deadline-clock();need(remaining>SUBPROCESS_CLEANUP_RESERVE_SECONDS,'decode_export_retry_readiness_timeout')
+        code,raw,_=await _run_bytes(ssh,input_data=_remote_source(request),
+                                  timeout=min(40,remaining-SUBPROCESS_CLEANUP_RESERVE_SECONDS),stdout_limit=MAX_PRIVATE_JSON)
+        if code==0:
+            rows=_private_profiles(json.loads(raw),[profile['host']])
+            fresh=next(row for row in rows if row['profile']==profile['profile'])
+            need(all(fresh[key]==profile[key]for key in ('cameraId','quality','channel','expectedCodec',
+                 'expectedWidth','expectedHeight','url')),'decode_retry_profile_changed')
+            need(fresh['startMs']>=boundary,'decode_retry_window_overlaps_failed_export')
+            need(clock()<=deadline,'decode_export_retry_readiness_timeout')
+            return fresh,request
+        need(_remote_error(raw,'decode_discovery_failed')=='decode_new_recording_pending',
+             _remote_error(raw,'decode_discovery_failed'))
+        remaining=deadline-clock();need(remaining>SUBPROCESS_CLEANUP_RESERVE_SECONDS,'decode_export_retry_readiness_timeout')
+        await sleep(min(EXPORT_RETRY_POLL_SECONDS,remaining-SUBPROCESS_CLEANUP_RESERVE_SECONDS))
+
+
+async def _retry_recording_profile(profile,payload,ssh,*,clock=None,sleep=None):
+    # Cover awaited process creation and all readiness work as one operation.
+    # _run_bytes owns at most two seconds of cancellation cleanup, so start
+    # cancellation early enough for that cleanup to remain inside 120 seconds.
+    try:
+        return await asyncio.wait_for(_retry_recording_profile_inner(profile,payload,ssh,clock=clock,sleep=sleep),
+                      timeout=EXPORT_RETRY_WAIT_SECONDS-SUBPROCESS_CLEANUP_RESERVE_SECONDS)
+    except asyncio.TimeoutError:
+        raise OperationError('decode_export_retry_readiness_timeout')from None
+
+
+async def _recorded_decode(profile,exe,probe,duration,ssh,payload):
+    """At most one export retry, exclusively before any failed payload decode."""
+    first=await _recorded_once(profile,exe,probe,duration,ssh,payload)
+    if first.get('errorCode')not in EXPORT_RETRY_ERRORS or 'decode'in first:
+        return first
+    attempts=[first]
+    try:
+        fresh,request=await _retry_recording_profile(profile,payload,ssh)
+        second=await _recorded_once(fresh,exe,probe,duration,ssh,request)
+        attempts.append(second)
+        return dict(second,exportAttempts=attempts,exportRetryUsed=True,
+                    retryWindowNotBeforeMs=request['notBeforeMs'])
+    except Exception as error:
+        return dict(first,exportAttempts=attempts,exportRetryUsed=False,
+                    retryReadinessErrorCode=error_code(error,'decode_export_retry_readiness_failed'),
+                    retryWindowNotBeforeMs=max(profile['endMs']+1,payload.get('notBeforeMs')or 0))
 
 
 def _coverage(profiles,rows):

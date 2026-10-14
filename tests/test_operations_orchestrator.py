@@ -186,6 +186,45 @@ class ControllerTests(unittest.TestCase):
                     self.assertEqual(report['status'],'failed',report)
                     self.assertFalse(report['rollback']['ok'])
                     self.assertIsNotNone(backend.marker,'healthy frames cannot prove forceTcp restoration')
+    def test_recorded_gate_starts_after_successful_transport_rebuild(self):
+        clock=[1000.0];recovered=[False];base=self.backend.udm
+        cid=self.backend.identities[IPS[0]]
+        def dispatch(request,timeout=None):
+            result=base(request,timeout)
+            if request['action']=='health' and request.get('cameraIds') and not recovered[0]:
+                target=next(row for row in result['cameras'] if row['cameraId']==cid)
+                target.update(ok=False,protectHealthy=False,cause='native_empty');result['ok']=False
+            if request['action']=='recover':
+                clock[0]+=60;recovered[0]=True
+            return result
+        self.backend.udm=dispatch
+        with patch.object(orchestrator.time,'time',side_effect=lambda:clock[0]):
+            report=self.execute()
+        self.assertTrue(report['ok'],report)
+        state=json.loads((self.directory/'update.json').read_text())
+        boundary=state['recorderReadyAfterMs'][cid]
+        first=state['evidence']['camera-'+IPS[0]]
+        self.assertGreater(boundary,first['afterActivationMs'])
+        self.assertEqual(first['afterRecorderReadyMs'],boundary)
+        decoded=next(row for row in self.backend.calls if row[0]=='decode' and row[1]==[IPS[0]])
+        self.assertEqual(decoded[2],boundary,'an activation-only window would overlap the real rebuild')
+    def test_rollback_decode_starts_after_original_images_are_restored(self):
+        clock=[1000.0];base=self.backend.nas
+        self.backend.fail_decode_ip=IPS[0]
+        def dispatch(payload):
+            result=base(payload)
+            if payload['mode']=='rollback-all':clock[0]+=30
+            return result
+        self.backend.nas=dispatch
+        with patch.object(orchestrator.time,'time',side_effect=lambda:clock[0]):
+            report=self.execute()
+        self.assertEqual(report['status'],'rolled-back',report)
+        state=json.loads((self.directory/'update.json').read_text())
+        boundary=state['evidence']['rollback-recording-boundary-ms']
+        self.assertEqual(boundary,1030000)
+        self.assertGreater(boundary,state['activations'][IPS[0]])
+        decoded=[row for row in self.backend.calls if row[0]=='decode' and row[1] is None][-1]
+        self.assertEqual(decoded[2],boundary)
     def test_unrelated_unhealthy_source_during_canary_never_repairs_healthy_target(self):
         self.backend.source_bad_ip=IPS[1];report=self.execute()
         self.assertEqual(report['errorCode'],'unrelated_camera_health_failed',report)

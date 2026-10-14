@@ -12,6 +12,7 @@ import shutil
 import sys
 import time
 import types
+import urllib.parse
 import unittest
 from unittest.mock import Mock, patch
 
@@ -115,9 +116,11 @@ class DecodeScopeTests(unittest.TestCase):
 
     def test_entire_export_window_must_follow_activation_before_any_viewer(self):
         tree=ast.parse(decode._REMOTE_COMMON)
-        function=next(node for node in tree.body if isinstance(node,ast.FunctionDef)and node.name=='discover')
+        functions=[node for node in tree.body if isinstance(node,ast.FunctionDef)and node.name in ('current_source','discover')]
         now=START+300000;recording_end=now-5000;start=recording_end-30000-decode.EXPORT_WINDOW_MS
         camera={'id':'1'*24,'host':'192.168.30.215','channels':[{'id':0,'enabled':True,'width':64,'height':36}],
+                'state':'CONNECTED','isConnected':True,'hasRecordingStarted':True,'videoReconfigurationInProgress':False,
+                'thirdPartyCameraInfo':{'enableRtspAudio':True},
                 'stats':{'video':{'recordingEnd':recording_end,'recordingStart':START}}}
         config={'bridges':[{'cameraId':camera['id'],'host':camera['host'],
                             'username':'private-user','password':SECRET}]}
@@ -125,9 +128,11 @@ class DecodeScopeTests(unittest.TestCase):
         namespace={'EXPORT_WINDOW_MS':decode.EXPORT_WINDOW_MS,'need':decode.need,
                    'context':lambda:(config,[camera]),'time':types.SimpleNamespace(time=lambda:now/1000),
                    'qualities':lambda _:[('high','recordingEnd',0)],'uri_for':uri,
-                   'bridge_metrics':lambda _:{'streams':[{'profile':'main','codec':'H264','width':64,'height':36}]},
+                   'bridge_metrics':lambda _:{'status':'ready','streams':[{'profile':'main','codec':'H264','width':64,'height':36,
+                         'liveVideo':True,'videoReady':True,'lastVideoAgeMs':100,
+                         'audio':{'available':True,'metadataCurrent':True,'sampleRate':16000}}]},
                    'payload':{'lagSeconds':30,'notBeforeMs':start+1}}
-        exec(compile(ast.Module(body=[function],type_ignores=[]),'<public-discover-test>','exec'),namespace)
+        exec(compile(ast.Module(body=functions,type_ignores=[]),'<public-discover-test>','exec'),namespace)
         with self.assertRaisesRegex(OperationError,'decode_new_recording_pending'):
             namespace['discover']()
         uri.assert_not_called()
@@ -295,6 +300,192 @@ class DecodeScopeTests(unittest.TestCase):
                 self.assertEqual(response.status,status);self.assertIsNone(response.getheader('Location'));response.read();conn.close()
         finally:server.close()
         self.assertEqual(server.video,b'')
+
+
+class ExportRetryTests(unittest.TestCase):
+    def setUp(self):
+        self.row=profile();self.elapsed=0;self.readiness_calls=[];self.sleeps=[]
+        self.payload={'action':'discover','configPath':decode.DEFAULT_CONFIG,'remoteRelease':None,
+             'ips':[self.row['host']],'lagSeconds':30,'notBeforeMs':START,'exportWindowMs':decode.EXPORT_WINDOW_MS}
+    def first_failure(self,code='decode_recording_audio_missing'):
+        return dict(decode._public_profile(self.row),startMs=self.row['startMs'],endMs=self.row['endMs'],
+             requestedExportSeconds=24,ok=False,errorCode=code,exportBytes=32768,
+             streams=[{'codec_type':'video','codec_name':'h264','width':64,'height':36,
+                       'start_time':'0','duration':'25.770'}],videoMetadataPreserved=True)
+    def fresh(self,boundary=None):
+        boundary=max(self.row['endMs']+1,self.payload.get('notBeforeMs')or 0)if boundary is None else boundary
+        return dict(self.row,startMs=boundary,endMs=boundary+decode.EXPORT_WINDOW_MS)
+    def clock(self):return self.elapsed
+    async def sleep(self,seconds):self.sleeps.append(seconds);self.elapsed+=seconds
+    def test_one_retry_preserves_first_projection_and_actual_second_decode(self):
+        first=self.first_failure();second=dict(success(self.fresh(),True),startMs=self.fresh()['startMs'],endMs=self.fresh()['endMs'])
+        request=dict(self.payload,notBeforeMs=self.row['endMs']+1)
+        async def ready(*args):return self.fresh(),request
+        with patch.object(decode,'_recorded_once',side_effect=[first,second])as once, \
+             patch.object(decode,'_retry_recording_profile',side_effect=ready)as wait:
+            result=asyncio.run(decode._recorded_decode(self.row,'ffmpeg','ffprobe',5,['ssh'],self.payload))
+        self.assertTrue(result['ok']);self.assertTrue(result['exportRetryUsed'])
+        self.assertEqual(result['exportAttempts'],[first,second]);self.assertEqual(once.call_count,2)
+        self.assertEqual(once.call_args.args[0]['startMs'],self.row['endMs']+1)
+        self.assertEqual(once.call_args.args[3],5);wait.assert_called_once()
+        self.assertNotIn(SECRET,json.dumps(result));self.assertNotIn('rtsp://',json.dumps(result))
+    def test_persistent_missing_audio_or_timeout_never_gets_a_third_export(self):
+        for code in decode.EXPORT_RETRY_ERRORS:
+            first=self.first_failure(code);second=dict(first,startMs=self.fresh()['startMs'],endMs=self.fresh()['endMs'])
+            async def ready(*args):return self.fresh(),dict(self.payload,notBeforeMs=self.row['endMs']+1)
+            with self.subTest(code=code),patch.object(decode,'_recorded_once',side_effect=[first,second])as once, \
+                 patch.object(decode,'_retry_recording_profile',side_effect=ready):
+                result=asyncio.run(decode._recorded_decode(self.row,'ffmpeg','ffprobe',5,['ssh'],self.payload))
+                self.assertFalse(result['ok']);self.assertEqual(len(result['exportAttempts']),2)
+                self.assertEqual(once.call_count,2);self.assertEqual(result['errorCode'],code)
+    def test_readiness_failure_preserves_first_failed_attempt(self):
+        first=self.first_failure()
+        with patch.object(decode,'_recorded_once',return_value=first)as once, \
+             patch.object(decode,'_retry_recording_profile',side_effect=OperationError('decode_source_audio_unhealthy')):
+            result=asyncio.run(decode._recorded_decode(self.row,'ffmpeg','ffprobe',5,['ssh'],self.payload))
+        self.assertFalse(result['ok']);self.assertFalse(result['exportRetryUsed'])
+        self.assertEqual(result['exportAttempts'],[first]);self.assertEqual(once.call_count,1)
+        self.assertEqual(result['retryReadinessErrorCode'],'decode_source_audio_unhealthy')
+    def test_actual_decode_or_hard_export_failures_are_never_retried(self):
+        failures=[self.first_failure(code)for code in ('decode_remote_read_failed','decode_export_rejected',
+             'decode_export_payload_invalid','decode_recording_tracks_invalid','decode_recording_export_too_short',
+             'decode_recording_probe_failed','decode_recording_video_metadata_changed','decode_track_timing_invalid')]
+        for code in decode.EXPORT_RETRY_ERRORS:
+            failures.append(dict(self.first_failure(code),decode={'ok':False,'warningCategories':{'decodeErrors':1}}))
+        failures.append(dict(self.first_failure(None),decode={'ok':False,'decodedTimestampErrors':1}))
+        for first in failures:
+            with self.subTest(first=first),patch.object(decode,'_recorded_once',return_value=first)as once, \
+                 patch.object(decode,'_retry_recording_profile')as wait:
+                result=asyncio.run(decode._recorded_decode(self.row,'ffmpeg','ffprobe',5,['ssh'],self.payload))
+                self.assertIs(result,first);once.assert_called_once();wait.assert_not_called()
+    def test_readiness_uses_strictly_new_window_and_original_not_before(self):
+        self.payload['notBeforeMs']=self.row['endMs']+60000
+        boundary=self.payload['notBeforeMs'];fresh=self.fresh(boundary)
+        pending={'ok':False,'errorCode':'decode_new_recording_pending'}
+        async def read(command,**kwargs):
+            self.readiness_calls.append(kwargs)
+            if len(self.readiness_calls)==1:return 2,json.dumps(pending).encode(),b''
+            return 0,json.dumps({'ok':True,'profiles':[fresh]}).encode(),b''
+        captured=[]
+        def source(value):captured.append(value);return b'public-readonly-source'
+        with patch.object(decode,'_run_bytes',side_effect=read),patch.object(decode,'_remote_source',side_effect=source):
+            row,payload=asyncio.run(decode._retry_recording_profile(self.row,self.payload,['ssh'],clock=self.clock,sleep=self.sleep))
+        self.assertEqual(row['startMs'],boundary);self.assertEqual(row['endMs']-row['startMs'],24000)
+        self.assertEqual([p['notBeforeMs']for p in captured],[boundary,boundary])
+        self.assertEqual(self.sleeps,[10]);self.assertEqual(payload['ips'],[self.row['host']])
+    def test_readiness_pending_is_bounded_including_subprocess_cleanup(self):
+        pending={'ok':False,'errorCode':'decode_new_recording_pending'}
+        async def read(command,**kwargs):
+            self.readiness_calls.append(kwargs)
+            self.assertLessEqual(kwargs['timeout']+decode.SUBPROCESS_CLEANUP_RESERVE_SECONDS,120-self.elapsed)
+            return 2,json.dumps(pending).encode(),b''
+        with patch.object(decode,'_run_bytes',side_effect=read),patch.object(decode,'_remote_source',return_value=b'public'), \
+             self.assertRaisesRegex(OperationError,'decode_export_retry_readiness_timeout'):
+            asyncio.run(decode._retry_recording_profile(self.row,self.payload,['ssh'],clock=self.clock,sleep=self.sleep))
+        self.assertLessEqual(self.elapsed,120);self.assertEqual(self.elapsed,118)
+        self.assertLessEqual(len(self.readiness_calls),13)
+    def test_readiness_network_time_and_cleanup_are_inside_one_120_second_budget(self):
+        pending={'ok':False,'errorCode':'decode_new_recording_pending'}
+        async def read(command,**kwargs):
+            self.readiness_calls.append(kwargs)
+            self.elapsed+=kwargs['timeout']+decode.SUBPROCESS_CLEANUP_RESERVE_SECONDS
+            return 2,json.dumps(pending).encode(),b''
+        with patch.object(decode,'_run_bytes',side_effect=read),patch.object(decode,'_remote_source',return_value=b'public'), \
+             self.assertRaisesRegex(OperationError,'decode_export_retry_readiness_timeout'):
+            asyncio.run(decode._retry_recording_profile(self.row,self.payload,['ssh'],clock=self.clock,sleep=self.sleep))
+        self.assertEqual(self.elapsed,120);self.assertEqual(len(self.readiness_calls),3)
+        self.assertEqual([call['timeout']for call in self.readiness_calls],[40,40,14])
+    def test_whole_readiness_timer_cancels_a_stalled_process_creation(self):
+        cancelled=[]
+        async def stalled(command,**kwargs):
+            try:await asyncio.sleep(60)
+            finally:
+                cancelled.append(True)
+                await asyncio.sleep(.01)
+        started=time.monotonic()
+        with patch.object(decode,'EXPORT_RETRY_WAIT_SECONDS',.06), \
+             patch.object(decode,'SUBPROCESS_CLEANUP_RESERVE_SECONDS',.01), \
+             patch.object(decode,'_run_bytes',side_effect=stalled),patch.object(decode,'_remote_source',return_value=b'public'), \
+             self.assertRaisesRegex(OperationError,'decode_export_retry_readiness_timeout'):
+            asyncio.run(decode._retry_recording_profile(self.row,self.payload,['ssh']))
+        self.assertEqual(cancelled,[True]);self.assertLess(time.monotonic()-started,.5)
+    def test_fresh_readiness_rejects_overlap_metadata_change_and_source_failure(self):
+        for mutation in ('overlap','codec','dimensions','source'):
+            fresh=self.fresh()
+            if mutation=='overlap':fresh['startMs']-=1;fresh['endMs']-=1
+            if mutation=='codec':fresh['expectedCodec']='hevc'
+            if mutation=='dimensions':fresh['expectedWidth']=128
+            async def read(command,**kwargs):
+                if mutation=='source':return 2,json.dumps({'ok':False,'errorCode':'decode_source_unhealthy'}).encode(),b''
+                return 0,json.dumps({'ok':True,'profiles':[fresh]}).encode(),b''
+            expected={'overlap':'decode_retry_window_overlaps_failed_export','codec':'decode_retry_profile_changed',
+                      'dimensions':'decode_retry_profile_changed','source':'decode_source_unhealthy'}[mutation]
+            with self.subTest(mutation=mutation),patch.object(decode,'_run_bytes',side_effect=read), \
+                 patch.object(decode,'_remote_source',return_value=b'public'),self.assertRaisesRegex(OperationError,expected):
+                asyncio.run(decode._retry_recording_profile(self.row,self.payload,['ssh'],clock=self.clock,sleep=self.sleep))
+            self.assertFalse(self.sleeps)
+    def test_single_expected_video_is_the_only_missing_audio_retry_shape(self):
+        video={'codec_type':'video','codec_name':'h264','width':64,'height':36,'start_time':'0','duration':'25.770'}
+        audio={'codec_type':'audio','codec_name':'aac','sample_rate':'16000','channels':1,'start_time':'0','duration':'25.770'}
+        fixtures=[([video],'decode_recording_audio_missing'),
+                  ([dict(video,codec_name='hevc')],'decode_recording_video_metadata_changed'),
+                  ([dict(video,width=128)],'decode_recording_video_metadata_changed'),
+                  ([video,video],'decode_recording_tracks_invalid'),([audio],'decode_recording_tracks_invalid'),
+                  ([video,audio,audio],'decode_recording_tracks_invalid'),
+                  ([dict(video,duration='18.999')],'decode_recording_export_too_short'),
+                  ([dict(video,duration='-1')],'decode_track_timing_invalid'),
+                  ([dict(video,start_time='not-a-time')],'decode_probe_metadata_invalid')]
+        for streams,expected in fixtures:
+            async def read(command,**kwargs):
+                return (0,b'0000ftyp'+b'x'*32,b'')if command[0]=='ssh'else(0,json.dumps({'streams':streams}).encode(),b'')
+            with self.subTest(expected=expected),patch.object(decode,'_run_bytes',side_effect=read), \
+                 patch.object(decode,'_MemoryServer',return_value=Mock(url='http://127.0.0.1:49152/recording.mp4')), \
+                 patch.object(decode,'_decode_av')as actual:
+                result=asyncio.run(decode._recorded_once(self.row,'ffmpeg','ffprobe',5,['ssh'],self.payload))
+                self.assertFalse(result['ok']);self.assertEqual(result['errorCode'],expected)
+                actual.assert_not_called()
+    def test_remote_export_timeout_and_status_are_categorical_before_decode(self):
+        tree=ast.parse(decode._REMOTE_COMMON)
+        function=next(node for node in tree.body if isinstance(node,ast.FunctionDef)and node.name=='export')
+        now=START+300000
+        camera={'id':self.row['cameraId'],'host':self.row['host'],
+                'stats':{'video':{'recordingEnd':now,'recordingStart':START}}}
+        bridge={'cameraId':camera['id'],'host':camera['host']}
+        namespace={'EXPORT_WINDOW_MS':decode.EXPORT_WINDOW_MS,'need':decode.need,'OperationError':OperationError,
+             'context':lambda:({'bridges':[bridge]},[camera]),'current_source':Mock(),
+             'time':types.SimpleNamespace(time=lambda:now/1000),'qualities':lambda _:[('high','recordingEnd',0)],
+             'owner_headers':lambda _:{},'urllib':urllib,'sys':types.SimpleNamespace(stdout=types.SimpleNamespace(buffer=Mock())),
+             'payload':dict(self.payload,profile={key:self.row[key]for key in ('host','cameraId','quality','channel','startMs','endMs')})}
+        exec(compile(ast.Module(body=[function],type_ignores=[]),'<public-export-test>','exec'),namespace)
+        for status,expected in ((500,'decode_export_http_500'),(503,'decode_export_http_503'),(404,'decode_export_rejected')):
+            namespace['get_bytes']=Mock(return_value=(status,b'private body'))
+            with self.subTest(status=status),self.assertRaisesRegex(OperationError,expected):namespace['export']()
+        namespace['get_bytes']=Mock(side_effect=TimeoutError(SECRET))
+        with self.assertRaisesRegex(OperationError,'^decode_export_timeout$'):namespace['export']()
+        namespace['get_bytes']=Mock(return_value=(200,b'corrupt'))
+        with self.assertRaisesRegex(OperationError,'^decode_export_payload_invalid$'):namespace['export']()
+    def test_fresh_remote_source_rejects_lost_video_audio_or_reconfiguration(self):
+        tree=ast.parse(decode._REMOTE_COMMON)
+        function=next(node for node in tree.body if isinstance(node,ast.FunctionDef)and node.name=='current_source')
+        camera={'state':'CONNECTED','isConnected':True,'hasRecordingStarted':True,'videoReconfigurationInProgress':False,
+                'thirdPartyCameraInfo':{'enableRtspAudio':True}}
+        live={'status':'ready','streams':[{'profile':'main','liveVideo':True,'videoReady':True,'lastVideoAgeMs':100,
+                'audio':{'available':True,'metadataCurrent':True,'sampleRate':16000}}]}
+        namespace={'need':decode.need,'qualities':lambda _:[('high','recordingEnd',0)]}
+        exec(compile(ast.Module(body=[function],type_ignores=[]),'<public-source-test>','exec'),namespace)
+        namespace['bridge_metrics']=lambda _:live
+        self.assertEqual(set(namespace['current_source']({},camera)),{'main'})
+        for mutation in ('video','age','audio','rate','busy','duplicate'):
+            source=copy.deepcopy(live);current=copy.deepcopy(camera)
+            if mutation=='video':source['streams'][0]['liveVideo']=False
+            if mutation=='age':source['streams'][0]['lastVideoAgeMs']=5001
+            if mutation=='audio':source['streams'][0]['audio']['metadataCurrent']=False
+            if mutation=='rate':source['streams'][0]['audio']['sampleRate']=48000
+            if mutation=='busy':current['videoReconfigurationInProgress']=True
+            if mutation=='duplicate':source['streams'].append(copy.deepcopy(source['streams'][0]))
+            namespace['bridge_metrics']=lambda _:source
+            with self.subTest(mutation=mutation),self.assertRaises(OperationError):
+                namespace['current_source']({},current)
 
 
 @unittest.skipUnless(shutil.which('ffmpeg')and shutil.which('ffprobe'),'real local decode integration requires FFmpeg/ffprobe')

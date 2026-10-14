@@ -67,6 +67,16 @@ python tools/protect_ops.py resume --config /path/to/local-controller.json --run
    decoded to PCM must pass the existing codec, dimensions, warning and 350 ms
    audio/video timeline checks. The entire requested window must follow a
    camera's activation; an older overlapping window cannot pass its gate.
+   An export timeout, HTTP 500/503, or one correctly shaped video track with
+   missing AAC can request exactly one replacement export before payload decode.
+   The replacement window must begin strictly after the failed window ends and
+   satisfy the original activation/recovery boundary. Readiness is bounded to
+   120 seconds with fresh source/index checks and no open viewers while waiting.
+   Both attempt projections remain in the report. A persistent missing audio
+   track, malformed media, changed codec/dimensions, timeline mismatch or actual
+   decoder warning remains a failed gate; this retry never repairs a recorder.
+   When a recorder repair is needed, it must also follow that repair's successful
+   original-setting/media verification, keeping reconfiguration out of the probe.
 4. Build bridge audit and production images from the same frozen ZIP on Synology.
    Run real .NET self-tests, Protect contracts and the hardware low-quality test
    in isolated containers; require the production application DLL to be identical
@@ -86,6 +96,8 @@ files after comparing their current state with the receipt chain. **Keep the
 current Events journal and Protect database**; restoring an old source journal
 would discard genuine events received during the rollout. The SQLite snapshot is
 a disaster-recovery backup, not part of routine rollback.
+Restoration's recorded probes also require their entire window after the
+original images have been restored, keeping restart intervals out of that proof.
 
 If restoration or its verification is inconclusive, the controller retains the
 owned maintenance marker and reports failure. Resume finishes that restoration
