@@ -3,13 +3,14 @@ import base64
 import hashlib
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
 import sys
 import time
 import uuid
-from .decode import EXPORT_WINDOW_SECONDS, run_full_decodes
+from .decode import EXPORT_WINDOW_SECONDS, MIN_RECORDED_SECONDS, run_full_decodes
 from .release import build_package, source_snapshot
 from .locking import process_lock
 from .transport import invoke, source_bundle
@@ -49,6 +50,73 @@ def gate_decode(report, full=True):
     key = 'allEleven' if full else 'allRequested'
     need(all(report.get(kind, {}).get(key) is True for kind in ('rtspProfileCoverage', 'recordedProfileCoverage')),
          'real_media_decode_coverage_failed')
+
+
+def recording_audio_repair_candidate(report, ip, cid):
+    """Only one persistent video-only export, with every scoped live AV decode clean."""
+    try:
+        if report.get('ok') is not False or report.get('errorCode') or report.get('realDecodes') is not False:
+            return False
+        live, recorded = report['rtsp'], report['recordings']
+        count = 1 if ip == IPS[-1] else 2
+        expected = {('main', 'high', 0)} | (set() if count == 1 else {('sub', 'low', 2)})
+        identity = lambda row: (row['profile'], row['quality'], row['channel'])
+        if len(live) != count or len(recorded) != count or {identity(r) for r in live} != expected or {identity(r) for r in recorded} != expected:
+            return False
+        if any(r['host'] != ip or r['cameraId'] != cid for r in live + recorded):
+            return False
+        if any(r.get('ok') is not True or r.get('realVideoDecode') is not True or r.get('realAudioDecode') is not True
+               or r.get('cleanDecode') is not True or r.get('expectedDimensionsMatch') is not True
+               or r.get('expectedAudioMatch') is not True or r.get('warningCategories') or r.get('decodedTimestampErrors')
+               or r.get('errorCode')
+               for r in live):
+            return False
+        for key, passed in (('rtspProfileCoverage', count), ('recordedProfileCoverage', count - 1)):
+            coverage = report[key]
+            if any(coverage.get(k) != value for k, value in (('expectedRequested', count), ('checked', count), ('passed', passed))):
+                return False
+        if report['rtspProfileCoverage'].get('allRequested') is not True:
+            return False
+        failed = [r for r in recorded if r.get('ok') is not True]
+        if len(failed) != 1:
+            return False
+        bad = failed[0]
+        if any(r.get('decode', {}).get('ok') is not True or r['decode'].get('realVideoDecode') is not True
+               or r['decode'].get('realAudioDecode') is not True for r in recorded if r is not bad):
+            return False
+        if (bad.get('errorCode') != 'decode_recording_audio_missing' or bad.get('exportRetryUsed') is not True
+                or bad.get('videoMetadataPreserved') is not True or 'decode' in bad):
+            return False
+        attempts = bad['exportAttempts']
+        if len(attempts) != 2:
+            return False
+        reference = next(r for r in live if identity(r) == identity(bad))
+        previous_end = None
+        for attempt in attempts:
+            if (identity(attempt) != identity(bad) or attempt['host'] != ip or attempt['cameraId'] != cid
+                    or attempt.get('ok') is not False or attempt.get('errorCode') != 'decode_recording_audio_missing'
+                    or attempt.get('videoMetadataPreserved') is not True or 'decode' in attempt):
+                return False
+            start, end = attempt['startMs'], attempt['endMs']
+            if type(start) is not int or type(end) is not int or start <= 0 or end - start != EXPORT_WINDOW_SECONDS * 1000:
+                return False
+            if previous_end is not None and start <= previous_end:
+                return False
+            previous_end = end
+            streams = attempt['streams']
+            if len(streams) != 1:
+                return False
+            video = streams[0]
+            if (video.get('codec_type') != 'video' or video.get('codec_name') != reference['sdpMetadata']['videoCodec']
+                    or reference['decodedDimensions'] != [[video['width'], video['height']]]):
+                return False
+            duration, began = float(video['duration']), float(video['start_time'])
+            if not math.isfinite(duration) or not math.isfinite(began) or duration < MIN_RECORDED_SECONDS:
+                return False
+        return (bad['startMs'] == attempts[-1]['startMs'] and bad['endMs'] == attempts[-1]['endMs']
+                and bad['streams'] == attempts[-1]['streams'])
+    except (KeyError, TypeError, ValueError, AttributeError, StopIteration):
+        return False
 
 
 class Backend:
@@ -229,6 +297,21 @@ class Update:
             need(all(current[project][key] == expected[key] for key in ('sourceRevision', 'sourceSha256')),
                  'sources_changed_since_release_freeze')
 
+    def _repair(self, cid, trigger):
+        need(trigger.get('sourceHealthy') is True, 'source_unhealthy_no_recorder_repair')
+        attempts = self.state.setdefault('repairAttempts', [])
+        need(cid not in attempts, 'release_recorder_repair_limit')
+        self.check_sources()
+        attempts.append(cid)
+        self.state['evidence']['repair-trigger-' + cid] = trigger
+        self.persist()  # Both recovery causes share one budget, charged before dispatch.
+        repair = self.backend.udm({'action': 'recover', 'cameraId': cid, 'owner': self.state['owner']}, timeout=300)
+        self.state['evidence']['repair-' + cid] = repair
+        self.persist()
+        need(repair.get('ok') is True and repair.get('restoredOriginalTcp') is True, 'native_recorder_repair_failed')
+        self.state.setdefault('recorderReadyAfterMs', {})[cid] = int(time.time() * 1000)
+        self.persist()
+
     def health(self, camera_ids=None):
         result = self.backend.udm({'action': 'health', 'mode': 'full', 'cameraIds': camera_ids})
         if result.get('ok') is True:
@@ -243,22 +326,49 @@ class Update:
             for cid in camera_ids:
                 row = rows.get(cid, {})
                 need(row.get('ok') is False, 'target_failure_not_confirmed')
-                need(row.get('sourceHealthy') is True, 'source_unhealthy_no_recorder_repair')
-                attempts = self.state.setdefault('repairAttempts', [])
-                need(cid not in attempts, 'release_recorder_repair_limit')
-                attempts.append(cid)
-                self.state['evidence']['repair-trigger-' + cid] = row
-                self.persist()  # Charge the attempt before an ambiguous remote dispatch.
-                repair = self.backend.udm({'action': 'recover', 'cameraId': cid, 'owner': self.state['owner']}, timeout=300)
-                self.state['evidence']['repair-' + cid] = repair
-                self.persist()
-                need(repair.get('ok') is True and repair.get('restoredOriginalTcp') is True, 'native_recorder_repair_failed')
-                self.state.setdefault('recorderReadyAfterMs', {})[cid] = int(time.time() * 1000)
-                self.persist()
+                self._repair(cid, row)
             checked = self.backend.udm({'action': 'health', 'mode': 'full', 'cameraIds': camera_ids})
             need(sorted(checked.get('activeProbeCameraIds', [])) == sorted(camera_ids), 'native_active_probe_coverage_failed')
             return checked
         return result
+
+    def verify_camera(self, ip, cid, activation):
+        name = 'camera-' + ip
+        health = self.health([cid])
+        self.state['evidence'][name + '-health'] = health
+        self.persist()
+        need(health.get('ok') is True, 'camera_native_media_failed')
+        boundary = max(activation, self.state.get('recorderReadyAfterMs', {}).get(cid, 0))
+        decoded = self.backend.decode([ip], not_before_ms=boundary)
+        self.state['evidence'][name + '-decode'] = decoded
+        self.persist()
+        if recording_audio_repair_candidate(decoded, ip, cid):
+            # The export retry has exhausted two separate intervals. Re-read
+            # healthy source/native state before the single scoped repair;
+            # the remote worker separately checks the source and settings CAS.
+            self.state['evidence'][name + '-decode-before-audio-repair'] = decoded
+            fresh = self.backend.udm({'action': 'health', 'mode': 'full', 'cameraIds': [cid]})
+            self.state['evidence'][name + '-audio-repair-precheck'] = fresh
+            self.persist()
+            rows = fresh.get('cameras', [])
+            need(fresh.get('ok') is True and fresh.get('activeProbeCameraIds') == [cid]
+                 and len(rows) == len(IPS) and {row.get('host') for row in rows} == set(IPS)
+                 and all(row.get('ok') is True and row.get('sourceHealthy') is True for row in rows),
+                 'recording_audio_repair_precheck_failed')
+            target = [row for row in rows if row.get('cameraId') == cid and row.get('host') == ip]
+            need(len(target) == 1, 'recording_audio_repair_scope_failed')
+            self._repair(cid, dict(target[0], cause='recording_audio_missing', decodeEvidence=decoded))
+            health = self.health([cid])
+            self.state['evidence'][name + '-health-after-audio-repair'] = health
+            self.persist()
+            need(health.get('ok') is True, 'camera_native_media_failed')
+            boundary = max(activation, self.state['recorderReadyAfterMs'][cid])
+            decoded = self.backend.decode([ip], not_before_ms=boundary)
+            self.state['evidence'][name + '-decode'] = decoded
+            self.persist()
+        gate_decode(decoded, full=False)
+        return {'ok': True, 'health': health, 'decode': decoded, 'afterActivationMs': activation,
+                'afterRecorderReadyMs': boundary}
 
     def rollback(self):
         self.maintenance(True, recovery=True)
@@ -350,17 +460,7 @@ class Update:
                 self.persist()
                 row = next(r for r in self.state['evidence']['native-media-before']['cameras'] if r['host'] == ip)
                 def verify(ip=ip, cid=row['cameraId'], activation=activation):
-                    health = self.health([cid])
-                    self.state['evidence'][name + '-health'] = health
-                    self.persist()
-                    need(health.get('ok') is True, 'camera_native_media_failed')
-                    recording_boundary = max(activation, self.state.get('recorderReadyAfterMs', {}).get(cid, 0))
-                    decoded = self.backend.decode([ip], not_before_ms=recording_boundary)
-                    self.state['evidence'][name + '-decode'] = decoded
-                    self.persist()
-                    gate_decode(decoded, full=False)
-                    return {'ok': True, 'health': health, 'decode': decoded, 'afterActivationMs': activation,
-                            'afterRecorderReadyMs': recording_boundary}
+                    return self.verify_camera(ip, cid, activation)
                 self.step(name, verify)
                 status = self.backend.nas({'mode': 'resume', 'baseline': self.state['baseline'], 'release': self.state['release']})
                 need(status.get('ok') is True, 'bridge_resume_failed')

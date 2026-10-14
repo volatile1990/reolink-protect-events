@@ -85,6 +85,11 @@ python tools/protect_ops.py resume --config /path/to/local-controller.json --run
    complete configuration, replay state, runtime identity and Compose settings.
    Gate each camera on native playback and real decoded clips recorded entirely
    after activation. The first camera is the canary for the remaining five.
+   One persistent missing recorded AAC track can use the same single-camera
+   repair budget as a native failure. It requires two disjoint exports containing
+   exactly the expected video, clean live video/audio decodes and freshly checked
+   healthy sources/native streams. Other recording or decode faults remain hard
+   failures. After repair, native playback and new recorded AV must pass again.
 6. Install the Events release and separate media-monitor service. Back up service
    files, private configuration and a consistent SQLite source journal. Enable
    automatic thumbnail selection for new events. Verify compatibility, all media

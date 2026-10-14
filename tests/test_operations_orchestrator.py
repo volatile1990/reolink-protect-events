@@ -294,6 +294,157 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(result['ok'],result)
 
 
+def persistent_recording_audio_missing(ip, cid):
+    rows = [dict(host=ip, cameraId=cid, profile=profile, quality=quality, channel=channel,
+                 ok=True, realVideoDecode=True, realAudioDecode=True, cleanDecode=True,
+                 expectedDimensionsMatch=True, expectedAudioMatch=True, warningCategories={},
+                 decodedTimestampErrors=0, errorCode=None, sdpMetadata={'videoCodec':'hevc'},
+                 decodedDimensions=[[64,36]])
+            for profile,quality,channel in (('main','high',0),('sub','low',2))]
+    first = {k:rows[0][k] for k in ('host','cameraId','profile','quality','channel')}
+    first.update(startMs=1001000,endMs=1025000,requestedExportSeconds=24,exportBytes=32768,
+                 ok=False,errorCode='decode_recording_audio_missing',videoMetadataPreserved=True,
+                 streams=[{'codec_type':'video','codec_name':'hevc','width':64,'height':36,
+                           'start_time':'0.0','duration':'24.001'}])
+    second = dict(copy.deepcopy(first),startMs=1025001,endMs=1049001)
+    bad = dict(copy.deepcopy(second),exportAttempts=[first,second],exportRetryUsed=True)
+    good = {k:rows[1][k] for k in ('host','cameraId','profile','quality','channel')}
+    good.update(ok=True,decode={'ok':True,'realVideoDecode':True,'realAudioDecode':True})
+    return {'ok':False,'realDecodes':False,'rtsp':rows,'recordings':[bad,good],
+            'rtspProfileCoverage':{'expectedRequested':2,'checked':2,'passed':2,'allRequested':True},
+            'recordedProfileCoverage':{'expectedRequested':2,'checked':2,'passed':1,'allRequested':False}}
+
+
+class RecordingAudioRepairTests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory()
+        self.root=Path(self.temp.name).resolve();self.directory=self.root/'release'
+        self.backend=FakeBackend();self.cid=self.backend.identities[IPS[0]]
+        self.failure=persistent_recording_audio_missing(IPS[0],self.cid)
+        self.clock=[1000.0];self.recovered=False;self.native_calls=0;self.scoped_decodes=[]
+        self.bad_precheck=False;self.native_failure_first=False;self.persistent_after_repair=False
+        self.restore_proven=True;self.after_repair_failure=None
+        original_udm,original_decode=self.backend.udm,self.backend.decode
+
+        def dispatch(request,timeout=None):
+            result=original_udm(request,timeout)
+            if request['action']=='health' and request.get('cameraIds')==[self.cid]:
+                self.native_calls+=1
+                if self.native_failure_first and self.native_calls==1:
+                    target=next(row for row in result['cameras'] if row['cameraId']==self.cid)
+                    target.update(ok=False,protectHealthy=False,cause='native_empty');result['ok']=False
+                if self.bad_precheck and self.native_calls==2:
+                    target=next(row for row in result['cameras'] if row['cameraId']==self.cid)
+                    target.update(ok=False,sourceHealthy=False);result['ok']=False
+            if request['action']=='recover':
+                self.assertEqual(timeout,300)
+                saved=json.loads((self.directory/'update.json').read_text())
+                self.assertEqual(saved['repairAttempts'],[self.cid],'attempt must be charged before remote dispatch')
+                trigger=saved['evidence']['repair-trigger-'+self.cid]
+                if trigger['cause']=='recording_audio_missing':
+                    self.assertEqual(trigger['decodeEvidence'],self.failure)
+                    self.assertEqual(saved['evidence']['camera-'+IPS[0]+'-decode-before-audio-repair'],self.failure)
+                    self.assertTrue(saved['evidence']['camera-'+IPS[0]+'-audio-repair-precheck']['ok'])
+                self.clock[0]+=60;self.recovered=True
+                result['restoredOriginalTcp']=self.restore_proven
+            return result
+
+        def decode(ips=None,not_before_ms=None):
+            result=original_decode(ips,not_before_ms)
+            if ips==[IPS[0]]:
+                self.scoped_decodes.append(not_before_ms);self.clock[0]+=120
+                if not self.recovered or self.persistent_after_repair:
+                    return copy.deepcopy(self.failure)
+                if self.after_repair_failure is not None:
+                    return copy.deepcopy(self.after_repair_failure)
+            return result
+
+        self.backend.udm,self.backend.decode=dispatch,decode
+
+    def tearDown(self):self.temp.cleanup()
+
+    def execute(self):
+        with patch.object(orchestrator.time,'time',side_effect=lambda:self.clock[0]):
+            return Update(self.backend,self.directory).run()
+
+    def repairs(self):
+        return [row for row in self.backend.calls if row[0]=='udm' and row[1]['action']=='recover']
+
+    def test_exact_two_disjoint_video_only_exports_repair_once_and_decode_after_ack(self):
+        self.assertTrue(orchestrator.recording_audio_repair_candidate(self.failure,IPS[0],self.cid))
+        report=self.execute();self.assertTrue(report['ok'],report)
+        self.assertEqual([row[1]['cameraId'] for row in self.repairs()],[self.cid])
+        state=json.loads((self.directory/'update.json').read_text())
+        self.assertEqual(state['repairAttempts'],[self.cid])
+        boundary=state['recorderReadyAfterMs'][self.cid]
+        self.assertEqual(boundary,1180000,'recording boundary must follow the successful remote ack')
+        self.assertEqual(self.scoped_decodes,[1000000,boundary])
+        self.assertGreater(boundary,self.failure['recordings'][0]['endMs'])
+        self.assertTrue(state['evidence']['camera-'+IPS[0]+'-health-after-audio-repair']['ok'])
+        self.assertEqual(state['evidence']['camera-'+IPS[0]]['afterRecorderReadyMs'],boundary)
+        self.assertIsNone(self.backend.marker)
+
+    def test_corrupt_codec_audio_clock_and_payload_errors_never_dispatch_recovery(self):
+        original=copy.deepcopy(self.failure)
+        for code in ('decode_recording_video_metadata_changed','decode_recording_probe_failed',
+                     'decode_recording_tracks_invalid','decode_track_timing_invalid','decode_codec_mismatch',
+                     'decode_export_timeout','decode_export_http_500','decode_export_http_503'):
+            with self.subTest(code=code):
+                self.failure=copy.deepcopy(original);self.failure['recordings'][0]['errorCode']=code
+                report=self.execute();self.assertFalse(report['ok']);self.assertFalse(self.repairs())
+                self.assertEqual(report['status'],'rolled-back',report)
+                self.directory=self.root/code
+        for mutation in ('payload','wrong_codec','bad_clock','overlap','one_attempt','rtsp','two_profiles'):
+            with self.subTest(mutation=mutation):
+                value=copy.deepcopy(original);bad=value['recordings'][0]
+                if mutation=='payload':bad['decode']={'ok':False,'realVideoDecode':False,'warningCategories':{'decodeErrors':1}}
+                elif mutation=='wrong_codec':bad['exportAttempts'][1]['streams'][0]['codec_name']='h264'
+                elif mutation=='bad_clock':bad['exportAttempts'][1]['streams'][0]['duration']='NaN'
+                elif mutation=='overlap':bad['exportAttempts'][1]['startMs']=bad['exportAttempts'][0]['endMs']
+                elif mutation=='one_attempt':bad['exportAttempts'].pop()
+                elif mutation=='rtsp':value['rtsp'][0].update(ok=False,realAudioDecode=False)
+                elif mutation=='two_profiles':value['recordings'][1].update(ok=False,errorCode='decode_recording_audio_missing')
+                self.assertFalse(orchestrator.recording_audio_repair_candidate(value,IPS[0],self.cid))
+
+    def test_fresh_unhealthy_source_precheck_never_dispatches_audio_repair(self):
+        self.bad_precheck=True
+        report=self.execute()
+        self.assertEqual(report['errorCode'],'recording_audio_repair_precheck_failed')
+        self.assertEqual(report['status'],'rolled-back',report);self.assertFalse(self.repairs())
+
+    def test_recording_and_native_failures_share_one_charged_repair_budget(self):
+        self.native_failure_first=True;self.persistent_after_repair=True
+        report=self.execute()
+        self.assertEqual(report['errorCode'],'release_recorder_repair_limit')
+        self.assertEqual(len(self.repairs()),1,'audio export failure cannot charge a second native rebuild')
+        state=json.loads((self.directory/'update.json').read_text())
+        self.assertEqual(state['repairAttempts'],[self.cid]);self.assertEqual(report['status'],'rolled-back',report)
+
+    def test_existing_charged_attempt_prevents_another_audio_repair_before_dispatch(self):
+        with patch.object(orchestrator.time,'time',side_effect=lambda:self.clock[0]):
+            update=Update(self.backend,self.directory)
+            update.state['frozen']=self.backend.freeze(self.directory)
+            update.state['repairAttempts']=[self.cid]
+            update.state['evidence']['repair-'+self.cid]={'restoredOriginalTcp':True}
+            update.persist()
+            with self.assertRaisesRegex(RuntimeError,'^release_recorder_repair_limit$'):
+                update.verify_camera(IPS[0],self.cid,1000000)
+        self.assertFalse(self.repairs())
+        self.assertEqual(json.loads((self.directory/'update.json').read_text())['repairAttempts'],[self.cid])
+
+    def test_audio_repair_requires_original_tcp_restore_proof_before_new_decode(self):
+        self.restore_proven=False
+        report=self.execute();self.assertEqual(report['errorCode'],'native_recorder_repair_failed')
+        self.assertEqual(len(self.repairs()),1);self.assertEqual(len(self.scoped_decodes),1)
+        self.assertEqual(report['status'],'failed',report);self.assertIsNotNone(self.backend.marker)
+
+    def test_actual_postrepair_payload_failure_has_no_second_repair_or_decode_retry(self):
+        self.after_repair_failure={'ok':False,'realDecodes':False,'errorCode':'decode_codec_mismatch'}
+        report=self.execute();self.assertEqual(report['errorCode'],'real_media_decode_failed')
+        self.assertEqual(len(self.repairs()),1);self.assertEqual(len(self.scoped_decodes),2)
+        self.assertEqual(report['status'],'rolled-back',report)
+
+
 class TransportTests(unittest.TestCase):
     def test_invalid_host_is_rejected_before_running_ssh(self):
         with patch.object(transport.subprocess,'run')as called:
