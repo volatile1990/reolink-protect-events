@@ -90,6 +90,10 @@ def get_bytes(url, headers=None, *, timeout=5, limit=2 * 1024 * 1024, include_he
             if len(data) > limit:
                 raise ValueError("http_response_oversized")
             return (response.status, data, dict(response.headers)) if include_headers else (response.status, data)
+    except socket.timeout:
+        # Before Python 3.10 socket.timeout is a separate OSError subclass.
+        # Normalize every TCP/TLS/request/response timeout at this API boundary.
+        raise TimeoutError("http_total_deadline") from None
     finally:
         connection.close()
         if sock is not None:

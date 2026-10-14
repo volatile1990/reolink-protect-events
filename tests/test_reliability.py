@@ -261,6 +261,15 @@ class TcpFixture:
 
 
 class DeadlineTests(unittest.TestCase):
+    def test_pre310_distinct_socket_timeout_is_normalized_at_api_boundary(self):
+        class LegacySocketTimeout(OSError):
+            pass
+        with patch('reolink_protect_events.http_deadline.socket.timeout', LegacySocketTimeout), \
+             patch('reolink_protect_events.http_deadline.http.client.HTTPConnection.connect', side_effect=LegacySocketTimeout):
+            with self.assertRaises(TimeoutError) as failure:
+                get_bytes('http://127.0.0.1:1/', timeout=0.1)
+            self.assertEqual(str(failure.exception), 'http_total_deadline')
+
     def test_close_delimited_response_does_not_close_socket_before_delayed_body(self):
         for headers in (b'HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close', b'HTTP/1.0 200 OK'):
             fixture = TcpFixture(headers + b'\r\n\r\nabc', body_delay=0.05)
