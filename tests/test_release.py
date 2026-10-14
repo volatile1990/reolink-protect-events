@@ -139,7 +139,7 @@ class ReleaseTests(unittest.TestCase):
 
     def test_static_json_symlink_is_rejected(self):
         with tempfile.TemporaryDirectory()as folder:
-            root=Path(folder);pkg=root/'reolink_protect_events';pkg.mkdir();(root/'compatibility').mkdir()
+            root=Path(folder).resolve();pkg=root/'reolink_protect_events';pkg.mkdir();(root/'compatibility').mkdir()
             (pkg/'__init__.py').write_text('__version__ = "1.0.0"')
             target=root/'compatibility/contract.json';target.write_text('{}')
             actual=Path.is_symlink
