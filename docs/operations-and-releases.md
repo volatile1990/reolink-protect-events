@@ -84,6 +84,16 @@ using the frozen workers. OS locks release automatically after a controller
 crash. A mismatched receipt, foreign maintenance marker or configuration drift
 requires investigation; the controller never resets unrelated camera settings.
 
+A resume can use a corrected read-only health checker from the current clean
+repository; its source revision/hash is recorded separately. Every mutating
+rollback worker still comes from the original frozen bundle. A fresh clip waits
+up to three minutes for post-activation recording-index readiness. Decode errors
+remain failures, and per-camera health/decode evidence is retained before gating.
+An already successful bridge hardware audit can be reused only for the exact
+same clean source revision, canonical ZIP hash and version. The NAS validates
+its immutable image ID, tag and source labels again before deployment. An Events
+checker correction therefore does not need another identical bridge build.
+
 ## Continuous monitor
 
 `reolink-protect-media-monitor.service` uses the same private console config as

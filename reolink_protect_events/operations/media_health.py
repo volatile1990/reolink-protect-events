@@ -6,6 +6,9 @@ from .protect import automatic_channel, qualities, recording_ends, selected_came
 from .safety import VERSION, OperationError, error_code, need, validate_config
 from .ubv import probe_ubv
 
+PROGRESS_WAIT_SECONDS = 45
+PROGRESS_POLL_SECONDS = 8
+
 
 def _number(value):
     return type(value) in (int, float) and 0 <= value <= 10**16
@@ -30,11 +33,16 @@ def source_health(metrics):
             'connectionEpoch':epoch if type(epoch)is int and 0<=epoch<=10**12 else None}
 
 
-def inspect(config, *, prior=None, now_ms=None, api=None, fetch=None):
+def inspect(config, *, prior=None, now_ms=None, api=None, fetch=None, deadline=None, clock=None):
     """Return a public report plus raw bootstrap in worker memory only."""
-    validate_config(config); api=api or protect_json; fetch=fetch or bridge_metrics
+    validate_config(config); real_api=api is None; api=api or protect_json; fetch=fetch or bridge_metrics
     now_ms=int(time.time()*1000) if now_ms is None else now_ms
-    bootstrap=api(config,'/api/bootstrap')
+    if deadline is not None and real_api:
+        # Reserve the source requests' existing four-second total deadline.
+        remaining=deadline-(clock or time.monotonic)()
+        need(remaining>4,'recording_progress_timeout')
+        bootstrap=api(config,'/api/bootstrap',timeout=min(8,remaining-4))
+    else:bootstrap=api(config,'/api/bootstrap')
     cameras=selected_cameras(config,bootstrap)
     bridges={b['cameraId']:b for b in config['bridges']}
     def read(camera):
@@ -68,47 +76,87 @@ def inspect(config, *, prior=None, now_ms=None, api=None, fetch=None):
             'handsetPlaybackVerified':False},bootstrap
 
 
+def _available(report):
+    """Only fresh, connected input may wait for cached recorder statistics."""
+    return report['scopeValid'] and all(row['sourceHealthy'] and row['protectConnected']
+        and bool(row['recordings']) and all(r['fresh'] for r in row['recordings'])
+        for row in report['cameras'])
+
+
+def _progress(report, wanted=None):
+    rows=[row for row in report['cameras'] if wanted is None or row['cameraId'] in wanted]
+    return report['scopeValid'] and bool(rows) and all(bool(row['recordings'])
+        and all(r['advanced'] is True for r in row['recordings']) for row in rows)
+
+
 def run_once(config, root=None, *, mode='quick', prior=None, now_ms=None, api=None, fetch=None, probe=None,
-             camera_ids=None):
+             camera_ids=None, clock=None, sleep=None):
     """Public readonly health API. Full means actual UBV metadata for every mode.
 
     Payload decoding is intentionally not claimed by metadata probes. External
     rollout gates may add bounded FFmpeg recording/RTSP decode evidence.
     """
     if mode not in ('quick','full'):raise OperationError('health_mode_invalid')
+    observe=prior is None and (api is None or clock is not None)
+    clock=clock or time.monotonic; sleep=sleep or time.sleep
+    began=clock(); deadline=began+PROGRESS_WAIT_SECONDS
+    def sample_time():
+        return None if now_ms is None else now_ms+int((clock()-began)*1000)
     try:
-        report,bootstrap=inspect(config,prior=prior,now_ms=now_ms,api=api,fetch=fetch)
-        if prior is None and api is None:
-            # One fresh historical end alone cannot prove a running recorder.
-            # The service supplies its previous 30-second sample; a one-shot
-            # real health command observes a second snapshot instead.
-            previous={row['cameraId']:{'recordingEnds':row['recordingEnds']}for row in report['cameras']}
-            time.sleep(8)
-            report,bootstrap=inspect(config,prior=previous,now_ms=None if now_ms is None else now_ms+8000,
-                                     api=api,fetch=fetch)
-            report['recordingProgressSampleSeconds']=8
-        else:report['recordingProgressSampleSeconds']=None
-        report['recordingProgressObserved']=all(r['advanced']is True for row in report['cameras']for r in row['recordings'])
-        report['mode']=mode
+        report,bootstrap=inspect(config,prior=prior,now_ms=sample_time(),api=api,fetch=fetch,
+                                 deadline=deadline if observe else None,clock=clock)
+        # Never replace this checkpoint while waiting: different cached profiles
+        # may advance in different responses, and all eleven must advance.
+        previous=prior if prior is not None else {
+            row['cameraId']:{'recordingEnds':dict(row['recordingEnds'])}for row in report['cameras']}
         known={row['cameraId']for row in report['cameras']}
         if camera_ids is not None:
             need(isinstance(camera_ids,(list,tuple))and 1<=len(camera_ids)<=6
                  and all(isinstance(cid,str)for cid in camera_ids)
                  and len(set(camera_ids))==len(camera_ids)and set(camera_ids)<=known,'health_camera_scope_invalid')
         wanted=known if camera_ids is None else set(camera_ids)
-        report['activeProbeCameraIds']=sorted(wanted)if mode=='full'else[]
-        report['fullActiveCoverage']=mode=='full'and wanted==known
-        if mode=='full':
+        timeout=False
+        if observe:
+            # Protect publishes recording ends in cached blocks. A fresh value
+            # can legitimately stay unchanged across several eight-second reads.
+            while _available(report) and not _progress(report):
+                remaining=deadline-clock()
+                if remaining<=0:timeout=True;break
+                if api is None and remaining<=5:
+                    sleep(remaining);timeout=True;break
+                sleep(min(PROGRESS_POLL_SECONDS,remaining-5 if api is None else remaining))
+                if clock()>=deadline:timeout=True;break
+                report,bootstrap=inspect(config,prior=previous,now_ms=sample_time(),api=api,fetch=fetch,
+                                         deadline=deadline,clock=clock)
+        report['activeProbeCameraIds']=[];report['fullActiveCoverage']=False
+        if mode=='full' and report['ok'] and not timeout:
             probe=probe or probe_ubv; by_id={c['id']:c for c in selected_cameras(config,bootstrap)}
+            evidence={}
             for row in report['cameras']:
                 if row['cameraId']not in wanted:continue
                 camera=by_id[row['cameraId']]
-                row['activeProbes']=[]
+                evidence[row['cameraId']]=[]
                 for channel in sorted(set([c for _,_,c in qualities(camera)]+[automatic_channel(camera)])):
                     result=probe(config,camera,channel,seconds=8)
-                    row['activeProbes'].append(result)
-                row['ok']=row['ok']and all(p.get('ok')is True for p in row['activeProbes'])
+                    evidence[row['cameraId']].append(result)
+            # The full sweep can last more than two minutes. Refresh both source
+            # and recording age, preserving the original comparison checkpoint.
+            report,bootstrap=inspect(config,prior=previous,now_ms=sample_time(),api=api,fetch=fetch)
+            for row in report['cameras']:
+                if row['cameraId']not in evidence:continue
+                row['activeProbes']=evidence[row['cameraId']]
+                active_ok=all(p.get('ok')is True for p in row['activeProbes'])
+                row['ok']=row['ok']and active_ok
+                if not active_ok and row['sourceHealthy']:row['cause']='protect_media_unhealthy'
+            report['activeProbeCameraIds']=sorted(evidence)
+            report['fullActiveCoverage']=set(evidence)==known
             report['ok']=report['scopeValid']and all(row['ok']for row in report['cameras'])
+        report['recordingProgressSampleSeconds']=round(clock()-began,3) if observe or mode=='full' else None
+        report['recordingProgressObserved']=_progress(report)
+        report['scopedRecordingProgressObserved']=_progress(report,wanted)
+        report['mode']=mode
+        if timeout:
+            report['ok']=False;report['errorCode']='recording_progress_timeout'
         return report
     except Exception as error:
         return {'schemaVersion':1,'atMs':int(time.time()*1000)if now_ms is None else now_ms,

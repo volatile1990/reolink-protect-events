@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from reolink_protect_events.operations import compatibility, media_health, monitor, protect, recovery
 from reolink_protect_events.operations.safety import OperationError, read_json, write_json
 
@@ -70,6 +71,7 @@ class MonitorTests(unittest.TestCase):
         self.assertTrue(report['ok']);self.assertEqual(report['expectedRecordingProfiles'],11)
         self.assertEqual([r['automaticChannel']for r in report['cameras']],[1,1,1,1,1,0])
     def test_full_live_scope_is_explicit_and_invalid_ids_never_probe(self):
+        self.api.advance=True
         cid=self.config['bridges'][-1]['cameraId']
         report=media_health.run_once(self.config,mode='full',camera_ids=[cid],api=self.api,fetch=metrics,probe=self.probe)
         self.assertTrue(report['ok']);self.assertFalse(report['fullActiveCoverage'])
@@ -161,6 +163,116 @@ class MonitorTests(unittest.TestCase):
         report=compatibility.assess(self.config,api=self.api,schema_reader=lambda:called.append(True))
         self.assertEqual(report['state'],'unsupported');self.assertFalse(report['certified'])
         self.assertFalse(report['nativeWritesAllowed']);self.assertFalse(called)
+
+
+class HealthProgressTests(unittest.TestCase):
+    def setUp(self):
+        self.config,self.boot,self.now=fixture();self.elapsed=0;self.sleeps=[];self.reads=0;self.probes=[]
+    def clock(self):return self.elapsed
+    def sleep(self,seconds):self.sleeps.append(seconds);self.elapsed+=seconds
+    def cached_api(self,advance_after=None,stuck_quality=None):
+        def read(_config,_path,**_options):
+            self.reads+=1;value=copy.deepcopy(self.boot)
+            if advance_after is not None and self.reads>advance_after:
+                for camera in value['cameras']:
+                    for key in ('recordingEnd','recordingEndLQ'):
+                        if (camera['id'],key)!=stuck_quality:
+                            camera['stats']['video'][key]=self.now+int(self.elapsed*1000)
+            return value
+        return read
+    def run_health(self,api,**options):
+        return media_health.run_once(self.config,api=api,fetch=metrics,now_ms=self.now,
+            clock=self.clock,sleep=self.sleep,**options)
+    def probe(self,_config,camera,channel,**_):
+        self.probes.append((camera['id'],channel));self.elapsed+=8
+        return {'ok':True,'channel':channel,'mediaSaved':False}
+    def test_default_api_cached_first_four_reads_then_all_profiles_advance(self):
+        # Exercise the real API selection path without networking or wall sleeps.
+        with patch.object(media_health,'protect_json',side_effect=self.cached_api(4))as api:
+            report=media_health.run_once(self.config,fetch=metrics,now_ms=self.now,
+                clock=self.clock,sleep=self.sleep)
+        self.assertTrue(report['ok'],report);self.assertTrue(report['recordingProgressObserved'])
+        self.assertEqual(self.reads,5);self.assertEqual(self.sleeps,[8,8,8,8])
+        self.assertEqual(report['recordingProgressSampleSeconds'],32)
+        ends=[r for row in report['cameras']for r in row['recordings']]
+        self.assertEqual(len(ends),11);self.assertTrue(all(r['advanced']is True for r in ends))
+        self.assertTrue(all(0<call.kwargs['timeout']<=8 for call in api.call_args_list))
+    def test_fresh_cached_ends_never_advancing_fail_at_45_second_limit(self):
+        report=self.run_health(self.cached_api())
+        self.assertFalse(report['ok']);self.assertEqual(report['errorCode'],'recording_progress_timeout')
+        self.assertEqual(self.elapsed,45);self.assertEqual(self.sleeps,[8,8,8,8,8,5])
+        self.assertEqual(self.reads,6);self.assertFalse(report['recordingProgressObserved'])
+        self.assertTrue(all(row['sourceHealthy']and all(r['fresh']for r in row['recordings'])
+                            for row in report['cameras']))
+        self.assertFalse(self.probes)
+    def test_one_of_eleven_stalled_profiles_cannot_be_hidden_by_other_progress(self):
+        stuck=(self.boot['cameras'][4]['id'],'recordingEndLQ')
+        report=self.run_health(self.cached_api(1,stuck_quality=stuck))
+        self.assertFalse(report['ok']);self.assertEqual(self.elapsed,45)
+        ends=[r for row in report['cameras']for r in row['recordings']]
+        self.assertEqual(sum(r['advanced']is True for r in ends),10)
+        self.assertEqual(sum(r['advanced']is False for r in ends),1)
+    def test_profiles_advancing_in_different_cached_blocks_use_one_original_checkpoint(self):
+        def read(_config,_path,**_options):
+            self.reads+=1;value=copy.deepcopy(self.boot)
+            for camera in value['cameras']:
+                if self.reads>=2:camera['stats']['video']['recordingEnd']=self.now+8000
+                if self.reads>=3:camera['stats']['video']['recordingEndLQ']=self.now+16000
+            return value
+        report=self.run_health(read)
+        self.assertTrue(report['ok'],report);self.assertEqual(self.reads,3);self.assertEqual(self.elapsed,16)
+        self.assertTrue(report['recordingProgressObserved'])
+    def test_source_failure_while_waiting_stops_before_active_probe(self):
+        def fetch(bridge):
+            if self.elapsed>=8 and bridge['cameraId']==self.boot['cameras'][0]['id']:
+                return {'status':'waiting-for-camera','streams':[]}
+            return metrics(bridge)
+        report=media_health.run_once(self.config,mode='full',api=self.cached_api(),fetch=fetch,
+            probe=self.probe,now_ms=self.now,clock=self.clock,sleep=self.sleep)
+        self.assertFalse(report['ok']);self.assertEqual(self.elapsed,8);self.assertEqual(self.reads,2)
+        self.assertFalse(self.probes);self.assertFalse(report['fullActiveCoverage'])
+        self.assertFalse(report['cameras'][0]['sourceHealthy'])
+    def test_stale_initial_recording_stops_without_waiting_or_probing(self):
+        self.boot['cameras'][0]['stats']['video']['recordingEnd']=self.now-120001
+        report=self.run_health(self.cached_api(1),mode='full',probe=self.probe)
+        self.assertFalse(report['ok']);self.assertEqual(self.reads,1);self.assertEqual(self.elapsed,0)
+        self.assertFalse(self.sleeps);self.assertFalse(self.probes)
+    def test_full_refresh_compares_against_original_not_preprobe_cached_snapshot(self):
+        cid=self.boot['cameras'][-1]['id']
+        def read(_config,_path,**_options):
+            self.reads+=1;value=copy.deepcopy(self.boot)
+            if self.reads>=2:
+                for camera in value['cameras']:
+                    for key in ('recordingEnd','recordingEndLQ'):camera['stats']['video'][key]=self.now+8000
+            return value
+        report=self.run_health(read,mode='full',camera_ids=[cid],probe=self.probe)
+        self.assertTrue(report['ok'],report);self.assertEqual(self.reads,3);self.assertEqual(report['atMs'],self.now+16000)
+        self.assertTrue(report['recordingProgressObserved']);self.assertTrue(report['scopedRecordingProgressObserved'])
+        self.assertFalse(report['fullActiveCoverage']);self.assertEqual(report['activeProbeCameraIds'],[cid])
+        self.assertEqual(self.probes,[(cid,0)])
+        self.assertEqual(report['cameras'][-1]['recordings'][0]['ageMs'],8000)
+        self.assertEqual(report['cameras'][-1]['activeProbes'],[{'ok':True,'channel':0,'mediaSaved':False}])
+    def test_full_final_refresh_cannot_keep_old_green_when_source_fails(self):
+        cid=self.boot['cameras'][-1]['id']
+        def fetch(bridge):
+            if self.elapsed>=16 and bridge['cameraId']==cid:return {'status':'waiting-for-camera','streams':[]}
+            return metrics(bridge)
+        report=media_health.run_once(self.config,mode='full',camera_ids=[cid],api=self.cached_api(1),
+            fetch=fetch,probe=self.probe,now_ms=self.now,clock=self.clock,sleep=self.sleep)
+        self.assertFalse(report['ok']);self.assertEqual(self.reads,3)
+        self.assertFalse(report['cameras'][-1]['sourceHealthy']);self.assertEqual(report['atMs'],self.now+16000)
+        self.assertTrue(report['cameras'][-1]['activeProbes'][0]['ok'])
+    def test_full_final_refresh_rejects_recordings_that_became_stale_during_sweep(self):
+        def read(_config,_path,**_options):
+            self.reads+=1;value=copy.deepcopy(self.boot)
+            if self.reads>=2:
+                for camera in value['cameras']:
+                    for key in ('recordingEnd','recordingEndLQ'):camera['stats']['video'][key]=self.now+8000
+            return value
+        report=self.run_health(read,mode='full',probe=self.probe)
+        self.assertFalse(report['ok']);self.assertEqual(len(self.probes),16);self.assertEqual(self.elapsed,136)
+        self.assertTrue(report['fullActiveCoverage']);self.assertTrue(report['recordingProgressObserved'])
+        self.assertTrue(all(r['ageMs']==128000 and not r['fresh']for row in report['cameras']for r in row['recordings']))
 
 
 class RecoveryTests(unittest.TestCase):

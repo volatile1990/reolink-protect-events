@@ -65,6 +65,7 @@ class Backend:
         self.bridge_manifest = load_module(self.bridge_repo / 'tools/release_manifest.py', 'owned_bridge_manifest')
         self.nas_cli = load_module(self.bridge_repo / 'tools/deploy/cli.py', 'owned_bridge_deploy')
         self.operation_sources = source_bundle(self.events_repo)
+        self.verification_sources = self.operation_sources
         self.nas_sources = self.nas_cli.source_bundle()
 
     def current_sources(self):
@@ -98,18 +99,66 @@ class Backend:
             rows.append({'repository': repo.name, 'passed': True, 'tests': int(count[1]) if count else None})
         return {'ok': True, 'results': rows}
 
+    def cached_build(self, directory, frozen):
+        """Reuse only an exact-source, successful isolated artifact audit.
+
+        The NAS plan subsequently checks the immutable image ID, tag and source
+        labels again before recording a baseline or changing any camera.
+        """
+        required = frozen['sources']['bridge']
+        siblings = sorted((p for p in directory.parent.iterdir() if p.is_dir() and not p.is_symlink()
+                           and len(p.name) == 32 and all(c in '0123456789abcdef' for c in p.name)),
+                          key=lambda p: p.stat().st_mtime, reverse=True)
+        for path in siblings[:24]:
+            receipt = path / 'update.json'
+            if path == directory or receipt.is_symlink() or not receipt.is_file() or receipt.stat().st_size > 16 * 1024 * 1024:
+                continue
+            try:
+                state = json.loads(receipt.read_text(encoding='utf-8'))
+                value = state['evidence']['isolated-build-and-hardware-tests']
+                release = value['release']
+                flags = ('ok', 'testsPassed', 'testedApplicationDllIdentical', 'cleanupConfirmed', 'productionInventoryPreserved', 'kernelProcessLimitVerified')
+                if not all(value.get(k) is True for k in flags):
+                    continue
+                if any(release.get(k) != required[k] for k in ('sourceSha256', 'sourceRevision', 'version')):
+                    continue
+                if release.get('archiveSha256') != frozen['archiveSha256']:
+                    continue
+                result = dict(value)
+                result['buildCacheReceipt'] = str(receipt)
+                result['buildCacheReused'] = True
+                return result
+            except (KeyError, ValueError, OSError, TypeError):
+                continue
+        return None
+
     def nas(self, payload):
         return self.nas_cli.invoke(payload, self.connector, sources=self.nas_sources)
 
     def udm(self, request, timeout=180):
-        return invoke(self.events_repo, self.host, request, timeout=timeout, sources=self.operation_sources)
+        if request.get('action') == 'health' and request.get('mode') == 'full':
+            timeout = max(timeout, 300)
+        readonly = request.get('action') in ('compatibility', 'health', 'event-evidence', 'monitor-status')
+        return invoke(self.events_repo, self.host, request, timeout=timeout,
+                      sources=self.verification_sources if readonly else self.operation_sources)
 
     def decode(self, ips=None, not_before_ms=None):
         if not_before_ms is not None:
             # Entire twenty-second clip must precede the thirty-second index lag.
             self.wait_until(not_before_ms + 52000)
-        return run_full_decodes(self.host, ips=ips, ffmpeg=self.ffmpeg, ffprobe=self.ffprobe,
-                                not_before_ms=not_before_ms)
+        while True:
+            value = run_full_decodes(self.host, ips=ips, ffmpeg=self.ffmpeg, ffprobe=self.ffprobe,
+                                     not_before_ms=not_before_ms)
+            # Recording-index progress is a readiness condition. Its scoped
+            # discovery fails before opening a viewer, so waiting does not hide
+            # a failed payload decode or introduce concurrent readers.
+            if not_before_ms is None or value.get('errorCode') != 'decode_new_recording_pending':
+                return value
+            now = int(time.time() * 1000)
+            if now >= not_before_ms + 180000:
+                return value
+            self.progress({'stage': 'waiting-for-recording-index', 'reason': 'new-recording-not-indexed-yet'})
+            self.wait_until(min(now + 20000, not_before_ms + 180000))
 
     def wait_until(self, timestamp):
         while int(time.time() * 1000) < timestamp:
@@ -133,6 +182,7 @@ class Update:
                 need(hashlib.sha256(data).hexdigest() == self.state['frozen']['operationSourcesSha256'], 'frozen_operation_sources_changed')
                 sources = json.loads(data)
                 self.backend.operation_sources, self.backend.nas_sources = sources['events'], sources['bridge']
+                self.state['resumedVerificationSources'] = self.backend.current_sources()['events']
             else:
                 need(not self.state['completed'] and not self.state.get('maintenanceIntent') and not self.state.get('maintenanceActive')
                      and not self.state.get('installIntent') and not self.state.get('baseline'), 'incomplete_freeze_state_invalid')
@@ -228,7 +278,11 @@ class Update:
             results.append(restored)
         need(all(r.get('ok') is True for r in results), 'release_rollback_failed')
         health = self.backend.udm({'action': 'health', 'mode': 'full'}, timeout=180)
+        self.state['evidence']['rollback-native-media'] = health
+        self.persist()
         decoded = self.backend.decode()
+        self.state['evidence']['rollback-real-decodes'] = decoded
+        self.persist()
         gate_decode(decoded)
         need(health.get('ok') is True and health.get('fullActiveCoverage') is True, 'rollback_native_media_failed')
         return {'ok': True, 'restored': results, 'health': health, 'decode': decoded, 'journalPreserved': True}
@@ -254,6 +308,9 @@ class Update:
             self.step('real-decode-before', self._full_decode)
             def build():
                 frozen = self.state['frozen']
+                cached = getattr(self.backend, 'cached_build', lambda *_: None)(self.directory, frozen)
+                if cached is not None:
+                    return cached
                 return self.backend.nas({'mode': 'build', 'archiveBase64': base64.b64encode((self.directory / 'bridge-source.zip').read_bytes()).decode(),
                     'archiveSha256': frozen['archiveSha256'], 'sourceManifest': frozen['sources']['bridge'],
                     'imageTag': 'reolink-bridge:managed-' + frozen['sources']['bridge']['sourceSha256'][:12] + '-' + self.state['owner'][:8]})
@@ -286,8 +343,12 @@ class Update:
                 row = next(r for r in self.state['evidence']['native-media-before']['cameras'] if r['host'] == ip)
                 def verify(ip=ip, cid=row['cameraId'], activation=activation):
                     health = self.health([cid])
+                    self.state['evidence'][name + '-health'] = health
+                    self.persist()
                     need(health.get('ok') is True, 'camera_native_media_failed')
                     decoded = self.backend.decode([ip], not_before_ms=activation)
+                    self.state['evidence'][name + '-decode'] = decoded
+                    self.persist()
                     gate_decode(decoded, full=False)
                     return {'ok': True, 'health': health, 'decode': decoded, 'afterActivationMs': activation}
                 self.step(name, verify)
