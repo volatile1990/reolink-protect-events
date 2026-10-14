@@ -151,7 +151,10 @@ class Update:
             return self.state['evidence'][name]
         self.backend.progress({'stage': name, 'status': 'running'})
         value = operation()
-        need(isinstance(value, dict) and value.get('ok') is True, name + '_failed')
+        if not isinstance(value, dict) or value.get('ok') is not True:
+            self.state['evidence'][name + '-failed'] = value if isinstance(value, dict) else {'ok': False, 'errorCode': 'invalid_operation_result'}
+            self.persist()
+            raise UpdateError(name + '_failed')
         self.state['evidence'][name] = value
         self.state['completed'].append(name)
         self.persist()
