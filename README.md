@@ -38,7 +38,12 @@ Protect's timeline preview and full-frame view use separate thumbnail lookups. E
 
 ## Deployment
 
-Python 3.9+ is sufficient; the runtime has no pip dependencies. The console requires local Protect PostgreSQL access through `runuser -u postgres`, an adopted camera MAC for each loopback `updates-ds` connection, and systemd.
+Python 3.9+ is required. Automatic preview selection uses Pillow; the deployment
+package includes a verified release-local ARM64 decoder without installing global
+packages on the console. The console requires local Protect PostgreSQL access
+through `runuser -u postgres`, an adopted camera MAC for each loopback `updates-ds`
+connection, and systemd. See [automatic previews](docs/automatic-thumbnails.md) and
+[automatic own-code releases and the media monitor](docs/operations-and-releases.md).
 
 Offline contracts run on Linux and Windows in CI with Python 3.9, 3.13 and
 3.14. A separate CI job runs the actual native transactions in an isolated

@@ -13,3 +13,8 @@ secrets/
 backups/
 features.json
 feature-deployment.json
+artifacts/
+dist/
+build/
+*.whl
+reolink_protect_events/_vendor/

@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "protectVersion": "7.3.70",
+  "uiVersion": "7.3.26",
+  "certification": "audited-installed-release",
+  "databaseContract": "native.py:_REQUIRED_COLUMNS-and-required-indexes",
+  "dsContract": "updates-ds-v1-no-application-ack",
+  "mediaContract": "native-ubv-500ms-aac-fd06-16000",
+  "recordingExportContract": "loopback-http-7080-api-video-export",
+  "vendorUiSha256": "0ffb0344d673a7f6e04703e1ae6695b77d65d07ba16886cb06956e2581e5cff4",
+  "vendorServiceSha256": "b2dbea8740a201826b66d427e26cc428651751fcf1c4bda6de9b26765e558c16",
+  "supportedLayerOrder": ["native-events-ui", "controls-ui", "aac-clock-canary", "aac-clock-all-six"],
+  "activeFiles": {
+    "/usr/share/unifi-protect/app/service.js": "a4e546e4a9d7cd82dc130a26cc5e92fa2b69f4cdb6fce1368870a543f0d08a7f",
+    "/usr/local/lib/reolink-protect-controls/ubv-aac-clock-compat.cjs": "1d5e5e581f74b0755fd27dc2d4e724eadaaf683eceb58a9b1f03d11bdea9c54e",
+    "/usr/local/lib/reolink-protect-controls/ubv-aac-clock-compat-all.cjs": "139b46a64eb0170a8fdbb4c890db823f12ec2ea2ea1743f40791f8c34ded2a0b"
+  },
+  "policy": {
+    "unknownVersionNativeWritesAllowed": false,
+    "assessmentMayCertify": false,
+    "fullDatabaseRollbackAllowed": false,
+    "recordingsAndJournalMustBePreserved": true
+  }
+}

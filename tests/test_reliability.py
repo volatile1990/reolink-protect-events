@@ -430,7 +430,7 @@ class DeploymentHealthTests(unittest.TestCase):
             root = Path(folder)
             (root / 'config.json').write_text('{}')
             (root / 'health.json').write_text(json.dumps({'atMs': int(time.time() * 1000) - 60000, 'healthy': True}))
-            env.update(root=root, run=lambda args: 'active')
+            env.update(root=root, run=lambda args: 'active', state_of=lambda name: {'active': True, 'enabled': True})
             self.assertFalse(env['health']()['health']['healthy'])
 
 

@@ -69,6 +69,8 @@ def validate_config(config):
         raise ValueError("invalid_stale_seconds")
     if config.get("protectVersion", "7.3.70") != "7.3.70":
         raise ValueError("unsupported_protect_version")
+    from .thumbnails import settings
+    settings(config)
     return config
 
 
@@ -92,17 +94,21 @@ def atomic_json(path, value):
 
 
 def recording_thumbnail(config, interval):
-    """Ask Protect for the recorded frame at the original source timestamp."""
+    """Select genuine recorded snapshots; preserve the original event timestamp."""
     from .native import Thumbnail
+    from .thumbnails import settings, select_recorded
     headers = {"X-UserId": config["protectUserId"], "X-UserRole": "owner", "X-UserPermissionMask": "64",
                "X-UserPermissions": "65535", "X-Internal-Use": "true"}
-    path = "/api/cameras/" + interval["cameraId"] + "/snapshot?ts=" + str(interval["start"])
-    status, content = get_bytes("http://127.0.0.1:7080" + path, headers, timeout=5, limit=2097152)
-    if status != 200:
-        raise ValueError("recording_http_" + str(status))
-    thumbnail = Thumbnail(content, interval["start"])
-    thumbnail.dimensions()
-    return thumbnail
+    def recorded(timestamp, timeout):
+        path = "/api/cameras/" + interval["cameraId"] + "/snapshot?ts=" + str(timestamp)
+        status, content = get_bytes("http://127.0.0.1:7080" + path, headers, timeout=timeout, limit=2097152)
+        if status != 200:
+            raise ValueError("recording_http_" + str(status))
+        thumbnail = Thumbnail(content, timestamp)
+        thumbnail.dimensions()
+        return thumbnail
+    options = settings(config)
+    return select_recorded(interval, options, recorded) if options["mode"] == "automatic" else recorded(interval["start"], 5)
 
 
 class Journal:
@@ -129,7 +135,8 @@ class Journal:
 
         # Additive migration preserves every existing cursor, interval and outbox.
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(media)")}
-        for name, definition in (("next_attempt", "INTEGER NOT NULL DEFAULT 0"), ("error_reason", "TEXT")):
+        for name, definition in (("next_attempt", "INTEGER NOT NULL DEFAULT 0"), ("error_reason", "TEXT"),
+                                 ("selection", "TEXT")):
             if name not in columns:
                 self.db.execute("ALTER TABLE media ADD COLUMN " + name + " " + definition)
         self.db.executescript("""
@@ -318,6 +325,28 @@ class Journal:
             self.db.execute("UPDATE media SET attempts=attempts+1,last_attempt=?,done=?,next_attempt=?,error_reason=? WHERE event_id=?",
                             (now_ms, int(success), 0 if success else now_ms + delay, None if success else error_reason or "unknown", event_id))
 
+    def defer_media(self, event_id, ready_at):
+        with self.db:
+            self.db.execute("UPDATE media SET next_attempt=? WHERE event_id=? AND done=0", (ready_at, event_id))
+
+    def media_interval(self, event_id):
+        row = self.db.execute("SELECT id,camera,class,start,end,provenance,delivered_revision,revision FROM intervals WHERE id=?", (event_id,)).fetchone()
+        return {"eventId": row[0], "cameraId": row[1], "classes": [row[2]], "start": row[3], "end": row[4],
+                "provenance": json.loads(row[5]), "deliveredRevision": row[6], "revision": row[7]} if row else None
+
+    def media_selection(self, event_id, selection):
+        # Preserve source/classification fields. Pin before the native write so
+        # a crash after its commit cannot silently choose another sample time.
+        with self.db:
+            row = self.db.execute("SELECT provenance FROM intervals WHERE id=?", (event_id,)).fetchone()
+            if row:
+                provenance = json.loads(row[0])
+                provenance.setdefault("thumbnailSelection", selection)
+                self.db.execute("UPDATE intervals SET provenance=? WHERE id=?", (json.dumps(provenance), event_id))
+                self.db.execute("UPDATE media SET selection=? WHERE event_id=?", (json.dumps(provenance["thumbnailSelection"]), event_id))
+                return provenance["thumbnailSelection"]
+        return selection
+
     def retry_media(self, event_ids):
         """Explicitly reopen failed attempts; never reset interval delivery state."""
         if not event_ids or any(not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{24}", value) for value in event_ids):
@@ -356,6 +385,9 @@ class Runtime:
         self.last_native_check = 0
         self.background_native = background_native
         self._pool = None
+        self._media_pool = None
+        self._media_future = None
+        self._media_event_id = None
         self._native_thread = None
         self._stop = threading.Event()
         self._native_state = {}
@@ -464,20 +496,68 @@ class Runtime:
 
     def deliver_media(self, now_ms):
         from .native import RetiredEventError
+        from .thumbnails import settings, candidate_times, ThumbnailDeferred, ThumbnailExpired
         if self.capture_only or not self.native_ready:
             return
-        for interval in self.journal.pending_media(now_ms):
+        future = None
+        options = settings(self.config)
+        if options["mode"] == "automatic":
+            if self._media_future is not None:
+                if not self._media_future.done():
+                    return
+                future = self._media_future
+                interval = self.journal.media_interval(self._media_event_id)
+                self._media_future = self._media_event_id = None
+                if interval is None or interval["deliveredRevision"] != interval["revision"]:
+                    return
+                intervals = [interval]
+            else:
+                intervals = self.journal.pending_media(now_ms)
+                if not intervals:
+                    return
+                interval = intervals[0]
+                try:
+                    candidate_times(interval, options, now_ms)
+                except ThumbnailDeferred as deferred:
+                    self.journal.defer_media(interval["eventId"], deferred.ready_at)
+                    return
+                except ThumbnailExpired:
+                    self.journal.media_attempt(interval["eventId"], now_ms, True)
+                    with self.journal.db:
+                        self.journal.count("expiredThumbnailWindows")
+                    return
+                if self._media_pool is None:
+                    self._media_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="recorded-thumbnail")
+                self._media_event_id = interval["eventId"]
+                self._media_future = self._media_pool.submit(recording_thumbnail, self.config, interval)
+                return
+        else:
+            intervals = self.journal.pending_media(now_ms)
+        for interval in intervals:
             if self._stop.is_set():
                 break
             success = False
             error_reason = None
             stage = "snapshot"
             try:
-                thumbnail = recording_thumbnail(self.config, interval)
+                thumbnail = future.result() if future is not None else recording_thumbnail(self.config, interval)
                 if self._stop.is_set():
                     break
+                # A real clear can shorten an open interval while pixels load.
+                # Discard an out-of-interval candidate and resample the new bound.
+                if thumbnail.timestamp < interval["start"] or (interval["end"] is not None and thumbnail.timestamp > interval["end"]):
+                    with self.journal.db:
+                        self.journal.count("thumbnailWindowChanged")
+                    continue
+                selection = getattr(thumbnail, "selection", None)
+                if selection:
+                    selection = self.journal.media_selection(interval["eventId"], selection)
+                    interval = dict(interval, provenance=dict(interval["provenance"], thumbnailSelection=selection))
                 stage = "database"
                 event = self.native.upsert_interval(interval, thumbnail)
+                if selection:
+                    with self.journal.db:
+                        self.journal.count("automaticallySelectedThumbnails" if selection["automaticSelected"] else "fallbackThumbnails")
                 if self._stop.is_set():
                     break
                 stage = "notification"
@@ -487,6 +567,13 @@ class Runtime:
                 success = True
                 with self.journal.db:
                     self.journal.count("retiredMedia")
+            except ThumbnailDeferred as deferred:
+                self.journal.defer_media(interval["eventId"], deferred.ready_at)
+                continue
+            except ThumbnailExpired:
+                success = True
+                with self.journal.db:
+                    self.journal.count("expiredThumbnailWindows")
             except Exception as error:
                 # Fixed reason vocabulary; never persist arbitrary messages or headers.
                 status = re.fullmatch(r"recording_http_([1-5][0-9]{2})", str(error)) if stage == "snapshot" else None
@@ -520,6 +607,8 @@ class Runtime:
                                       "nativeError": type(error).__name__, "workerStopped": True}
         finally:
             if worker is not None:
+                if worker._media_pool is not None:
+                    worker._media_pool.shutdown(wait=True, cancel_futures=True)
                 for client in worker.clients.values():
                     client.close()
                 worker.journal.close()
@@ -613,6 +702,9 @@ class Runtime:
         if self._pool is not None:
             self._pool.shutdown(wait=True, cancel_futures=True)
             self._pool = None
+        if self._media_pool is not None:
+            self._media_pool.shutdown(wait=True, cancel_futures=True)
+            self._media_pool = None
         if self._native_thread is not None:
             self._native_thread.join(timeout=30)
         for client in self.clients.values():

@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "project": "pillow",
+  "version": "11.3.0",
+  "python": "cp39",
+  "architecture": "aarch64",
+  "filename": "pillow-11.3.0-cp39-cp39-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
+  "url": "https://files.pythonhosted.org/packages/43/46/0b85b763eb292b691030795f9f6bb6fcaf8948c39413c81696a01c3577f7/pillow-11.3.0-cp39-cp39-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
+  "sha256": "23cff760a9049c502721bdb743a7cb3e03365fafcdfc2ef9784610714166e5a4",
+  "bytes": 5853376,
+  "license": "MIT-CMU",
+  "purpose": "Release-local JPEG scoring for automatic event thumbnails"
+}

@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""Test and deploy one's own committed bridge/events code as a single release."""
+import argparse
+import json
+import os
+from pathlib import Path
+import sys
+import uuid
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from reolink_protect_events.operations.orchestrator import Backend, Update, need, save
+from reolink_protect_events.operations.locking import process_lock
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('mode', choices=('update', 'resume', 'assess', 'status'))
+    parser.add_argument('--config', required=True, type=Path, help='Local paths/SSH alias only; no passwords or tokens')
+    parser.add_argument('--run', type=Path, help='Exact receipt directory to resume')
+    args = parser.parse_args()
+    need(not args.config.is_symlink(), 'controller_config_invalid')
+    config = json.loads(args.config.read_text(encoding='utf-8'))
+    allowed = {'bridgeRepo', 'eventsRepo', 'connector', 'sshAlias', 'ffmpeg', 'ffprobe', 'dependencyCache', 'stateDirectory'}
+    need(set(config) <= allowed and {'bridgeRepo', 'eventsRepo', 'connector', 'stateDirectory'} <= set(config), 'controller_config_invalid')
+    backend = Backend(config['bridgeRepo'], config['eventsRepo'], config['connector'], host=config.get('sshAlias', 'unifi-dream-machine'),
+                      ffmpeg=config.get('ffmpeg'), ffprobe=config.get('ffprobe'), dependency_cache=config.get('dependencyCache'))
+    if args.mode in ('assess', 'status'):
+        result = backend.udm({'action': 'compatibility' if args.mode == 'assess' else 'monitor-status'})
+        print(json.dumps(result))
+        return 0 if result.get('ok') else 1
+    directory = Path(config['stateDirectory']).resolve()
+    need(not directory.is_symlink(), 'state_directory_invalid')
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock = directory / 'active-controller.lock'
+    lease = process_lock(lock)
+    lease.__enter__()
+    try:
+        latest = directory / 'latest.json'
+        current = backend.current_sources()
+        resume = args.mode == 'resume'
+        run = args.run
+        if args.mode == 'update' and latest.exists():
+            prior = json.loads(latest.read_text())
+            path = directory / prior['run']
+            need(path.parent == directory and len(prior['run']) == 32, 'latest_receipt_invalid')
+            previous = json.loads((path / 'update.json').read_text())
+            same = all(previous.get('frozen', {}).get('sources', {}).get(project, {}).get('sourceSha256') == current[project]['sourceSha256']
+                       for project in ('bridge', 'events'))
+            if previous['status'] == 'complete' and same:
+                result = backend.udm({'action': 'health', 'mode': 'quick'})
+                need(result.get('ok') is True, 'already_deployed_release_unhealthy')
+                print(json.dumps({'ok': True, 'status': 'already-deployed', 'receipt': str(path / 'update.json')}))
+                return 0
+            if previous['status'] in ('running', 'failed') and (previous.get('maintenanceIntent') or previous.get('maintenanceActive')):
+                run, resume = path, True
+        if resume:
+            need(run is not None and run.resolve().parent == directory, 'resume_run_required')
+        else:
+            run = directory / uuid.uuid4().hex
+        updater = Update(backend, run, resume=resume)
+        save(latest, {'run': run.name})
+        result = updater.run()
+        print(json.dumps(result))
+        return 0 if result.get('ok') else 1
+    finally:
+        lease.__exit__(None, None, None)
+
+
+if __name__ == '__main__':
+    try:
+        raise SystemExit(main())
+    except Exception as error:
+        print(json.dumps({'ok': False, 'errorCode': 'release_controller_failed', 'errorType': type(error).__name__}))
+        raise SystemExit(1)

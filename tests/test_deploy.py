@@ -23,6 +23,7 @@ class RollbackTests(unittest.TestCase):
         self.backup.mkdir(parents=True)
         self.calls = []
         self.env.update(root=self.root, unit=self.unit, service=self.unit.name,
+                        monitor_unit=self.root / 'monitor.service', monitor_root=self.root / 'monitor',
                         secure=lambda path: None, run=self.calls.append,
                         subprocess=types.SimpleNamespace(
                             DEVNULL=None, run=lambda args, **kwargs: self.calls.append(args)))
