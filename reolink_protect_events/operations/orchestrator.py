@@ -188,8 +188,11 @@ class Update:
         # One scoped repair per camera/release, only for healthy input and a native failure.
         if camera_ids:
             rows = {r['cameraId']: r for r in result.get('cameras', [])}
+            need(all(row.get('ok') is True for cid, row in rows.items() if cid not in camera_ids),
+                 'unrelated_camera_health_failed')
             for cid in camera_ids:
                 row = rows.get(cid, {})
+                need(row.get('ok') is False, 'target_failure_not_confirmed')
                 need(row.get('sourceHealthy') is True, 'source_unhealthy_no_recorder_repair')
                 attempts = self.state.setdefault('repairAttempts', [])
                 need(cid not in attempts, 'release_recorder_repair_limit')
