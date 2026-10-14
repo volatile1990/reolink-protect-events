@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "reolink-protect-events"
-version = "1.0.1"
+version = "1.1.0"
 description = "Native UniFi Protect event import of real Reolink camera AI classifications"
 requires-python = ">=3.9"
 license = {text = "MIT"}

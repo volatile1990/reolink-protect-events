@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from reolink_protect_events.native import NativeError, RetiredEventError, SchemaError, Thumbnail
-from reolink_protect_events.runtime import Runtime
+from reolink_protect_events.runtime import Journal, Runtime
 
 
 START = 1791586947512
@@ -130,6 +130,7 @@ class RuntimeDeliveryTests(unittest.TestCase):
         self.attach()
 
     def tearDown(self):
+        self.runtime.close()
         self.runtime.journal.db.close()
         self.monotonic.stop()
         self.clock.stop()
@@ -376,6 +377,7 @@ class RuntimeDeliveryTests(unittest.TestCase):
         self.assertTrue(all(client.closed for client in abandoned), "partial retry leaked an old DS client")
 
     def test_collect_deliver_health_and_shutdown_preserve_replay_cursor(self):
+        self.runtime.background_native = False  # Exercise deterministic delivery boundary in this fixture.
         self.runtime.last_native_check = self.now_ms
         self.now_ms = START + 2000
         original_once = self.runtime.once
@@ -389,6 +391,7 @@ class RuntimeDeliveryTests(unittest.TestCase):
              patch.object(self.runtime, "once", side_effect=one_iteration):
             self.runtime.run()
         self.assertEqual(len(self.native.rows), 1)
+        self.runtime.journal = Journal(self.path / 'journal.sqlite3')
         self.assertEqual(self.runtime.journal.health()["pending"], 0)
         self.restart()
         self.assertEqual(self.runtime.journal.cursor(CAMERA)["seq"], 1)

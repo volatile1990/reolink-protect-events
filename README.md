@@ -40,6 +40,16 @@ Protect's timeline preview and full-frame view use separate thumbnail lookups. E
 
 Python 3.9+ is sufficient; the runtime has no pip dependencies. The console requires local Protect PostgreSQL access through `runuser -u postgres`, an adopted camera MAC for each loopback `updates-ds` connection, and systemd.
 
+Offline contracts run on Linux and Windows in CI with Python 3.9, 3.13 and
+3.14. A separate CI job runs the actual native transactions in an isolated
+PostgreSQL 16 container, using synthetic fixtures modeled on the inspected
+Protect schema. Locally, pull `postgres:16` explicitly, then run
+`python tools/test_postgres.py`. The runner publishes no ports, mounts no host
+directories, applies resource limits and removes only its own labeled temporary
+container. Its database marker prevents loading destructive fixtures into an
+unmarked database. These tests verify SQL and concurrency; they do not emulate
+Protect's application alarm handlers or prove compatibility with another release.
+
 The provided deployment tools use a trusted SSH alias (default `unifi-dream-machine`) and the existing private console configuration at `/data/reolink-bridge-events/config.json`. Bridge credentials remain on the console, are copied only to a root-owned mode-0600 configuration, and never enter command arguments, Git or output. Configure your SSH alias beforehand; these tools do not install keys or change host trust. The current deployment helper deliberately checks the six-camera scope `192.168.30.210` through `.215`; adapt and review that explicit scope for another installation.
 
 ```console
@@ -55,6 +65,40 @@ python tools/deploy.py status
 Enable `none` on outdoor bridges **after** verifying the native path. The feature setup backs up and changes only the selected cameras' `featureFlags`, whole-frame `smartDetectZones` integration rule and a camera-selection predicate in the two exact shipped frontend files. Existing `smartDetectSettings` and the UniFi AI user agreement remain unchanged: classification comes from Reolink. It does not advertise AI Port pairing or full camera features. Protect needs one restart to reload persisted camera fields. The backend service file is not patched. `refresh` only checks that the persisted fields are loaded.
 
 Persistent deployment directory: `/data/reolink-protect-events`. Service: `reolink-protect-native-events.service`. Releases are addressed by package hash. The SQLite source journal, outbox and retry state survive service restarts. `health.json` distinguishes healthy capture from healthy native delivery and includes per-camera poll health, import retries, replay gaps and thumbnail failures.
+
+Version 1.1 separates collection from native delivery. A persistent network pool
+collects bridge pushes; a dedicated outbox thread owns a separate SQLite WAL
+connection, PostgreSQL adapter and DS clients. A slow schema check, import or
+recorded snapshot cannot stop collection. HTTP headers and bodies and DS
+handshakes have total deadlines. SQLite upgrades add retry fields and partial
+indexes without replacing existing state. Native delivery still has the
+documented at-least-once notification boundary.
+
+Health includes `captureHealthy`, per-camera poll duration, replay backlog and
+remaining replay headroom, oldest pending-event age, persistent import errors,
+last successful native notification and grouped thumbnail error reasons. The
+deployment status computes health freshness; an active process with an old
+health file is unhealthy. `nativeWorkerAgeMs` reports a stalled native worker
+independently of continuing source capture. Missing historical pictures do not
+make otherwise successful source/event delivery unhealthy.
+
+The bridge may optionally return current `source.connectionEpoch` and
+`source.connected` alongside its replay. Once that replay has been consumed, the
+collector closes a prior interval at a disconnect/reconnect even without a new
+camera push. Older bridges remain supported through event epochs and stale
+timeouts. During paginated catch-up, current connection state and wall-clock
+expiry wait for the remaining historical pushes. A backwards source-clock jump
+preserves every original timestamp, advances the cursor, marks provenance and
+keeps interval progress monotonic. A clear received before the latest observed
+activity has an explicitly estimated end.
+
+The feature helper ships the narrow Controls layer reversal contract inside
+this package; no sibling repository is needed. Rollback persists its UI/camera
+phase before writes. After a database failure or interrupted rollback, repeat
+`python tools/enable_features.py rollback` to resume. Every repeated phase
+checks file ownership/hash or camera compare-and-swap conditions. `status`
+reports a partial rollback and its resume command. Controls must still be
+removed first, and unrelated file or camera edits still stop restoration.
 
 An optional read-only check for a **real** already imported event verifies its class filters, graph, both thumbnail paths, track response and selected camera flags:
 
@@ -79,9 +123,37 @@ python tools/repair_previews.py apply
 
 The repair supplies the missing default preview from the existing recorded JPEG while preserving the full-frame thumbnail and source classification. Run `tools/verify_native.py` for a real affected event afterward to check both API image paths.
 
+Missing recorded frames use a bounded exponential retry schedule (15 seconds
+through one hour, at most 20 attempts), with sanitized persistent error reasons.
+After fixing recording availability, review and reset attempts for explicit
+previously delivered event IDs:
+
+```console
+python tools/retry_thumbnails.py plan --event-id YOUR_NATIVE_EVENT_ID
+python tools/retry_thumbnails.py apply --event-id YOUR_NATIVE_EVENT_ID
+```
+
+`plan` opens the existing journal read-only. `apply` changes only failed/pending
+media retry state; it keeps interval IDs and delivery revisions. A deleted or
+purged Protect event remains protected by the existing-event guard. Completed
+or retired media rows are not reopened. The native verifier returns individual
+`checks` and `failedChecks`; success requires the supported version, bootstrap,
+selected camera flags/zones, owned camera-AI graph, empty native tracks, both
+class confidence filters and all three JPEG paths.
+
 Native graph writes are transactional and use deterministic event IDs. A failed event retries with backoff without blocking other cameras. Delivery to the DS WebSocket has no application ACK: a crash after acceptance can repeat a notification or custom alarm action, although the stored event remains unique. Updates and late thumbnails do not resurrect events already purged or deleted by Protect. Imported graphs use Protect's existing retention/foreign-key relationships; the separate source journal retains 30 days.
 
-The bridge's replay is bounded to 256 camera pushes. A long collector outage or a bridge restart can therefore lose events that were never journaled. Replay gaps are counted explicitly. No implementation can reconstruct classifications the camera/bridge no longer retains. Thumbnails retry separately; a missing recording can leave an event without a picture. Package upgrades are guarded rather than automatically patched or downgraded. Console OS upgrades may require re-registering the systemd unit.
+The bridge's default memory replay retains 256 camera pushes and is lost on a
+bridge restart. Recent bridges offer an opt-in durable replay with its own
+capacity, byte and age limits; configure that on persistent storage for stronger
+outage recovery. The collector fetches at most 256 pushes per page in both modes.
+A long outage can still exceed retention. Replay gaps and the known number of
+lost pushes are counted once; even an entirely expired empty replay advances
+only to its proven retention floor. No implementation can reconstruct
+classifications the camera/bridge no longer retains. Thumbnails retry
+separately; a missing recording can leave an event without a picture. Package
+upgrades are guarded rather than automatically patched or downgraded. Console
+OS upgrades may require re-registering the systemd unit.
 
 ## Implementation references
 

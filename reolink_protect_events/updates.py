@@ -15,6 +15,7 @@ import re
 import socket
 import struct
 import threading
+import time
 import uuid
 
 
@@ -132,6 +133,7 @@ class DsUpdateClient:
             if self.connected:
                 return
             connection = None
+            deadline = time.monotonic() + self.timeout
             try:
                 connection = socket.create_connection((self.host, self.port), timeout=self.timeout)
                 key = base64.b64encode(os.urandom(16)).decode("ascii")
@@ -144,6 +146,10 @@ class DsUpdateClient:
                 response = bytearray()
                 # Read only through the headers, preserving any coalesced WS data.
                 while not response.endswith(b"\r\n\r\n"):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise DsUpdateError("DS handshake deadline exceeded")
+                    connection.settimeout(remaining)
                     chunk = connection.recv(1)
                     if not chunk or len(response) >= 16384:
                         raise DsUpdateError("DS handshake is incomplete or oversized")

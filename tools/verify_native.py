@@ -11,10 +11,15 @@ import base64
 import json
 import re
 import subprocess
+from pathlib import Path
 
 
 REMOTE = r'''
 import hashlib,json,os,pathlib,re,ssl,subprocess,urllib.error,urllib.parse,urllib.request
+namespace={};exec(base64.b64decode(verification_source),namespace)
+verify_checks=namespace['verify_checks']
+http_namespace={};exec(base64.b64decode(http_source),http_namespace)
+get_bytes=http_namespace['get_bytes']
 config_path=pathlib.Path('/data/reolink-protect-events/config.json')
 if os.geteuid()!=0 or config_path.is_symlink() or config_path.stat().st_mode&0o077:
  raise RuntimeError('private_root_configuration_required')
@@ -47,17 +52,13 @@ def jpeg_dimensions(raw):
  return None
 
 def get(path,binary=False):
- req=urllib.request.Request('https://127.0.0.1:7443'+path,headers=headers,method='GET')
- try:
-  with op.open(req,timeout=15) as r:
-   raw=r.read(10000001)
-   if len(raw)>10000000: raise RuntimeError('response_limit')
-   if binary:
-    dimensions=jpeg_dimensions(raw)
-    return {'status':r.status,'bytes':len(raw),'sha256':hashlib.sha256(raw).hexdigest(),'contentType':r.headers.get('Content-Type'),
-     'isJpeg':dimensions is not None,'dimensions':dimensions}
-   return {'status':r.status,'body':json.loads(raw)}
- except urllib.error.HTTPError as e: return {'status':e.code,'body':None}
+  status,raw,response_headers=get_bytes('https://127.0.0.1:7443'+path,headers,timeout=15,limit=10000000,include_headers=True)
+  if status!=200:return {'status':status,'body':None}
+  if binary:
+   dimensions=jpeg_dimensions(raw)
+   return {'status':status,'bytes':len(raw),'sha256':hashlib.sha256(raw).hexdigest(),'contentType':response_headers.get('Content-Type'),
+    'isJpeg':dimensions is not None,'dimensions':dimensions}
+  return {'status':status,'body':json.loads(raw)}
 def text(value): return "convert_from(decode('"+str(value).encode().hex()+"','hex'),'UTF8')"
 def sql(query):
  p=subprocess.run(['runuser','-u','postgres','--','psql','-h','/run/postgresql','-p','5433','-d','unifi-protect','-w','-X','-q','-At','-v','ON_ERROR_STOP=1'],input='BEGIN READ ONLY;\nSET LOCAL statement_timeout=\'10s\';\n'+query+'\nROLLBACK;\n',encoding='utf-8',stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=20)
@@ -79,6 +80,7 @@ metadata=event.get('metadata') or {}
 own=metadata.get('reolinkProtectEvents') or {}
 expected_types=sorted(set(expected_classes))
 event_summary={'id':event.get('id'),'camera':camera,'type':event.get('type'),'start':event.get('start'),'end':event.get('end'),'score':event.get('score'),'smartDetectTypes':event.get('smartDetectTypes'),
+  'owner':own.get('owner'),'schemaVersion':own.get('schemaVersion'),
  'classificationOrigin':own.get('classificationOrigin'),'confidenceAvailable':own.get('confidenceAvailable'),'spatialTrackAvailable':own.get('spatialTrackAvailable'),'adapterVirtualZone':own.get('adapterVirtualZone'),
  'historicalImport':(own.get('provenance') or {}).get('historicalImport',False),'endIsTimeoutEstimate':(own.get('provenance') or {}).get('endIsTimeoutEstimate',False)}
 def search(kind,confidence):
@@ -104,6 +106,7 @@ for c in boot.get('cameras',[]):
  if c.get('id') in targets:
   flags=c.get('featureFlags') or {}
   camera_status.append({'id':c.get('id'),'isThirdPartyCamera':c.get('isThirdPartyCamera'),'hasSmartDetect':flags.get('hasSmartDetect'),'smartDetectTypes':flags.get('smartDetectTypes'),
+    'isPairedWithAiPort':c.get('isPairedWithAiPort'),
    'zoneIds':[z.get('id') for z in c.get('smartDetectZones',[])],'recordingMode':(c.get('recordingSettings') or {}).get('mode'),
    'recordingEnd':((c.get('stats') or {}).get('video') or {}).get('recordingEnd')})
 tables=['events','smartDetectObjects','smartDetectRaws','smartDetectTracks','smartDetectObjectAreas','labels','detectionLabels','thumbnails','cameras']
@@ -133,8 +136,14 @@ negative=all(s['status']==200 and not s['found'] for s in searches if s['class']
 true_graph=(graph['eventRows']==1 and sorted(o['type'] for o in objects)==expected_types and graph['spatialAreaRows']==0 and all(not o['confidenceKeyPresent'] and not o['spatialCoordPresent'] for o in objects))
 def valid_thumbnail(result): return result.get('status')==200 and result.get('bytes',0)>0 and result.get('isJpeg') is True
 thumbnail_paths_valid=all(valid_thumbnail(result) for result in (thumb_result,timeline_thumb_result,timeline_explicit_result))
-ok=(positive and negative and true_graph and event.get('type')=='smartDetectZone' and sorted(event.get('smartDetectTypes',[]))==expected_types and graph['readOnly']=='on' and event_filter['found'] and not graph['deleted'] and thumbnail_paths_valid)
+report={'event':event_summary,'eventApiStatus':event_result['status'],'bootstrapApiStatus':boot_result['status'],
+ 'eventFilteredApi':event_filter,'searchFilters':searches,'graph':graph,'thumbnailApi':thumb_result,
+ 'timelineThumbnailApi':timeline_thumb_result,'timelineThumbnailExplicitApi':timeline_explicit_result,
+ 'tracksApi':tracks_summary,'protectVersion':boot.get('nvr',{}).get('version'),'cameras':camera_status}
+checks=verify_checks(report,event_id,expected_types,camera_ids)
+ok=all(checks.values())
 print(json.dumps({'ok':ok,'event':event_summary,'eventApiStatus':event_result['status'],'eventFilteredApi':event_filter,'searchFilters':searches,'graph':graph,
+  'checks':checks,'failedChecks':[name for name,passed in checks.items()if not passed],'bootstrapApiStatus':boot_result['status'],
  'thumbnailApi':thumb_result,'timelineThumbnailApi':timeline_thumb_result,'timelineThumbnailExplicitApi':timeline_explicit_result,
  'thumbnailPathsValid':thumbnail_paths_valid,'tracksApi':tracks_summary,'protectVersion':boot.get('nvr',{}).get('version'),'cameras':camera_status,
  'limits':{'spatialTracksExpected':False,'confidenceExpected':False,'apiGETOnly':True,'databaseReadOnly':True,'imagesOrVideoSaved':False}}))
@@ -149,11 +158,16 @@ def main():
     parser.add_argument("--expected-class", choices=("person", "vehicle", "animal"), action="append", default=[])
     parser.add_argument("--ssh-alias", default="unifi-dream-machine")
     args = parser.parse_args()
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', args.ssh_alias):
+        parser.error('Use an existing SSH alias')
     for value in [args.event_id] + args.camera_id:
         if not re.fullmatch(r"[a-f0-9]{24}", value):
             parser.error("Event and camera IDs must be 24 lowercase hex characters")
     encoded = base64.b64encode(REMOTE.encode("utf-8")).decode("ascii")
     values = "event_id=" + repr(args.event_id) + "\ncamera_ids=" + repr(args.camera_id) + "\nexpected_classes=" + repr(args.expected_class or ["person"]) + "\n"
+    root = Path(__file__).resolve().parents[1] / 'reolink_protect_events'
+    values += 'verification_source=' + repr(base64.b64encode((root / 'verification.py').read_bytes()).decode('ascii')) + '\n'
+    values += 'http_source=' + repr(base64.b64encode((root / 'http_deadline.py').read_bytes()).decode('ascii')) + '\n'
     script = values + "import base64\nexec(base64.b64decode(" + repr(encoded) + "))\n"
     result = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes",
                             args.ssh_alias, "python3 -"], input=script, encoding="utf-8", stdout=subprocess.PIPE,

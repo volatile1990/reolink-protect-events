@@ -10,10 +10,11 @@ from pathlib import Path
 import re
 import signal
 import sqlite3
-import ssl
+import threading
 import time
 import urllib.error
 import urllib.request
+from .http_deadline import get_bytes
 
 CLASSES = frozenset(("person", "vehicle", "animal"))
 RAW_CLASSES = {"people": "person", "person": "person", "human": "person", "pedestrian": "person",
@@ -71,25 +72,13 @@ def validate_config(config):
     return config
 
 
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *args):
-        raise ValueError("http_redirect_rejected")
-
-
-def opener():
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect(),
-        urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
-
-
 def fetch_bridge(bridge, after):
-    request = urllib.request.Request("http://" + bridge["host"] + ":8080/events?after=" + str(after) + "&limit=256")
     token = base64.b64encode((bridge["username"] + ":" + bridge["password"]).encode()).decode()
-    request.add_header("Authorization", "Basic " + token)
-    with opener().open(request, timeout=4) as response:
-        data = response.read(512001)
-        if len(data) > 512000:
-            raise ValueError("oversized_bridge_response")
-        return json.loads(data)
+    status, data = get_bytes("http://" + bridge["host"] + ":8080/events?after=" + str(after) + "&limit=256",
+                             {"Authorization": "Basic " + token}, timeout=4, limit=512000)
+    if status != 200:
+        raise ValueError("bridge_http_status")
+    return json.loads(data)
 
 
 def atomic_json(path, value):
@@ -108,10 +97,9 @@ def recording_thumbnail(config, interval):
     headers = {"X-UserId": config["protectUserId"], "X-UserRole": "owner", "X-UserPermissionMask": "64",
                "X-UserPermissions": "65535", "X-Internal-Use": "true"}
     path = "/api/cameras/" + interval["cameraId"] + "/snapshot?ts=" + str(interval["start"])
-    with opener().open(urllib.request.Request("http://127.0.0.1:7080" + path, headers=headers), timeout=5) as response:
-        content = response.read(2097153)
-        if response.status != 200 or len(content) > 2097152:
-            raise ValueError("invalid_recording_thumbnail")
+    status, content = get_bytes("http://127.0.0.1:7080" + path, headers, timeout=5, limit=2097152)
+    if status != 200:
+        raise ValueError("recording_http_" + str(status))
     thumbnail = Thumbnail(content, interval["start"])
     thumbnail.dimensions()
     return thumbnail
@@ -121,7 +109,7 @@ class Journal:
     def __init__(self, path, stale_seconds=120):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(str(path))
+        self.db = sqlite3.connect(str(path), timeout=10)
         os.chmod(path, 0o600)
         self.stale_ms = stale_seconds * 1000
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -139,6 +127,21 @@ class Journal:
         CREATE TABLE IF NOT EXISTS delivery_failures(event_id TEXT PRIMARY KEY,attempts INTEGER NOT NULL,next_attempt INTEGER NOT NULL);
         """)
 
+        # Additive migration preserves every existing cursor, interval and outbox.
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(media)")}
+        for name, definition in (("next_attempt", "INTEGER NOT NULL DEFAULT 0"), ("error_reason", "TEXT")):
+            if name not in columns:
+                self.db.execute("ALTER TABLE media ADD COLUMN " + name + " " + definition)
+        self.db.executescript("""
+        CREATE INDEX IF NOT EXISTS intervals_open ON intervals(camera,last_seen) WHERE end IS NULL;
+        CREATE INDEX IF NOT EXISTS intervals_pending ON intervals(start) WHERE delivered_revision<revision OR notified_revision<revision;
+        CREATE INDEX IF NOT EXISTS sources_at ON sources(at);
+        CREATE INDEX IF NOT EXISTS media_pending ON media(next_attempt,last_attempt) WHERE done=0 AND attempts<20;
+        """)
+
+    def close(self):
+        self.db.close()  # sqlite3.close is idempotent; still enforces owner-thread use.
+
     def cursor(self, camera):
         row = self.db.execute("SELECT instance,seq,epoch FROM cursors WHERE camera=?", (camera,)).fetchone()
         return dict(zip(("instance", "seq", "epoch"), row)) if row else {"instance": None, "seq": 0, "epoch": None}
@@ -150,11 +153,11 @@ class Journal:
         event_id, start, last_seen, provenance = row
         meta = json.loads(provenance)
         meta["closureReason"] = reason
-        meta["endIsTimeoutEstimate"] = reason != "camera_clear" or at > last_seen + self.stale_ms
+        meta["endIsTimeoutEstimate"] = reason != "camera_clear" or at > last_seen + self.stale_ms or at < last_seen
         meta["endBasis"] = "camera_clear_received_utc" if not meta["endIsTimeoutEstimate"] else "source_stale_or_connection_boundary"
         if source is not None:
             meta["lastSourceEvent"] = source
-        end = max(start + 1, min(at, last_seen + self.stale_ms))
+        end = max(start + 1, last_seen, min(at, last_seen + self.stale_ms))
         self.db.execute("UPDATE intervals SET end=?,provenance=?,revision=revision+1 WHERE id=? AND end IS NULL",
                         (end, json.dumps(meta), event_id))
 
@@ -167,6 +170,11 @@ class Journal:
         instance = response.get("instanceId")
         newest, oldest = response.get("currentSeq"), response.get("oldestSeq")
         events = response.get("events")
+        source_state = response.get("source")
+        if source_state is not None and (not isinstance(source_state, dict) or
+                type(source_state.get("connectionEpoch")) is not int or source_state["connectionEpoch"] < 0 or
+                type(source_state.get("connected")) is not bool):
+            raise ValueError("invalid_bridge_source_state")
         if not isinstance(instance, str) or not re.fullmatch(r"[a-f0-9]{32}", instance):
             raise ValueError("invalid_bridge_instance")
         if type(newest) is not int or type(oldest) is not int or newest < 0 or not 1 <= oldest <= newest + 1:
@@ -182,6 +190,8 @@ class Journal:
             if type(sequence) is not int or not oldest <= sequence <= newest or sequence <= prior_seq:
                 raise ValueError("invalid_source_sequence")
             at = timestamp_ms(event.get("timestampUtc"))
+            if not 0 < at < 0xffffffff * 1000:
+                raise ValueError("invalid_source_timestamp_range")
             if at > int(time.time() * 1000) + 300000:
                 raise ValueError("future_source_timestamp")
             epoch = event.get("source", {}).get("connectionEpoch")
@@ -196,7 +206,12 @@ class Journal:
                 current = {"instance": instance, "seq": 0, "epoch": None}
             if oldest > current["seq"] + 1:
                 self.count("replayGaps")
+                self.count("replayLostPushes", oldest - current["seq"] - 1)
                 self._close_camera(camera, int(time.time() * 1000), "replay_gap")
+                # The source explicitly proves these sequences are gone. Advance
+                # only to its retention floor, never across an ordinary partial
+                # page. An entirely expired replay may therefore be empty.
+                current["seq"] = oldest - 1
             for sequence, at, epoch, event, classes in validated:
                 if sequence <= current["seq"]:
                     continue
@@ -206,16 +221,24 @@ class Journal:
                                 (camera, instance, sequence, at, json.dumps(event)))
                 active = self.db.execute("SELECT id,class,start,last_seen,provenance FROM intervals WHERE camera=? AND end IS NULL", (camera,)).fetchall()
                 active_classes = set()
+                regressed = False
                 for event_id, label, start, last_seen, provenance in active:
-                    if at < start:
-                        raise ValueError("nonmonotonic_source_timestamp")
+                    if at < last_seen:
+                        regressed = True
+                        meta = json.loads(provenance)
+                        meta["sourceClockRegressed"] = True
+                        meta["lastClockRegressionSource"] = event
+                        self.db.execute("UPDATE intervals SET provenance=? WHERE id=?", (json.dumps(meta), event_id))
+                        provenance = json.dumps(meta)
                     if label not in classes:
                         self._close((event_id, start, last_seen, provenance), at, "camera_clear", event)
                     elif at - last_seen >= self.stale_ms:
                         self._close((event_id, start, last_seen, provenance), last_seen + self.stale_ms, "source_stale")
                     else:
-                        self.db.execute("UPDATE intervals SET last_seen=? WHERE id=?", (at, event_id))
+                        self.db.execute("UPDATE intervals SET last_seen=MAX(last_seen,?) WHERE id=?", (at, event_id))
                         active_classes.add(label)
+                if regressed:
+                    self.count("sourceClockRegressions")
                 for label in sorted(classes - active_classes):
                     identity = camera + ":" + instance + ":" + str(epoch) + ":" + str(sequence) + ":" + label
                     event_id = "%08x%s" % (at // 1000, hashlib.sha256(identity.encode()).hexdigest()[:16])
@@ -229,13 +252,23 @@ class Journal:
                     self.count("classifiedIntervals")
                 self.count("sourceEvents")
                 current.update(seq=sequence, epoch=epoch)
+            # Current source state is evaluated AFTER replay: old epoch pushes
+            # still carry their real classifications, then the boundary closes
+            # them even when the new connection has not pushed another event.
+            if source_state is not None and current["seq"] == newest:
+                epoch = source_state["connectionEpoch"]
+                if current["epoch"] is not None and (epoch != current["epoch"] or not source_state["connected"]):
+                    self._close_camera(camera, int(time.time() * 1000),
+                                       "source_disconnect" if not source_state["connected"] else "source_reconnect")
+                current["epoch"] = epoch
             self.db.execute("INSERT INTO cursors VALUES(?,?,?,?) ON CONFLICT(camera) DO UPDATE SET instance=excluded.instance,seq=excluded.seq,epoch=excluded.epoch",
                             (camera, instance, current["seq"], current["epoch"]))
 
-    def expire(self, now_ms):
+    def expire(self, now_ms, replaying_cameras=()):
         with self.db:
-            for row in self.db.execute("SELECT id,start,last_seen,provenance FROM intervals WHERE end IS NULL AND last_seen+?<=?", (self.stale_ms, now_ms)).fetchall():
-                self._close(row, row[2] + self.stale_ms, "source_stale")
+            for row in self.db.execute("SELECT id,start,last_seen,provenance,camera FROM intervals WHERE end IS NULL AND last_seen+?<=?", (self.stale_ms, now_ms)).fetchall():
+                if row[4] not in replaying_cameras:
+                    self._close(row[:4], row[2] + self.stale_ms, "source_stale")
 
     def pending(self):
         rows = self.db.execute("SELECT i.id,i.camera,i.class,i.start,i.end,i.provenance,i.revision,i.delivered_revision,i.notified_revision FROM intervals i LEFT JOIN delivery_failures f ON f.event_id=i.id WHERE (i.delivered_revision<i.revision OR i.notified_revision<i.revision) AND COALESCE(f.next_attempt,0)<=? ORDER BY i.start LIMIT 16", (int(time.time() * 1000),)).fetchall()
@@ -258,22 +291,42 @@ class Journal:
             self.db.execute("INSERT INTO delivery_failures VALUES(?,?,?) ON CONFLICT(event_id) DO UPDATE SET attempts=excluded.attempts,next_attempt=excluded.next_attempt", (event_id, attempts, retry))
 
     def health(self):
-        return {"counters": dict(self.db.execute("SELECT name,value FROM counters")),
+        counters = dict(self.db.execute("SELECT name,value FROM counters"))
+        oldest = self.db.execute("SELECT MIN(start) FROM intervals WHERE delivered_revision<revision OR notified_revision<revision").fetchone()[0]
+        return {"counters": counters,
+                "lastNativeDeliveryMs": counters.get("lastNativeDeliveryMs"),
+                "oldestPendingStartMs": oldest,
+                "oldestPendingAgeMs": max(0, int(time.time() * 1000) - oldest) if oldest is not None else 0,
                 "pending": self.db.execute("SELECT COUNT(*) FROM intervals WHERE delivered_revision<revision OR notified_revision<revision").fetchone()[0],
                 "openIntervals": self.db.execute("SELECT COUNT(*) FROM intervals WHERE end IS NULL").fetchone()[0],
                 "pendingThumbnails": self.db.execute("SELECT COUNT(*) FROM media WHERE done=0 AND attempts<20").fetchone()[0],
                 "failedThumbnails": self.db.execute("SELECT COUNT(*) FROM media WHERE done=0 AND attempts>=20").fetchone()[0],
                 "retryIntervals": self.db.execute("SELECT COUNT(*) FROM delivery_failures").fetchone()[0],
-                "sourceRows": self.db.execute("SELECT COUNT(*) FROM sources").fetchone()[0]}
+                "sourceRows": self.db.execute("SELECT COUNT(*) FROM sources").fetchone()[0],
+                "thumbnailErrorReasons": dict(self.db.execute("SELECT COALESCE(error_reason,'unknown'),COUNT(*) FROM media WHERE done=0 AND error_reason IS NOT NULL GROUP BY error_reason"))}
 
     def pending_media(self, now_ms):
-        rows = self.db.execute("SELECT i.id,i.camera,i.class,i.start,i.end,i.provenance,i.delivered_revision FROM media m JOIN intervals i ON i.id=m.event_id WHERE m.done=0 AND m.attempts<20 AND m.last_attempt<? AND i.start<? AND i.delivered_revision=i.revision ORDER BY i.start LIMIT 4",
-                               (now_ms - 15000, now_ms - 1500)).fetchall()[:1]
+        rows = self.db.execute("SELECT i.id,i.camera,i.class,i.start,i.end,i.provenance,i.delivered_revision FROM media m JOIN intervals i ON i.id=m.event_id WHERE m.done=0 AND m.attempts<20 AND m.next_attempt<=? AND m.last_attempt<? AND i.start<? AND i.delivered_revision=i.revision ORDER BY i.start LIMIT 1",
+                               (now_ms, now_ms - 15000, now_ms - 1500)).fetchall()
         return [{"eventId": r[0], "cameraId": r[1], "classes": [r[2]], "start": r[3], "end": r[4], "provenance": json.loads(r[5]), "deliveredRevision": r[6]} for r in rows]
 
-    def media_attempt(self, event_id, now_ms, success):
+    def media_attempt(self, event_id, now_ms, success, error_reason=None):
         with self.db:
-            self.db.execute("UPDATE media SET attempts=attempts+1,last_attempt=?,done=? WHERE event_id=?", (now_ms, int(success), event_id))
+            attempts = self.db.execute("SELECT attempts FROM media WHERE event_id=?", (event_id,)).fetchone()
+            attempts = attempts[0] if attempts else 0
+            delay = min(3600000, 15000 * 2 ** min(attempts, 8))
+            self.db.execute("UPDATE media SET attempts=attempts+1,last_attempt=?,done=?,next_attempt=?,error_reason=? WHERE event_id=?",
+                            (now_ms, int(success), 0 if success else now_ms + delay, None if success else error_reason or "unknown", event_id))
+
+    def retry_media(self, event_ids):
+        """Explicitly reopen failed attempts; never reset interval delivery state."""
+        if not event_ids or any(not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{24}", value) for value in event_ids):
+            raise ValueError("explicit_valid_event_ids_required")
+        with self.db:
+            changed = 0
+            for event_id in set(event_ids):
+                changed += self.db.execute("UPDATE media SET attempts=0,last_attempt=0,next_attempt=0,error_reason=NULL WHERE event_id=? AND done=0", (event_id,)).rowcount
+        return changed
 
     def prune(self, now_ms, days=30):
         """The journal is separate from Protect retention; never resurrect delivered rows."""
@@ -287,7 +340,7 @@ class Journal:
 
 
 class Runtime:
-    def __init__(self, config, root, capture_only=False):
+    def __init__(self, config, root, capture_only=False, background_native=True):
         self.config = validate_config(config)
         self.root = Path(root)
         self.journal = Journal(self.root / "journal.sqlite3", config.get("bridgeEventStaleSeconds", 120))
@@ -301,6 +354,14 @@ class Runtime:
         self.native_ready = False
         self.native_error = None
         self.last_native_check = 0
+        self.background_native = background_native
+        self._pool = None
+        self._native_thread = None
+        self._stop = threading.Event()
+        self._native_state = {}
+        self._state_lock = threading.Lock()
+        self.last_poll_duration_ms = 0
+        self._closed = False
 
     def initialize_native(self):
         from .native import NativeAdapter
@@ -311,11 +372,15 @@ class Runtime:
         self.native = NativeAdapter(protect_version=self.config.get("protectVersion", "7.3.70"))
         self.native.guard_schema()
         for bridge in self.config["bridges"]:
+            if self._stop.is_set():
+                return
             self.clients[bridge["cameraId"]] = DsUpdateClient(bridge["mac"], port=self.config["dsProxyPort"])
             self.clients[bridge["cameraId"]].connect()
         self.native_ready = True
 
     def check_native(self):
+        if self._stop.is_set():
+            return
         now_ms = int(time.time() * 1000)
         delay = 60000 if self.native_ready else 10000
         if now_ms - self.last_native_check < delay:
@@ -328,6 +393,8 @@ class Runtime:
             else:
                 self.native.guard_schema()
                 for client in self.clients.values():
+                    if self._stop.is_set():
+                        return
                     client.connect()
                 self.native_ready = True
             self.native_error = None
@@ -337,10 +404,16 @@ class Runtime:
 
     def poll_one(self, bridge):
         cursor = self.journal.cursor(bridge["cameraId"])
+        return self._poll_network(bridge, cursor)[0]
+
+    def _poll_network(self, bridge, cursor):
+        if self._stop.is_set():
+            raise concurrent.futures.CancelledError()
+        began = time.monotonic()
         response = fetch_bridge(bridge, cursor["seq"])
-        if response.get("instanceId") != cursor["instance"] and cursor["seq"]:
+        if response.get("instanceId") != cursor["instance"] and cursor["seq"] and not self._stop.is_set():
             response = fetch_bridge(bridge, 0)
-        return response
+        return response, round((time.monotonic() - began) * 1000, 2)
 
     def deliver(self):
         from .native import RetiredEventError
@@ -348,12 +421,16 @@ class Runtime:
             return
         began = time.monotonic()
         for interval in self.journal.pending():
+            if self._stop.is_set():
+                break
             if time.monotonic() - began > 2:
                 break
             try:
                 event = self.native.upsert_interval(interval)
                 if interval["deliveredRevision"] < interval["revision"]:
                     self.journal.acknowledge(interval["eventId"], interval["revision"], "delivered")
+                if self._stop.is_set():
+                    break
                 # Repeated DB writes are idempotent. The WS delivery is at-least-
                 # once around a crash; deterministic event IDs prevent duplicate
                 # stored detections, but downstream custom alarm actions may repeat.
@@ -368,6 +445,8 @@ class Runtime:
                 else:
                     client.send_event("update", event)
                 self.journal.acknowledge(interval["eventId"], interval["revision"], "notified")
+                with self.journal.db:
+                    self.journal.db.execute("INSERT INTO counters VALUES('lastNativeDeliveryMs',?) ON CONFLICT(name) DO UPDATE SET value=MAX(value,excluded.value)", (int(time.time() * 1000),))
             except RetiredEventError:
                 self.journal.acknowledge(interval["eventId"], interval["revision"], "delivered")
                 self.journal.acknowledge(interval["eventId"], interval["revision"], "notified")
@@ -376,6 +455,8 @@ class Runtime:
                     self.journal.count("retiredEvents")
             except Exception as error:
                 self.import_errors += 1
+                with self.journal.db:
+                    self.journal.count("nativeImportErrors")
                 self.journal.delivery_failed(interval["eventId"], int(time.time() * 1000))
                 # Exception messages and urllib headers can expose credentials.
                 print(json.dumps({"error": "native_delivery_failed", "errorType": type(error).__name__}), flush=True)
@@ -386,66 +467,158 @@ class Runtime:
         if self.capture_only or not self.native_ready:
             return
         for interval in self.journal.pending_media(now_ms):
+            if self._stop.is_set():
+                break
             success = False
+            error_reason = None
+            stage = "snapshot"
             try:
                 thumbnail = recording_thumbnail(self.config, interval)
+                if self._stop.is_set():
+                    break
+                stage = "database"
                 event = self.native.upsert_interval(interval, thumbnail)
+                if self._stop.is_set():
+                    break
+                stage = "notification"
                 self.clients[interval["cameraId"]].send_event("update", event)
                 success = True
             except RetiredEventError:
                 success = True
                 with self.journal.db:
                     self.journal.count("retiredMedia")
-            except Exception:
-                pass
-            self.journal.media_attempt(interval["eventId"], now_ms, success)
+            except Exception as error:
+                # Fixed reason vocabulary; never persist arbitrary messages or headers.
+                status = re.fullmatch(r"recording_http_([1-5][0-9]{2})", str(error)) if stage == "snapshot" else None
+                error_reason = "snapshot_http_" + status[1] if status else stage + ("_timeout" if isinstance(error, TimeoutError) else "_failed")
+            self.journal.media_attempt(interval["eventId"], now_ms, success, error_reason)
+
+    def _native_loop(self):
+        # Construct and close the connection on its owner thread. No Python
+        # SQLite connection, DS client or native adapter crosses thread ownership.
+        worker = None
+        try:
+            worker = Runtime(self.config, self.root, background_native=False)
+            worker._stop = self._stop
+            while not self._stop.is_set():
+                began = time.monotonic()
+                worker.check_native()
+                if self._stop.is_set():
+                    break
+                worker.deliver()
+                if self._stop.is_set():
+                    break
+                worker.deliver_media(int(time.time() * 1000))
+                with self._state_lock:
+                    self._native_state = {"atMs": int(time.time() * 1000), "nativeReady": worker.native_ready,
+                        "nativeError": worker.native_error, "nativeDurationMs": round((time.monotonic() - began) * 1000, 2),
+                        "importErrors": worker.journal.health()["counters"].get("nativeImportErrors", 0)}
+                self._stop.wait(0.1)
+        except Exception as error:
+            with self._state_lock:
+                self._native_state = {"atMs": int(time.time() * 1000), "nativeReady": False,
+                                      "nativeError": type(error).__name__, "workerStopped": True}
+        finally:
+            if worker is not None:
+                for client in worker.clients.values():
+                    client.close()
+                worker.journal.close()
+
+    def _start_native_worker(self):
+        if not self.capture_only and self.background_native and self._native_thread is None:
+            self._native_thread = threading.Thread(target=self._native_loop, name="protect-native-outbox", daemon=True)
+            self._native_thread.start()
 
     def once(self):
         # Cursor reads occur on this thread because SQLite connections are not
         # shared across worker threads. Workers only perform network requests.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(self.config["bridges"]))) as pool:
+        began = time.monotonic()
+        if self._native_thread is not None and not self._native_thread.is_alive() and not self._stop.is_set():
+            self._native_thread = None
+            self._start_native_worker()
+        if self._pool is None:
+            self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(self.config["bridges"])), thread_name_prefix="bridge-fetch")
+        pool = self._pool
+        if pool is not None:
             jobs = {}
             for bridge in self.config["bridges"]:
                 cursor = self.journal.cursor(bridge["cameraId"])
-                jobs[pool.submit(fetch_bridge, bridge, cursor["seq"])] = (bridge, cursor)
+                jobs[pool.submit(self._poll_network, bridge, cursor)] = bridge
             for job in concurrent.futures.as_completed(jobs):
-                bridge, cursor = jobs[job]
+                bridge = jobs[job]
                 health = self.bridge_health.setdefault(bridge["cameraId"], {"consecutiveErrors": 0})
                 try:
-                    response = job.result()
-                    if response.get("instanceId") != cursor["instance"] and cursor["seq"]:
-                        response = fetch_bridge(bridge, 0)
+                    response, fetch_duration = job.result()
                     self.journal.ingest(bridge, response)
-                    health.update(lastSuccessMs=int(time.time() * 1000), consecutiveErrors=0)
+                    sequence = self.journal.cursor(bridge["cameraId"])["seq"]
+                    health.update(lastSuccessMs=int(time.time() * 1000), consecutiveErrors=0,
+                                  pollDurationMs=fetch_duration,
+                                  sourceCurrentSeq=response.get("currentSeq"), journalCursor=sequence,
+                                  sourceBacklog=max(0, response["currentSeq"] - sequence),
+                                  replayHeadroom=max(0, sequence - response["oldestSeq"] + 1))
+                    health.pop("errorType", None)
                 except Exception as error:
                     health["consecutiveErrors"] += 1
                     health["errorType"] = type(error).__name__
         now_ms = int(time.time() * 1000)
-        self.journal.expire(now_ms)
-        if not self.capture_only:
-            self.check_native()
-        self.deliver()
-        self.deliver_media(now_ms)
+        self.last_poll_duration_ms = round((time.monotonic() - began) * 1000, 2)
+        replaying = {camera for camera, value in self.bridge_health.items() if value["consecutiveErrors"] == 0 and value.get("sourceBacklog", 0) > 0}
+        self.journal.expire(now_ms, replaying)
+        if self._native_thread is None:
+            if not self.capture_only:
+                self.check_native()
+            self.deliver()
+            self.deliver_media(now_ms)
         if now_ms - self.last_prune > 3600000:
             self.journal.prune(now_ms)
             self.last_prune = now_ms
         health = self.journal.health()
         health.update(atMs=now_ms, mode="capture" if self.capture_only else "native", bridges=self.bridge_health,
                       importErrors=self.import_errors, nativeReady=self.native_ready, nativeError=self.native_error,
-                      protectVersion=self.config.get("protectVersion", "7.3.70"))
+                      protectVersion=self.config.get("protectVersion", "7.3.70"), pollDurationMs=self.last_poll_duration_ms)
+        if self._native_thread is not None:
+            with self._state_lock:
+                native_state = dict(self._native_state)
+            health.update({key: value for key, value in native_state.items() if key != "atMs"})
+            health["nativeWorkerAgeMs"] = max(0, now_ms - native_state.get("atMs", 0))
+            health["nativeReady"] = health.get("nativeReady", False) and health["nativeWorkerAgeMs"] <= 60000 and not native_state.get("workerStopped", False)
         health["healthy"] = len(self.bridge_health) == len(self.config["bridges"]) and all(
             v.get("lastSuccessMs", 0) >= now_ms - 30000 and v["consecutiveErrors"] == 0 for v in self.bridge_health.values())
         if not self.capture_only:
-            health["healthy"] = health["healthy"] and health["pending"] == 0 and self.native_ready
+            health["healthy"] = health["healthy"] and health["pending"] == 0 and health["nativeReady"]
+        health["captureHealthy"] = len(self.bridge_health) == len(self.config["bridges"]) and all(
+            v.get("lastSuccessMs", 0) >= now_ms - 30000 and v["consecutiveErrors"] == 0 for v in self.bridge_health.values())
         atomic_json(self.root / "health.json", health)
 
     def run(self):
-        signal.signal(signal.SIGTERM, lambda *_: setattr(self, "running", False))
-        signal.signal(signal.SIGINT, lambda *_: setattr(self, "running", False))
-        while self.running:
-            began = time.monotonic()
-            self.once()
-            time.sleep(max(0.1, 1 - (time.monotonic() - began)))
+        signal.signal(signal.SIGTERM, lambda *_: self.request_stop())
+        signal.signal(signal.SIGINT, lambda *_: self.request_stop())
+        self._start_native_worker()
+        try:
+            while self.running:
+                began = time.monotonic()
+                self.once()
+                time.sleep(max(0.1, 1 - (time.monotonic() - began)))
+        finally:
+            self.close()
+
+    def request_stop(self):
+        self.running = False
+        self._stop.set()
+
+    def close(self):
+        if self._closed:
+            return
+        self.request_stop()
+        if self._pool is not None:
+            self._pool.shutdown(wait=True, cancel_futures=True)
+            self._pool = None
+        if self._native_thread is not None:
+            self._native_thread.join(timeout=30)
+        for client in self.clients.values():
+            client.close()
+        self.journal.close()
+        self._closed = True
 
 
 def main():
