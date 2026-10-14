@@ -40,7 +40,7 @@ def complete_state(status='complete'):
 class ReleaseCliTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.directory = self.root / 'receipts'
         self.directory.mkdir()
         self.run = self.directory / ('1' * 32)
