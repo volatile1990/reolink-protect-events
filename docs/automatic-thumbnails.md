@@ -110,6 +110,12 @@ a newly received real clear shortened its event (`thumbnailWindowChanged`). The
 existing native/media error vocabulary remains categorical; URLs, owner headers,
 credentials and raw exception text are never stored in selection evidence.
 
+The late-clear guard applies while an image is still loading. A clear received
+after successful image storage can retrospectively shorten the event beyond the
+pinned image timestamp; the existing image is then preserved. Selection is
+bounded by the event window known at selection time, rather than a guarantee
+about an end timestamp that the camera reports later.
+
 ## Verification
 
 `tests/test_thumbnails.py` checks real JPEG day/night sharp-vs-blur selection,

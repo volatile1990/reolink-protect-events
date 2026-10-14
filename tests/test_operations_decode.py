@@ -1,16 +1,19 @@
 """Projected full-decode gates plus real bounded local MP4 decode integration."""
 import asyncio
+import ast
 import base64
 import copy
 import http.client
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sys
 import time
+import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from reolink_protect_events.operations import decode
 from reolink_protect_events.operations.rtsp_proxy import (
@@ -26,7 +29,7 @@ def profile(host='192.168.30.215', kind='main'):
             'profile':kind,'quality':'high'if kind=='main'else'low','channel':0 if kind=='main'else 2,
             'url':'rtsp://'+host+':8554/'+kind,'username':'private-user','password':SECRET,
             'expectedCodec':'h264','expectedWidth':64,'expectedHeight':36,
-            'startMs':START,'endMs':START+20000}
+            'startMs':START,'endMs':START+decode.EXPORT_WINDOW_MS}
 
 
 def all_profiles():
@@ -46,7 +49,7 @@ class DecodeScopeTests(unittest.TestCase):
     def test_private_payload_strict_scope_and_profile_coverage(self):
         rows=all_profiles()
         self.assertEqual(len(decode._private_profiles({'ok':True,'profiles':rows},sorted(HOSTS))),11)
-        for mutation in ('extra','missing','duplicate','foreign','credentials','profile','url'):
+        for mutation in ('extra','missing','duplicate','foreign','credentials','profile','url','short','long'):
             value=copy.deepcopy(rows)
             if mutation=='extra':value[0]['bootstrap']={'token':SECRET}
             elif mutation=='missing':value.pop()
@@ -54,6 +57,8 @@ class DecodeScopeTests(unittest.TestCase):
             elif mutation=='foreign':value[0]['host']='192.168.30.216'
             elif mutation=='credentials':value[0]['username']='bad:user'
             elif mutation=='profile':value[0]['channel']=1
+            elif mutation=='short':value[0]['endMs']-=1000
+            elif mutation=='long':value[0]['endMs']+=1000
             else:value[0]['url']='rtsp://private-user:'+SECRET+'@'+value[0]['host']+':8554/main'
             with self.subTest(mutation=mutation),self.assertRaises((OperationError,ValueError)):
                 decode._private_profiles({'ok':True,'profiles':value},sorted(HOSTS))
@@ -72,7 +77,7 @@ class DecodeScopeTests(unittest.TestCase):
 
     def test_remote_input_has_no_credentials_and_only_allowed_read_actions(self):
         payload={'action':'discover','configPath':decode.DEFAULT_CONFIG,'remoteRelease':None,
-                 'ips':['192.168.30.215'],'lagSeconds':30,'notBeforeMs':None}
+                 'ips':['192.168.30.215'],'lagSeconds':30,'notBeforeMs':None,'exportWindowMs':decode.EXPORT_WINDOW_MS}
         source=decode._remote_source(payload)
         self.assertNotIn(SECRET.encode(),source)
         self.assertNotIn(b'private-user',source)
@@ -82,6 +87,83 @@ class DecodeScopeTests(unittest.TestCase):
         self.assertIn(b"connection.request('POST','/onvif/media_service'",source)
         self.assertNotIn(b"request('PATCH'",source)
         self.assertNotIn(b'systemctl',source)
+
+    def test_export_window_is_fixed_in_local_and_remote_input(self):
+        self.assertEqual(decode.EXPORT_WINDOW_SECONDS,24)
+        self.assertEqual(decode.EXPORT_WINDOW_MS,24000)
+        self.assertEqual(decode.MIN_RECORDED_SECONDS,19)
+        payload={'action':'unsupported','configPath':decode.DEFAULT_CONFIG,'remoteRelease':None,
+                 'ips':['192.168.30.215'],'lagSeconds':30,'notBeforeMs':None,'exportWindowMs':decode.EXPORT_WINDOW_MS}
+        source=decode._remote_source(payload).decode()
+        encoded=ast.literal_eval(re.search(r'payload=json.loads\(base64.b64decode\(([^\n]+)\)\)',source)[1])
+        original=json.loads(base64.b64decode(encoded))
+        for window in (None,True,20000,23000,25000):
+            value=dict(payload,exportWindowMs=window)
+            with self.subTest(window=window),self.assertRaisesRegex(OperationError,'decode_export_window_invalid'):
+                decode._remote_source(value)
+            # Deliberately bypass the local validator to verify the public
+            # Python3.9 helper independently rejects a tampered payload before
+            # any configuration read, export, or network context is entered.
+            altered=dict(original,exportWindowMs=window)
+            changed=base64.b64encode(json.dumps(altered,separators=(',',':')).encode()).decode()
+            remote=source.replace(repr(encoded),repr(changed)).encode()
+            code,output,errors=asyncio.run(decode._run_bytes([sys.executable,'-B','-'],
+                 input_data=remote,timeout=5,stdout_limit=1024))
+            self.assertEqual(code,2)
+            self.assertEqual(json.loads(output),{'ok':False,'errorCode':'decode_export_window_invalid'})
+            self.assertEqual(errors,b'')
+
+    def test_entire_export_window_must_follow_activation_before_any_viewer(self):
+        tree=ast.parse(decode._REMOTE_COMMON)
+        function=next(node for node in tree.body if isinstance(node,ast.FunctionDef)and node.name=='discover')
+        now=START+300000;recording_end=now-5000;start=recording_end-30000-decode.EXPORT_WINDOW_MS
+        camera={'id':'1'*24,'host':'192.168.30.215','channels':[{'id':0,'enabled':True,'width':64,'height':36}],
+                'stats':{'video':{'recordingEnd':recording_end,'recordingStart':START}}}
+        config={'bridges':[{'cameraId':camera['id'],'host':camera['host'],
+                            'username':'private-user','password':SECRET}]}
+        uri=Mock(return_value='rtsp://192.168.30.215:8554/main')
+        namespace={'EXPORT_WINDOW_MS':decode.EXPORT_WINDOW_MS,'need':decode.need,
+                   'context':lambda:(config,[camera]),'time':types.SimpleNamespace(time=lambda:now/1000),
+                   'qualities':lambda _:[('high','recordingEnd',0)],'uri_for':uri,
+                   'bridge_metrics':lambda _:{'streams':[{'profile':'main','codec':'H264','width':64,'height':36}]},
+                   'payload':{'lagSeconds':30,'notBeforeMs':start+1}}
+        exec(compile(ast.Module(body=[function],type_ignores=[]),'<public-discover-test>','exec'),namespace)
+        with self.assertRaisesRegex(OperationError,'decode_new_recording_pending'):
+            namespace['discover']()
+        uri.assert_not_called()
+        namespace['payload']['notBeforeMs']=start
+        result=namespace['discover']();row=result['profiles'][0]
+        self.assertEqual((row['startMs'],row['endMs']),(start,start+decode.EXPORT_WINDOW_MS))
+        uri.assert_called_once()
+
+    def test_minimum_delivered_tracks_is_preserved_before_real_five_second_decode(self):
+        row=profile();payload={'action':'discover','configPath':decode.DEFAULT_CONFIG,'remoteRelease':None,
+              'ips':[row['host']],'lagSeconds':30,'notBeforeMs':START,'exportWindowMs':decode.EXPORT_WINDOW_MS}
+        streams=[{'codec_type':'video','codec_name':'h264','width':64,'height':36,'start_time':'0','duration':'19.000'},
+                 {'codec_type':'audio','codec_name':'aac','channels':1,'sample_rate':'16000','start_time':'0','duration':'19.000'}]
+        async def read(command,**kwargs):
+            return (0,b'0000ftyp'+b'x'*32,b'')if command[0]=='ssh'else(0,json.dumps({'streams':streams}).encode(),b'')
+        fake_server=Mock(url='http://127.0.0.1:49152/recording.mp4')
+        async def actual_decode(*args):
+            return {'ok':True,'realVideoDecode':True,'realAudioDecode':True}
+        with patch.object(decode,'_run_bytes',side_effect=read),patch.object(decode,'_MemoryServer',return_value=fake_server), \
+             patch.object(decode,'_decode_av',side_effect=actual_decode)as actual:
+            passed=asyncio.run(decode._recorded_decode(row,'ffmpeg','ffprobe',5,['ssh'],payload))
+            self.assertTrue(passed['ok'],passed)
+            self.assertEqual(passed['requestedExportSeconds'],24)
+            self.assertEqual(passed['minimumRecordedSeconds'],19)
+            self.assertEqual(actual.call_args.args[2],5)
+            for video_seconds,audio_seconds in ((18.823,18.752),(18.999,19),(19,18.999)):
+                actual.reset_mock()
+                streams[0]['duration']=str(video_seconds);streams[1]['duration']=str(audio_seconds)
+                failed=asyncio.run(decode._recorded_decode(row,'ffmpeg','ffprobe',5,['ssh'],payload))
+                self.assertFalse(failed['ok'])
+                self.assertEqual(failed['errorCode'],'decode_recording_export_too_short')
+                actual.assert_not_called()
+            streams[0]['duration']='19';streams[1]['duration']='19.351'
+            mismatch=asyncio.run(decode._recorded_decode(row,'ffmpeg','ffprobe',5,['ssh'],payload))
+            self.assertFalse(mismatch['ok'])
+            self.assertFalse(mismatch['deliveredTimelineDurationsCompatible'])
 
     def test_tools_missing_is_explicit_failure_before_ssh(self):
         with patch.object(decode.shutil,'which',return_value=None),patch.object(decode,'_run_bytes')as network:
@@ -231,7 +313,7 @@ class RealRecordedDecodeTests(unittest.TestCase):
 
     def test_real_local_video_and_pcm_decode_through_ram_server(self):
         row=profile();payload={'action':'discover','configPath':decode.DEFAULT_CONFIG,'remoteRelease':None,
-                              'ips':[row['host']],'lagSeconds':30,'notBeforeMs':START}
+                              'ips':[row['host']],'lagSeconds':30,'notBeforeMs':START,'exportWindowMs':decode.EXPORT_WINDOW_MS}
         original=decode._run_bytes
         async def read(command,**kwargs):
             if command[0]=='ssh':

@@ -9,8 +9,35 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from reolink_protect_events.operations.orchestrator import Backend, Update, need, save
+from reolink_protect_events.operations.orchestrator import Backend, Update, UpdateError, IPS, need, save
 from reolink_protect_events.operations.locking import process_lock
+
+
+def verify_installed_release(backend, state):
+    """Read-only CAS for a completed installation, including a crash before commit."""
+    release = state.get('release', {})
+    expected_image = release.get('imageId')
+    final = state.get('evidence', {}).get('bridge-final-receipt', {})
+    saved = final.get('bridges', [])
+    need(final.get('ok') is True and isinstance(expected_image, str) and expected_image
+         and len(saved) == len(IPS) and {row.get('ip') for row in saved} == set(IPS)
+         and all(row.get('imageId') == expected_image for row in saved), 'installed_release_receipt_invalid')
+    expected = {row['ip']: row['imageId'] for row in saved}
+    inventory = backend.nas({'mode': 'inventory'})
+    need(inventory.get('ok') is True, 'installed_bridge_inventory_failed')
+    actual = inventory.get('bridges', [])
+    need(len(actual) == len(IPS) and {row.get('ip') for row in actual} == set(IPS)
+         and {row['ip']: row.get('imageId') for row in actual} == expected, 'installed_bridge_release_drift')
+    digest = state.get('frozen', {}).get('eventsManifest', {}).get('packageSha256')
+    installed = state.get('evidence', {}).get('install-events', {}).get('deployment', {})
+    need(isinstance(digest, str) and digest and installed.get('sha256') == digest,
+         'installed_release_receipt_invalid')
+    observed = backend.udm({'action': 'installer', 'request': {'mode': 'status'}})
+    need(observed.get('ok') is True, 'installed_events_inventory_failed')
+    need(observed.get('deployment', {}).get('sha256') == digest, 'installed_events_release_drift')
+    need(observed.get('health', {}).get('healthy') is True and observed.get('active') == 'active'
+         and observed.get('enabled') == 'enabled' and observed.get('monitor', {}).get('active') is True
+         and observed.get('monitor', {}).get('enabled') is True, 'installed_events_release_unhealthy')
 
 
 def main():
@@ -48,17 +75,23 @@ def main():
             same = all(previous.get('frozen', {}).get('sources', {}).get(project, {}).get('sourceSha256') == current[project]['sourceSha256']
                        for project in ('bridge', 'events'))
             if previous['status'] == 'complete' and same:
+                verify_installed_release(backend, previous)
                 result = backend.udm({'action': 'health', 'mode': 'quick'})
                 need(result.get('ok') is True, 'already_deployed_release_unhealthy')
                 print(json.dumps({'ok': True, 'status': 'already-deployed', 'receipt': str(path / 'update.json')}))
                 return 0
-            if previous['status'] in ('running', 'failed') and (previous.get('maintenanceIntent') or previous.get('maintenanceActive')):
+            if previous['status'] == 'running' or (previous['status'] == 'failed'
+                    and (previous.get('maintenanceIntent') or previous.get('maintenanceActive'))):
                 run, resume = path, True
         if resume:
             need(run is not None and run.resolve().parent == directory, 'resume_run_required')
         else:
             run = directory / uuid.uuid4().hex
         updater = Update(backend, run, resume=resume)
+        if resume and updater.state['status'] == 'running' and 'install-events' in updater.state['completed']:
+            verify_installed_release(backend, updater.state)
+            need(backend.udm({'action': 'health', 'mode': 'quick'}).get('ok') is True,
+                 'resumed_installed_release_unhealthy')
         save(latest, {'run': run.name})
         result = updater.run()
         print(json.dumps(result))
@@ -71,5 +104,6 @@ if __name__ == '__main__':
     try:
         raise SystemExit(main())
     except Exception as error:
-        print(json.dumps({'ok': False, 'errorCode': 'release_controller_failed', 'errorType': type(error).__name__}))
+        print(json.dumps({'ok': False, 'errorCode': str(error) if isinstance(error, UpdateError) else 'release_controller_failed',
+                          'errorType': type(error).__name__}))
         raise SystemExit(1)

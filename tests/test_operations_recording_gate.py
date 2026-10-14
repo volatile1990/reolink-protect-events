@@ -62,7 +62,7 @@ class RecordingRetryTests(unittest.TestCase):
     def test_pending_retries_then_returns_actual_success_with_original_scope(self):
         result, clock, backend, decoder = self.evaluate([PENDING, SUCCESS])
         self.assertIs(result, SUCCESS)
-        self.assertEqual(clock.waits, [ACTIVATED + 52000, ACTIVATED + 72000])
+        self.assertEqual(clock.waits, [ACTIVATED + 56000, ACTIVATED + 76000])
         self.assertEqual(clock.attempts, clock.waits)
         self.assertEqual(decoder.call_count, 2)
         for call in decoder.call_args_list:
@@ -80,7 +80,7 @@ class RecordingRetryTests(unittest.TestCase):
                 result, clock, backend, decoder = self.evaluate([failed])
                 self.assertIs(result, failed)
                 self.assertEqual(decoder.call_count, 1)
-                self.assertEqual(clock.waits, [ACTIVATED + 52000])
+                self.assertEqual(clock.waits, [ACTIVATED + 56000])
                 backend.progress.assert_not_called()
 
     def test_real_failure_after_pending_stops_without_another_retry(self):
@@ -88,7 +88,7 @@ class RecordingRetryTests(unittest.TestCase):
         result, clock, _, decoder = self.evaluate([PENDING, failed])
         self.assertIs(result, failed)
         self.assertEqual(decoder.call_count, 2)
-        self.assertEqual(clock.waits, [ACTIVATED + 52000, ACTIVATED + 72000])
+        self.assertEqual(clock.waits, [ACTIVATED + 56000, ACTIVATED + 76000])
 
     def test_pending_without_activation_is_returned_without_waiting_or_retry(self):
         result, clock, backend, decoder = self.evaluate([PENDING], activation=None)
@@ -103,7 +103,7 @@ class RecordingRetryTests(unittest.TestCase):
         self.assertFalse(result['realDecodes'])
         self.assertEqual(clock.timestamp, ACTIVATED + 180000)
         self.assertEqual(decoder.call_count, 8)
-        self.assertTrue(all(ACTIVATED + 52000 <= time <= ACTIVATED + 180000 for time in clock.attempts))
+        self.assertTrue(all(ACTIVATED + 56000 <= time <= ACTIVATED + 180000 for time in clock.attempts))
         self.assertEqual(clock.waits[-1], ACTIVATED + 180000)
 
     def test_expired_activation_cannot_start_a_new_retry_window(self):

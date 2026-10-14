@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 import uuid
-from .decode import run_full_decodes
+from .decode import EXPORT_WINDOW_SECONDS, run_full_decodes
 from .release import build_package, source_snapshot
 from .locking import process_lock
 from .transport import invoke, source_bundle
@@ -144,8 +144,8 @@ class Backend:
 
     def decode(self, ips=None, not_before_ms=None):
         if not_before_ms is not None:
-            # Entire twenty-second clip must precede the thirty-second index lag.
-            self.wait_until(not_before_ms + 52000)
+            # Entire export window must precede the thirty-second index lag.
+            self.wait_until(not_before_ms + (EXPORT_WINDOW_SECONDS + 30 + 2) * 1000)
         while True:
             value = run_full_decodes(self.host, ips=ips, ffmpeg=self.ffmpeg, ffprobe=self.ffprobe,
                                      not_before_ms=not_before_ms)

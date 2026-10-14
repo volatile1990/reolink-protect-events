@@ -24,7 +24,9 @@ from .rtsp_proxy import BoundedLines, Progress, RtspProxy, Warnings
 MAX_MEDIA_BYTES = 64 * 1024 * 1024
 MAX_PRIVATE_JSON = 262144
 MAX_LOG_BYTES = 131072
-EXPORT_SECONDS = 20
+EXPORT_WINDOW_SECONDS = 24
+EXPORT_WINDOW_MS = EXPORT_WINDOW_SECONDS * 1000
+MIN_RECORDED_SECONDS = 19
 DEFAULT_CONFIG = '/data/reolink-protect-events/config.json'
 
 
@@ -114,6 +116,7 @@ def _ssh_command(alias):
 # this installed package or machine-specific sibling script is imported.
 _REMOTE_COMMON = r'''
 import base64,http.client,json,pathlib,re,sys,time,types,urllib.parse,xml.etree.ElementTree as ET
+EXPORT_WINDOW_MS=EXPORT_WINDOW_TOKEN
 payload=json.loads(base64.b64decode(INPUT))
 for name in ('reolink_protect_events','reolink_protect_events.operations'):
  module=types.ModuleType(name);module.__path__=[];sys.modules[name]=module
@@ -169,7 +172,7 @@ def discover():
    need((width,height)==(c.get('width'),c.get('height')),'decode_source_dimensions_changed')
    recording_end=stats.get(key,camera.get(key));recording_start=stats.get('recordingStart',camera.get('recordingStart'))
    need(type(recording_end)is int and -5000<=now-recording_end<=120000,'decode_recording_index_stale')
-   end=recording_end-payload['lagSeconds']*1000;start=end-20000
+   end=recording_end-payload['lagSeconds']*1000;start=end-EXPORT_WINDOW_MS
    need(type(recording_start)is int and recording_start<=start<end<=now,'decode_recording_range_unavailable')
    if payload.get('notBeforeMs')is not None:need(start>=payload['notBeforeMs'],'decode_new_recording_pending')
    out.append({'host':bridge['host'],'cameraId':camera['id'],'profile':profile,'quality':quality,'channel':channel,
@@ -182,7 +185,7 @@ def export():
  need(camera is not None,'decode_camera_mapping_changed')
  expected=[q for q in qualities(camera)if q[0]==p['quality']and q[2]==p['channel']];need(len(expected)==1,'decode_export_profile_scope')
  start,end=p['startMs'],p['endMs'];now=int(time.time()*1000)
- need(type(start)is int and type(end)is int and end-start==20000 and 0<start<end<=now,'decode_export_time_scope')
+ need(type(start)is int and type(end)is int and end-start==EXPORT_WINDOW_MS and 0<start<end<=now,'decode_export_time_scope')
  stats=camera.get('stats',{}).get('video',{});recording_end=stats.get(expected[0][1],camera.get(expected[0][1]))
  need(type(recording_end)is int and end<=recording_end,'decode_recording_range_unavailable')
  if payload.get('notBeforeMs')is not None:need(start>=payload['notBeforeMs'],'decode_new_recording_pending')
@@ -192,6 +195,7 @@ def export():
  sys.stdout.buffer.write(content);sys.stdout.buffer.flush()
 
 try:
+ need(type(payload.get('exportWindowMs'))is int and payload['exportWindowMs']==EXPORT_WINDOW_MS,'decode_export_window_invalid')
  if payload['action']=='discover':print(json.dumps(discover(),separators=(',',':')))
  elif payload['action']=='export':export()
  else:raise OperationError('decode_action_invalid')
@@ -204,13 +208,15 @@ except Exception as error:
 
 
 def _remote_source(payload):
+    need(type(payload.get('exportWindowMs')) is int and payload['exportWindowMs'] == EXPORT_WINDOW_MS,
+         'decode_export_window_invalid')
     package = Path(__file__).resolve().parents[1]
     helpers = [('reolink_protect_events.http_deadline', package / 'http_deadline.py')]
     helpers += [('reolink_protect_events.operations.' + name, package / 'operations' / (name + '.py'))
                 for name in ('safety', 'http', 'protect')]
     value = dict(payload, helpers=[(name, path.read_text(encoding='utf-8')) for name, path in helpers])
     encoded = base64.b64encode(json.dumps(value, separators=(',', ':')).encode()).decode()
-    return _REMOTE_COMMON.replace('INPUT', repr(encoded)).encode()
+    return _REMOTE_COMMON.replace('EXPORT_WINDOW_TOKEN', str(EXPORT_WINDOW_MS)).replace('INPUT', repr(encoded)).encode()
 
 
 def _public_profile(value):
@@ -245,7 +251,7 @@ def _private_profiles(response, selected):
              'decode_profile_mapping_invalid')
         need(row['expectedCodec'] in ('h264', 'hevc') and all(type(row[k]) is int and 16 <= row[k] <= 16384
              for k in ('expectedWidth', 'expectedHeight')), 'decode_expected_metadata_invalid')
-        need(type(row['startMs']) is int and type(row['endMs']) is int and row['endMs']-row['startMs']==20000,
+        need(type(row['startMs']) is int and type(row['endMs']) is int and row['endMs']-row['startMs']==EXPORT_WINDOW_MS,
              'decode_export_time_scope')
         for key in ('username', 'password', 'url'):
             need(isinstance(row[key], str) and 0 < len(row[key]) <= 8192 and not any(c in row[key] for c in '\r\n\0'),
@@ -474,7 +480,8 @@ async def _rtsp_decode(profile,exe,duration):
 
 
 async def _recorded_decode(profile,exe,probe,duration,ssh,payload):
-    row=dict(_public_profile(profile),startMs=profile['startMs'],endMs=profile['endMs'],requestedExportSeconds=20,ok=False)
+    row=dict(_public_profile(profile),startMs=profile['startMs'],endMs=profile['endMs'],
+             requestedExportSeconds=EXPORT_WINDOW_SECONDS,minimumRecordedSeconds=MIN_RECORDED_SECONDS,ok=False)
     server=None;content=None
     try:
         request=dict(payload,action='export',profile={key:profile[key]for key in ('host','cameraId','quality','channel','startMs','endMs')})
@@ -494,7 +501,11 @@ async def _recorded_decode(profile,exe,probe,duration,ssh,payload):
         metadata_match=(video.get('codec_name')==profile['expectedCodec'] and
             (video.get('width'),video.get('height'))==(profile['expectedWidth'],profile['expectedHeight']))
         row['videoMetadataPreserved']=metadata_match;row.update(timeline_comparison(video,audio))
-        need(float(video['duration'])>=19 and float(audio['duration'])>=19,'decode_recording_export_too_short')
+        # Protect can trim the requested interval at GOP/recording boundaries.
+        # A larger request reserves room for that trim without reducing the
+        # minimum delivered payload or any actual video/audio decode check.
+        need(float(video['duration'])>=MIN_RECORDED_SECONDS and float(audio['duration'])>=MIN_RECORDED_SECONDS,
+             'decode_recording_export_too_short')
         actual_audio={'codec':audio.get('codec_name'),'sampleRate':int(audio.get('sample_rate',0)), 'channels':audio.get('channels')}
         result=await _decode_av(exe,server.url,duration,profile,actual_audio)
         row['decode']=result;row['ok']=result['ok']and metadata_match and row['deliveredTimelineDurationsCompatible']
@@ -521,7 +532,7 @@ def run_full_decodes(ssh_alias='unifi-dream-machine', *, config_path=DEFAULT_CON
 
     A subset can pass its explicitly requested scope, but UPDATE must also
     require both profile coverage `allEleven` flags and `realDecodes`.
-    `not_before_ms` requires the entire fresh 20 s recorded clip after activation.
+    `not_before_ms` requires the entire requested 24 s window after activation.
     No synthetic events, media files, configuration changes or concurrent viewers.
     """
     report={'schemaVersion':1,'atMs':int(time.time()*1000),'ok':False,'realDecodes':False,
@@ -544,7 +555,7 @@ def run_full_decodes(ssh_alias='unifi-dream-machine', *, config_path=DEFAULT_CON
         sibling=Path(exe).with_name('ffprobe.exe'if os.name=='nt'else'ffprobe')
         probe=_executable(ffprobe or (str(sibling)if sibling.is_file()else None),'ffprobe')
         payload={'action':'discover','configPath':config_path,'remoteRelease':remote_release,'ips':selected,
-                 'lagSeconds':recording_lag_seconds,'notBeforeMs':not_before_ms}
+                 'lagSeconds':recording_lag_seconds,'notBeforeMs':not_before_ms,'exportWindowMs':EXPORT_WINDOW_MS}
         async def execute():
             nonlocal profiles
             code,raw,_=await _run_bytes(ssh,input_data=_remote_source(payload),timeout=150,stdout_limit=MAX_PRIVATE_JSON)

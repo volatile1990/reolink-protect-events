@@ -12,8 +12,11 @@ themselves. Protect and DSM firmware upgrades remain separate operations.
 existing hook. A local push of the checked-out commit to `main` runs the entire
 release controller before Git sends the ref update; other branches and ordinary
 file editing do not trigger deployment. Tests or production verification failures
-block the push. A second push of the same two source trees reuses the successful
-receipt and checks current camera health.
+block the push. A second push of the same two source trees verifies the actual
+six NAS image IDs, Events package ID, active services and current camera health
+before reusing the successful receipt. A separate manual rollback is reported
+as deployment drift. A crashed running transaction resumes its existing receipt,
+including a crash after clearing maintenance but before the final commit.
 
 The trigger runs on the home computer with its existing trusted SSH alias and
 external protected NAS connector. It is not a GitHub-hosted deployment job; a
@@ -58,6 +61,12 @@ python tools/protect_ops.py resume --config /path/to/local-controller.json --run
 3. Verify six fresh video sources, eleven advancing recording profiles, all native
    High/Low/Automatic modes and real video/audio decoding of all eleven live and
    recorded profiles. Missing decoders or incomplete coverage stop the update.
+   Each recorded probe requests a fixed 24-second window, allowing room for
+   the observed variation in Protect export duration while still requiring at least
+   19 seconds in both delivered tracks. Five seconds of video frames and AAC
+   decoded to PCM must pass the existing codec, dimensions, warning and 350 ms
+   audio/video timeline checks. The entire requested window must follow a
+   camera's activation; an older overlapping window cannot pass its gate.
 4. Build bridge audit and production images from the same frozen ZIP on Synology.
    Run real .NET self-tests, Protect contracts and the hardware low-quality test
    in isolated containers; require the production application DLL to be identical
