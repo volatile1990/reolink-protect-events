@@ -156,6 +156,17 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(report['errorCode'],'source_unhealthy_no_recorder_repair')
         self.assertFalse(any(r[0]=='udm'and r[1]['action']=='recover'for r in self.backend.calls))
         self.assertEqual(report['status'],'rolled-back')
+    def test_unrelated_unhealthy_source_during_canary_never_repairs_healthy_target(self):
+        self.backend.source_bad_ip=IPS[1];report=self.execute()
+        self.assertEqual(report['errorCode'],'unrelated_camera_health_failed',report)
+        self.assertEqual(report['status'],'rolled-back',report)
+        self.assertFalse(any(r[0]=='udm'and r[1]['action']=='recover'for r in self.backend.calls))
+        self.assertEqual([row[2]['ip']for row in self.modes('apply')],[IPS[0]])
+        restored=self.modes('rollback-all');self.assertEqual(len(restored),1)
+        self.assertEqual(len(report['rollback']['restored']),1)
+        self.assertEqual([step['ip']for step in report['rollback']['restored'][0]['steps']],[IPS[0]])
+        self.assertFalse(self.backend.applied);self.assertIsNone(self.backend.marker)
+        self.assertFalse(self.installers('install'))
     def test_ack_lost_after_events_install_restores_candidate_and_journal(self):
         self.backend.install_ack_lost=True;report=self.execute()
         self.assertEqual(report['status'],'rolled-back',report)

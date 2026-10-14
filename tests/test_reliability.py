@@ -395,25 +395,38 @@ class CollectorIsolationTests(unittest.TestCase):
             folder.cleanup()
 
     def test_restart_refetch_stays_in_parallel_network_workers(self):
-        cfg = config([dict(config()['bridges'][0], cameraId=str(i) * 24, host='192.168.30.' + str(210 + i)) for i in range(1, 4)])
+        cfg = config([dict(config()['bridges'][0], cameraId=str(i) * 24, host='192.168.30.' + str(210 + i)) for i in range(1, 7)])
         with tempfile.TemporaryDirectory() as folder:
             runtime = Runtime(cfg, folder, capture_only=True)
             try:
                 for bridge in cfg['bridges']:
                     runtime.journal.ingest(bridge, response([source(1)]))
-                ids = []
+                # Both cursor fetches and restart refetches must have all six
+                # network workers in flight together, independent of CI speed.
+                barriers = {after: threading.Barrier(6, timeout=10) for after in (1, 0)}
+                calls, calls_lock = [], threading.Lock()
                 def fetch(bridge, after):
-                    ids.append(threading.get_ident())
-                    time.sleep(0.06)
+                    with calls_lock:
+                        calls.append((bridge['cameraId'], after, threading.get_ident()))
+                    barriers[after].wait()
                     batch = response([source(1)])
                     batch['instanceId'] = 'b' * 32
                     return batch
                 with patch('reolink_protect_events.runtime.fetch_bridge', side_effect=fetch):
-                    began = time.monotonic()
                     runtime.once()
-                    self.assertLess(time.monotonic() - began, 0.3)
-                self.assertEqual(len(ids), 6)
-                self.assertNotIn(threading.get_ident(), ids)
+                self.assertEqual(len(calls), 12)
+                self.assertFalse(any(barrier.broken for barrier in barriers.values()))
+                for after in (1, 0):
+                    wave = [(camera, worker) for camera, cursor, worker in calls if cursor == after]
+                    self.assertEqual({camera for camera, _ in wave}, {bridge['cameraId'] for bridge in cfg['bridges']})
+                    self.assertEqual(len({worker for _, worker in wave}), 6)
+                    self.assertNotIn(threading.get_ident(), {worker for _, worker in wave})
+                for bridge in cfg['bridges']:
+                    camera_calls = [(after, worker) for camera, after, worker in calls if camera == bridge['cameraId']]
+                    self.assertEqual([after for after, _ in camera_calls], [1, 0])
+                    self.assertEqual(camera_calls[0][1], camera_calls[1][1])
+                    self.assertEqual(runtime.bridge_health[bridge['cameraId']]['consecutiveErrors'], 0)
+                    self.assertEqual(runtime.journal.cursor(bridge['cameraId'])['instance'], 'b' * 32)
             finally:
                 runtime.close()
                 runtime.journal.db.close()
