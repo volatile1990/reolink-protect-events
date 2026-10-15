@@ -73,8 +73,6 @@ def event(value, camera, now_ms):
     start, end = millis(value.get("start_time")), millis(value.get("end_time"), True)
     if end is not None and end < start:
         raise ValueError("invalid_frigate_event_end")
-    if type(value.get("false_positive")) is not bool:
-        raise ValueError("invalid_frigate_false_positive")
     data = value.get("data") or {}
     if not isinstance(data, dict):
         raise ValueError("invalid_frigate_event_data")
@@ -86,10 +84,23 @@ def event(value, camera, now_ms):
         score = data.get("top_score")
     if score is not None and (type(score) not in (int, float) or not math.isfinite(score) or not 0 <= score <= 1):
         raise ValueError("invalid_frigate_score")
+    if "false_positive" not in value or (value["false_positive"] is not None and type(value["false_positive"]) is not bool):
+        raise ValueError("invalid_frigate_false_positive")
+    legacy_flag = value["false_positive"]
+    if legacy_flag is None:
+        # Frigate 0.18.1 persists accepted object events in Event.data, while its
+        # deprecated top_score/false_positive columns can both be SQL NULL.
+        # This is NOT equivalent to a missing flag or a generic motion event.
+        # Require the actual object-data shape and a real nested source score.
+        nested_score = data.get("top_score")
+        if object_type != "object" or type(nested_score) not in (int, float) or not math.isfinite(nested_score) or not 0 <= nested_score <= 1:
+            raise ValueError("invalid_frigate_nullable_object_data")
+    accepted = object_type == "object" and legacy_flag is not True
     return {"id": value["id"], "camera": camera, "label": label, "start": start, "end": end,
             "type": object_type,
-            "class": LABELS.get(label) if value["false_positive"] is False and object_type == "object" else None,
-            "falsePositive": value["false_positive"], "topScore": score}
+            "class": LABELS.get(label) if accepted else None,
+            "falsePositive": legacy_flag, "topScore": score,
+            "acceptanceBasis": ("object_data_with_nullable_legacy_flag" if legacy_flag is None else "explicit_false_positive_false") if accepted else None}
 
 
 def poll(options, camera, cursor, active_ids, now_ms=None):

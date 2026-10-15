@@ -186,7 +186,8 @@ class Fusion:
                         self._close(row, at, "frigate_classification_withdrawn")
                     continue
                 meta = {"source": "frigate-object-detection", "sourceEventId": item["id"], "sourceLabel": item["label"],
-                        "topScore": item["topScore"], "classificationInferred": True,
+                        "topScore": item["topScore"], "falsePositive": item["falsePositive"],
+                        "acceptanceBasis": item["acceptanceBasis"], "classificationInferred": True,
                         "timeBasis": "frigate_event_utc", "endIsTimeoutEstimate": False,
                         "closureReason": "frigate_end" if item["end"] is not None else None}
                 for row in self.db.execute("SELECT camera,source,source_id,class,start,last_seen,provenance FROM fusion_inputs WHERE camera=? AND source='frigate' AND source_id=? AND class<>? AND end IS NULL", (camera, item["id"], item["class"])).fetchall():

@@ -2,7 +2,12 @@
 
 The pilot adds a second source for an existing Protect camera. Reolink continues
 to provide its own genuine AI classifications. Frigate contributes only
-confirmed `data.type="object"` events with `false_positive=false`. Generic motion,
+confirmed `data.type="object"` events with `false_positive=false`. Frigate 0.18.1
+can leave its legacy false_positive/top_score columns NULL while storing accepted
+object data in `data`. Explicit NULL is supported only with the real object type
+and a valid nested `data.top_score`; the original NULL and acceptance basis remain
+in provenance. A missing flag, malformed nullable object data or an explicit true
+flag cannot become a supported detection. Generic motion,
 manual timeline entries, audio, unknown types and unsupported labels cannot
 create a supported class. Inference and video decoding remain in Frigate, not
 on the Protect console. The native adapter remains pinned to Protect 7.3.70.

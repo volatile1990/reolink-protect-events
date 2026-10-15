@@ -254,6 +254,33 @@ class FusionTests(unittest.TestCase):
 
 
 class FrigateHttpTests(unittest.TestCase):
+    def test_actual_018_nullable_columns_use_real_nested_object_score(self):
+        value = item()
+        value.update(top_score=None, false_positive=None,
+                     data={"type": "object", "score": 0.82421875, "top_score": 0.84375, "max_severity": "alert"})
+        parsed = normalize(value, "front", START + 60000)
+        self.assertEqual(parsed["class"], "person")
+        self.assertEqual(parsed["topScore"], 0.84375)
+        self.assertIsNone(parsed["falsePositive"])
+        self.assertEqual(parsed["acceptanceBasis"], "object_data_with_nullable_legacy_flag")
+        value["false_positive"] = True
+        self.assertIsNone(normalize(value, "front", START + 60000)["class"])
+        value["false_positive"] = False
+        self.assertEqual(normalize(value, "front", START + 60000)["class"], "person")
+
+    def test_nullable_flag_never_substitutes_for_actual_object_data(self):
+        for data in ({}, {"type": "motion", "top_score": 0.9}, {"type": "manual", "top_score": 0.9},
+                     {"type": "object"}, {"type": "object", "top_score": None},
+                     {"type": "object", "top_score": True}, {"type": "object", "top_score": float("nan")}):
+            value = item(false_positive=None)
+            value["data"] = data
+            with self.assertRaises(ValueError):
+                normalize(value, "front", START + 60000)
+        value = item()
+        del value["false_positive"]
+        with self.assertRaises(ValueError):
+            normalize(value, "front", START + 60000)
+
     def fake(self, values, requests, absent=()):
         def get(url, headers, **kwargs):
             parsed = urllib.parse.urlsplit(url)

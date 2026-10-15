@@ -21,14 +21,17 @@ class ProjectionContractTests(unittest.TestCase):
     def test_real_projection_and_object_consumer_share_actual_018_shape(self):
         source = {"id": "1791586947.512843-abcdef", "camera": self.proxy.CAMERA, "label": "car",
                   "start_time": 1791586947.512843, "end_time": 1791586955.6,
-                  "top_score": None, "false_positive": False,
+                  "top_score": None, "false_positive": None,
                   "data": {"type": "object", "top_score": 0.91, "score": 0.85,
                            "stationary": False, "box": [0.1, 0.1, 0.3, 0.3]}}
         projected = self.proxy.event_view(source)
         parsed = event(projected, self.proxy.CAMERA, 1791587000000)
         self.assertEqual(parsed["class"], "vehicle")
         self.assertEqual(parsed["topScore"], 0.91)
+        self.assertIsNone(parsed["falsePositive"])
+        self.assertEqual(parsed["acceptanceBasis"], "object_data_with_nullable_legacy_flag")
         self.assertNotIn("box", projected["data"])
+        source["false_positive"] = False
         source["data"]["type"] = "manual"
         self.assertIsNone(event(self.proxy.event_view(source), self.proxy.CAMERA, 1791587000000)["class"])
 
