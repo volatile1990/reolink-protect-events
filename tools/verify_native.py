@@ -82,6 +82,9 @@ expected_types=sorted(set(expected_classes))
 event_summary={'id':event.get('id'),'camera':camera,'type':event.get('type'),'start':event.get('start'),'end':event.get('end'),'score':event.get('score'),'smartDetectTypes':event.get('smartDetectTypes'),
   'owner':own.get('owner'),'schemaVersion':own.get('schemaVersion'),
  'classificationOrigin':own.get('classificationOrigin'),'confidenceAvailable':own.get('confidenceAvailable'),'spatialTrackAvailable':own.get('spatialTrackAvailable'),'adapterVirtualZone':own.get('adapterVirtualZone'),
+ 'source':metadata.get('source'),'sourceUnionVersion':(own.get('provenance') or {}).get('sourceUnionVersion'),
+ 'sourceTypes':(own.get('provenance') or {}).get('sourceTypes'),'mergePolicy':(own.get('provenance') or {}).get('mergePolicy'),
+ 'objectIdentityMatched':(own.get('provenance') or {}).get('objectIdentityMatched'),
  'historicalImport':(own.get('provenance') or {}).get('historicalImport',False),'endIsTimeoutEstimate':(own.get('provenance') or {}).get('endIsTimeoutEstimate',False)}
 def search(kind,confidence):
  query=urllib.parse.urlencode([('start',start),('end',end),('labels[]','camera:'+camera),('labels[]','smartDetectType:'+kind),('minConfidence',confidence),('limit',50),('orderDirection','asc')])

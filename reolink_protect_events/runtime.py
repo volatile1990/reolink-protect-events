@@ -71,6 +71,8 @@ def validate_config(config):
         raise ValueError("unsupported_protect_version")
     from .thumbnails import settings
     settings(config)
+    from .frigate import settings as frigate_settings
+    frigate_settings(config)
     return config
 
 
@@ -145,6 +147,11 @@ class Journal:
         CREATE INDEX IF NOT EXISTS sources_at ON sources(at);
         CREATE INDEX IF NOT EXISTS media_pending ON media(next_attempt,last_attempt) WHERE done=0 AND attempts<20;
         """)
+        self.fusion = None
+
+    def enable_fusion(self, cameras, options):
+        from .fusion import Fusion
+        self.fusion = Fusion(self, cameras, options)
 
     def close(self):
         self.db.close()  # sqlite3.close is idempotent; still enforces owner-thread use.
@@ -206,6 +213,9 @@ class Journal:
                 raise ValueError("invalid_source_epoch")
             validated.append((sequence, at, epoch, event, source_classes(event)))
             prior_seq = sequence
+        if self.fusion is not None and camera in self.fusion.cameras:
+            self.fusion.reolink(bridge, response, validated)
+            return
         with self.db:
             current = self.cursor(camera)
             if current["instance"] != instance:
@@ -274,8 +284,10 @@ class Journal:
     def expire(self, now_ms, replaying_cameras=()):
         with self.db:
             for row in self.db.execute("SELECT id,start,last_seen,provenance,camera FROM intervals WHERE end IS NULL AND last_seen+?<=?", (self.stale_ms, now_ms)).fetchall():
-                if row[4] not in replaying_cameras:
+                if row[4] not in replaying_cameras and not (self.fusion is not None and row[4] in self.fusion.cameras):
                     self._close(row[:4], row[2] + self.stale_ms, "source_stale")
+        if self.fusion is not None:
+            self.fusion.expire(now_ms, replaying_cameras)
 
     def pending(self):
         rows = self.db.execute("SELECT i.id,i.camera,i.class,i.start,i.end,i.provenance,i.revision,i.delivered_revision,i.notified_revision FROM intervals i LEFT JOIN delivery_failures f ON f.event_id=i.id WHERE (i.delivered_revision<i.revision OR i.notified_revision<i.revision) AND COALESCE(f.next_attempt,0)<=? ORDER BY i.start LIMIT 16", (int(time.time() * 1000),)).fetchall()
@@ -365,6 +377,8 @@ class Journal:
             self.db.execute("DELETE FROM intervals WHERE end<? AND delivered_revision=revision AND notified_revision=revision", (cutoff,))
             self.db.execute("DELETE FROM media WHERE event_id NOT IN (SELECT id FROM intervals)")
             self.db.execute("DELETE FROM delivery_failures WHERE event_id NOT IN (SELECT id FROM intervals)")
+        if self.fusion is not None:
+            self.fusion.prune(cutoff)
         self.db.execute("PRAGMA wal_checkpoint(PASSIVE)")
 
 
@@ -373,6 +387,14 @@ class Runtime:
         self.config = validate_config(config)
         self.root = Path(root)
         self.journal = Journal(self.root / "journal.sqlite3", config.get("bridgeEventStaleSeconds", 120))
+        from .frigate import settings as frigate_settings
+        self.frigate_config = frigate_settings(config)
+        if self.frigate_config is not None:
+            self.journal.enable_fusion(self.frigate_config["cameraMap"].values(), self.frigate_config)
+        from .fusion import Fusion
+        Fusion.deactivate_unmapped(self.journal, self.frigate_config["cameraMap"].values() if self.frigate_config is not None else ())
+        self.frigate_health = {}
+        self._frigate_last_poll = {}
         self.capture_only = capture_only
         self.bridge_health = {}
         self.native = None
@@ -385,6 +407,8 @@ class Runtime:
         self.last_native_check = 0
         self.background_native = background_native
         self._pool = None
+        self._frigate_pool = None
+        self._frigate_jobs = {}
         self._media_pool = None
         self._media_future = None
         self._media_event_id = None
@@ -628,6 +652,17 @@ class Runtime:
         if self._pool is None:
             self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(self.config["bridges"])), thread_name_prefix="bridge-fetch")
         pool = self._pool
+        frigate_jobs = self._frigate_jobs
+        if self.frigate_config is not None:
+            from .frigate import poll as frigate_poll
+            if self._frigate_pool is None:
+                self._frigate_pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(self.frigate_config["cameraMap"])), thread_name_prefix="frigate-fetch")
+            for name, camera in self.frigate_config["cameraMap"].items():
+                if camera in frigate_jobs.values() or time.monotonic() - self._frigate_last_poll.get(camera, -1000000) < self.frigate_config["pollSeconds"]:
+                    continue
+                cursor, active_ids = self.journal.fusion.poll_state(camera)
+                frigate_jobs[self._frigate_pool.submit(frigate_poll, self.frigate_config, name, cursor, active_ids)] = camera
+                self._frigate_last_poll[camera] = time.monotonic()
         if pool is not None:
             jobs = {}
             for bridge in self.config["bridges"]:
@@ -649,10 +684,27 @@ class Runtime:
                 except Exception as error:
                     health["consecutiveErrors"] += 1
                     health["errorType"] = type(error).__name__
+        # Slow or failed Frigate HTTP calls must not delay the next Reolink
+        # capture pass. Only consume completed, bounded network jobs here.
+        for job in [job for job in frigate_jobs if job.done()]:
+            camera = frigate_jobs.pop(job)
+            health = self.frigate_health.setdefault(camera, {"consecutiveErrors": 0})
+            try:
+                response = job.result()
+                self.journal.fusion.frigate(camera, response)
+                health.update(lastSuccessMs=int(time.time() * 1000), consecutiveErrors=0,
+                              cursorMs=response["cursor"], backlogMs=response["backlogMs"], requests=response["requests"],
+                              historyCompleteness="no_sequence_or_retention_floor_proof")
+                health.pop("errorType", None)
+            except Exception as error:
+                health["consecutiveErrors"] += 1
+                health["errorType"] = type(error).__name__
         now_ms = int(time.time() * 1000)
         self.last_poll_duration_ms = round((time.monotonic() - began) * 1000, 2)
         replaying = {camera for camera, value in self.bridge_health.items() if value["consecutiveErrors"] == 0 and value.get("sourceBacklog", 0) > 0}
         self.journal.expire(now_ms, replaying)
+        if self.journal.fusion is not None:
+            self.journal.fusion.sync(now_ms)
         if self._native_thread is None:
             if not self.capture_only:
                 self.check_native()
@@ -677,6 +729,13 @@ class Runtime:
             health["healthy"] = health["healthy"] and health["pending"] == 0 and health["nativeReady"]
         health["captureHealthy"] = len(self.bridge_health) == len(self.config["bridges"]) and all(
             v.get("lastSuccessMs", 0) >= now_ms - 30000 and v["consecutiveErrors"] == 0 for v in self.bridge_health.values())
+        if self.frigate_config is not None:
+            health["frigate"] = self.frigate_health
+            health["frigateHealthy"] = len(self.frigate_health) == len(self.frigate_config["cameraMap"]) and all(
+                value.get("lastSuccessMs", 0) >= now_ms - 30000 and value["consecutiveErrors"] == 0
+                for value in self.frigate_health.values())
+            health["healthy"] = health["healthy"] and health["frigateHealthy"]
+            health["captureHealthy"] = health["captureHealthy"] and health["frigateHealthy"]
         atomic_json(self.root / "health.json", health)
 
     def run(self):
@@ -702,6 +761,9 @@ class Runtime:
         if self._pool is not None:
             self._pool.shutdown(wait=True, cancel_futures=True)
             self._pool = None
+        if self._frigate_pool is not None:
+            self._frigate_pool.shutdown(wait=True, cancel_futures=True)
+            self._frigate_pool = None
         if self._media_pool is not None:
             self._media_pool.shutdown(wait=True, cancel_futures=True)
             self._media_pool = None

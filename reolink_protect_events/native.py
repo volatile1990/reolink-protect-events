@@ -296,12 +296,19 @@ ROLLBACK;
             raise ValueError("Source provenance is required")
         if len(_json(provenance).encode("utf-8")) > 32768:
             raise ValueError("Provenance exceeds 32 KiB")
+        union = provenance.get("sourceUnionVersion") == 1
+        identity_start = _millis(provenance.get("identityStart"), "identityStart") if union else start
+        source_types = provenance.get("sourceTypes", [])
+        if union and (not isinstance(source_types, list) or not source_types or not set(source_types) <= {"reolink", "frigate"}):
+            raise ValueError("Union requires explicit source types")
+        origin = ("mixed" if len(set(source_types)) > 1 else "external-model" if source_types == ["frigate"] else "camera") if union else "camera"
+        source_name = ("reolink-and-frigate" if origin == "mixed" else "frigate-object-detection" if origin == "external-model" else "reolink-camera-ai")
         if isinstance(thumbnail, Mapping):
             thumbnail = Thumbnail(**thumbnail)
         if thumbnail is not None and not isinstance(thumbnail, Thumbnail):
             raise ValueError("Invalid thumbnail")
-        metadata = {"source": "reolink-camera-ai", "reolinkProtectEvents": {
-            "owner": OWNER, "schemaVersion": 1, "classificationOrigin": "camera",
+        metadata = {"source": source_name, "reolinkProtectEvents": {
+            "owner": OWNER, "schemaVersion": 1, "classificationOrigin": origin,
             "confidenceAvailable": False, "spatialTrackAvailable": False,
             "adapterVirtualZone": True, "sourceZoneIds": [],
             "provenance": provenance},
@@ -317,8 +324,14 @@ ROLLBACK;
         eid, cid = sql_text(event_id), sql_text(camera_id)
         owner_predicate = "metadata::jsonb->'reolinkProtectEvents'->>'owner'=" + sql_text(OWNER)
         class_sql = _sql_json(classes)
-        objects = {kind: native_id("object", start, event_id + ":" + kind) for kind in classes}
-        tid = native_id("track", start, event_id)
+        objects = {kind: native_id("object", identity_start, event_id + ":" + kind) for kind in classes}
+        tid = native_id("track", identity_start, event_id)
+        start_conflict = "start IS DISTINCT FROM %d" % start
+        if union:
+            # Only this adapter's source-union protocol can revise event bounds.
+            # Immutable identityStart keeps objects/tracks/thumb IDs stable even
+            # when delayed genuine history extends the start backwards.
+            start_conflict = "COALESCE((metadata::jsonb->'reolinkProtectEvents'->'provenance'->>'identityStart')::bigint,start) IS DISTINCT FROM %d" % identity_start
         thumb_id = None
         preview_id = None
         lines = ["BEGIN;", "SET LOCAL statement_timeout = '10s';",
@@ -329,12 +342,12 @@ ROLLBACK;
                  # retention DELETE between this check and the upsert.
                  " PERFORM id FROM events WHERE id=%s FOR UPDATE;\n"
                  " IF %s AND NOT EXISTS (SELECT 1 FROM events WHERE id=%s AND \"deletedAt\" IS NULL) THEN RAISE EXCEPTION USING MESSAGE='reolink-protect-events:retired',ERRCODE='P0002'; END IF;\n"
-                 " IF EXISTS (SELECT 1 FROM events WHERE id=%s AND (NOT COALESCE(%s,false) OR type IS DISTINCT FROM 'smartDetectZone' OR \"cameraId\" IS DISTINCT FROM %s OR start IS DISTINCT FROM %d OR \"smartDetectTypes\"::jsonb IS DISTINCT FROM %s::jsonb OR \"deletedAt\" IS NOT NULL)) THEN RAISE EXCEPTION 'Integration event identity collision'; END IF;\n END $rpe$;"
-                 % (cid, eid, "true" if require_existing else "false", eid, eid, owner_predicate, cid, start, class_sql)]
+                 " IF EXISTS (SELECT 1 FROM events WHERE id=%s AND (NOT COALESCE(%s,false) OR type IS DISTINCT FROM 'smartDetectZone' OR \"cameraId\" IS DISTINCT FROM %s OR %s OR \"smartDetectTypes\"::jsonb IS DISTINCT FROM %s::jsonb OR \"deletedAt\" IS NOT NULL)) THEN RAISE EXCEPTION 'Integration event identity collision'; END IF;\n END $rpe$;"
+                 % (cid, eid, "true" if require_existing else "false", eid, eid, owner_predicate, cid, start_conflict, class_sql)]
         if thumbnail:
             width, height = thumbnail.dimensions()
-            thumb_id = native_id("thumbnail", start, event_id)
-            preview_id = native_id("preview-thumbnail", start, event_id)
+            thumb_id = native_id("thumbnail", identity_start, event_id)
+            preview_id = native_id("preview-thumbnail", identity_start, event_id)
             event["thumbnailFullfov"] = thumb_id
             sid = sql_text(thumb_id)
             lines.append("INSERT INTO thumbnails (id,\"cameraId\",\"eventId\",width,height,timestamp,content,\"isFullfov\",locked,\"createdAt\",\"updatedAt\")\n"
@@ -355,12 +368,14 @@ ROLLBACK;
         end_sql = "NULL" if end is None else str(end)
         thumb_sql = "NULL" if thumb_id is None else sql_text(thumb_id)
         preview_sql = "NULL" if preview_id is None else sql_text(preview_id)
+        bounds_update = 'start=EXCLUDED.start,"end"=EXCLUDED."end",' if union else '"end"=CASE WHEN EXCLUDED."end" IS NULL THEN events."end" ELSE GREATEST(events."end",EXCLUDED."end") END,'
+        zone_case = "CASE WHEN EXCLUDED.\"end\" IS NOT NULL THEN 'leave' ELSE 'enter' END" if union else "CASE WHEN events.\"end\" IS NOT NULL OR EXCLUDED.\"end\" IS NOT NULL THEN 'leave' ELSE 'enter' END"
         lines.append("INSERT INTO events (id,type,start,\"end\",\"cameraId\",score,\"smartDetectTypes\",metadata,locked,\"thumbnailId\",\"thumbnailFullfovId\",\"createdAt\",\"updatedAt\")\n"
             "VALUES (%s,'smartDetectZone',%d,%s,%s,NULL,%s,%s,false,%s,%s,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)\n"
-            "ON CONFLICT (id) DO UPDATE SET \"end\"=CASE WHEN EXCLUDED.\"end\" IS NULL THEN events.\"end\" ELSE GREATEST(events.\"end\",EXCLUDED.\"end\") END,\n"
-            "metadata=((events.metadata::jsonb || EXCLUDED.metadata::jsonb) || jsonb_build_object('detectedThumbnails',CASE WHEN jsonb_array_length(COALESCE(events.metadata::jsonb->'detectedThumbnails','[]'::jsonb))>0 THEN events.metadata::jsonb->'detectedThumbnails' ELSE EXCLUDED.metadata::jsonb->'detectedThumbnails' END,'zonesStatus',jsonb_build_object('1',jsonb_build_object('status',CASE WHEN events.\"end\" IS NOT NULL OR EXCLUDED.\"end\" IS NOT NULL THEN 'leave' ELSE 'enter' END))))::json,\n"
+            "ON CONFLICT (id) DO UPDATE SET %s\n"
+            "metadata=((events.metadata::jsonb || EXCLUDED.metadata::jsonb) || jsonb_build_object('detectedThumbnails',CASE WHEN jsonb_array_length(COALESCE(events.metadata::jsonb->'detectedThumbnails','[]'::jsonb))>0 THEN events.metadata::jsonb->'detectedThumbnails' ELSE EXCLUDED.metadata::jsonb->'detectedThumbnails' END,'zonesStatus',jsonb_build_object('1',jsonb_build_object('status',%s))))::json,\n"
             "\"thumbnailId\"=CASE WHEN events.\"thumbnailId\" IS NULL OR (events.\"thumbnailId\"=events.\"thumbnailFullfovId\" AND events.\"thumbnailId\"=EXCLUDED.\"thumbnailFullfovId\") THEN EXCLUDED.\"thumbnailId\" ELSE events.\"thumbnailId\" END,\"thumbnailFullfovId\"=COALESCE(events.\"thumbnailFullfovId\",EXCLUDED.\"thumbnailFullfovId\"),\"updatedAt\"=CURRENT_TIMESTAMP;"
-            % (eid, start, end_sql, cid, class_sql, _sql_json(metadata), preview_sql, thumb_sql))
+            % (eid, start, end_sql, cid, class_sql, _sql_json(metadata), preview_sql, thumb_sql, bounds_update, zone_case))
         if thumb_id:
             for variant_id in (thumb_id, preview_id):
                 lines.append("UPDATE thumbnails SET \"eventId\"=%s WHERE id=%s AND \"cameraId\"=%s AND (\"eventId\" IS NULL OR \"eventId\"=%s);"
@@ -374,19 +389,20 @@ ROLLBACK;
                 % (sql_text(lid), sql_text(name), end or start))
         for kind, object_id in objects.items():
             attributes = {"objectType": kind, "zone": [1], "adapterVirtualZone": True}
-            object_meta = {"reolinkProtectEvents": {"owner": OWNER, "classificationOrigin": "camera",
+            object_meta = {"reolinkProtectEvents": {"owner": OWNER, "classificationOrigin": origin,
                                                    "confidenceAvailable": False, "spatialTrackAvailable": False,
                                                    "adapterVirtualZone": True, "sourceZoneIds": []}}
             lines.append("INSERT INTO \"smartDetectObjects\" (id,\"eventId\",\"cameraId\",type,attributes,metadata,\"detectedAt\",\"thumbnailId\",\"createdAt\",\"updatedAt\")\n"
                 "VALUES (%s,%s,%s,%s,%s,%s,%d,%s,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)\n"
-                "ON CONFLICT (id) DO UPDATE SET \"thumbnailId\"=COALESCE(\"smartDetectObjects\".\"thumbnailId\",EXCLUDED.\"thumbnailId\"),\"updatedAt\"=CURRENT_TIMESTAMP\n"
+                "ON CONFLICT (id) DO UPDATE SET \"thumbnailId\"=COALESCE(\"smartDetectObjects\".\"thumbnailId\",EXCLUDED.\"thumbnailId\"),%s\"updatedAt\"=CURRENT_TIMESTAMP\n"
                 "WHERE \"smartDetectObjects\".\"eventId\"=EXCLUDED.\"eventId\" AND \"smartDetectObjects\".\"cameraId\"=EXCLUDED.\"cameraId\" AND \"smartDetectObjects\".type=EXCLUDED.type;"
-                % (sql_text(object_id), eid, cid, sql_text(kind), _sql_json(attributes), _sql_json(object_meta, "jsonb"), start, thumb_sql))
+                % (sql_text(object_id), eid, cid, sql_text(kind), _sql_json(attributes), _sql_json(object_meta, "jsonb"), start, thumb_sql,
+                   '"detectedAt"=EXCLUDED."detectedAt",metadata=EXCLUDED.metadata,' if union else ''))
         lines.append("INSERT INTO \"smartDetectTracks\" (id,\"eventId\",\"cameraId\",payload,\"createdAt\",\"updatedAt\") VALUES (%s,%s,%s,'[]'::json,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) ON CONFLICT (id) DO NOTHING;"
                      % (sql_text(tid), eid, cid))
         def detection_label(object_id, names):
             key = event_id + ":" + (object_id or "event")
-            label_id = native_id("detection-label", start, key)
+            label_id = native_id("detection-label", identity_start, key)
             array_sql = "ARRAY(SELECT lid::integer FROM labels WHERE name IN (%s) ORDER BY lid)" % ",".join(sql_text(n) for n in names)
             object_sql = sql_text(object_id) if object_id else "NULL"
             target = '("eventId","objectId") WHERE "objectId" IS NOT NULL' if object_id else '("eventId") WHERE "objectId" IS NULL'

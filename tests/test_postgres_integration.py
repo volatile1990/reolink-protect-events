@@ -103,6 +103,55 @@ class PostgreSqlIntegrationTests(unittest.TestCase):
         self.assertEqual(picture, {"count": 2, "full": 1, "preview": 1, "favorites": True, "sameBytes": True})
         self.assertTrue(value("SELECT to_json(locked) FROM events;"))
 
+    def test_union_late_start_end_correction_retains_all_graph_ids_and_favorite(self):
+        row = interval()
+        identity = row["start"]
+        row["provenance"] = {"sourceUnionVersion": 1, "identityStart": identity,
+                             "sourceTypes": ["reolink"], "mergePolicy": "camera_class_time_union",
+                             "objectIdentityMatched": False}
+        self.db.upsert_interval(row, Thumbnail(JPEG, identity))
+        execute("UPDATE events SET locked=true;")
+        before_ids = value('SELECT json_build_object(\'objects\',(SELECT json_agg(id ORDER BY id) FROM "smartDetectObjects"),'
+                           '\'tracks\',(SELECT json_agg(id ORDER BY id) FROM "smartDetectTracks"),'
+                           '\'thumbnails\',(SELECT json_agg(id ORDER BY id) FROM thumbnails));')
+        changed = copy.deepcopy(row)
+        changed.update(start=identity - 2000, end=identity + 5000, deliveredRevision=1)
+        changed["provenance"]["sourceTypes"] = ["frigate", "reolink"]
+        result = self.db.upsert_interval(changed, Thumbnail(JPEG, identity))
+        self.assertEqual((result["start"], result["end"]), (identity - 2000, identity + 5000))
+        self.assertEqual(result["metadata"]["source"], "reolink-and-frigate")
+        self.assertEqual(result["metadata"]["reolinkProtectEvents"]["classificationOrigin"], "mixed")
+        after_ids = value('SELECT json_build_object(\'objects\',(SELECT json_agg(id ORDER BY id) FROM "smartDetectObjects"),'
+                          '\'tracks\',(SELECT json_agg(id ORDER BY id) FROM "smartDetectTracks"),'
+                          '\'thumbnails\',(SELECT json_agg(id ORDER BY id) FROM thumbnails));')
+        self.assertEqual(before_ids, after_ids)
+        self.assertEqual(self.counts()["objects"], 1)
+        self.assertTrue(value("SELECT to_json(locked) FROM events;"))
+        self.assertEqual(value('SELECT to_json("detectedAt") FROM "smartDetectObjects";'), changed["start"])
+        reopened = self.db.upsert_interval(dict(changed, end=None))
+        self.assertIsNone(reopened["end"])
+        self.assertEqual(reopened["metadata"]["zonesStatus"]["1"]["status"], "enter")
+        incompatible = copy.deepcopy(changed)
+        incompatible["provenance"]["identityStart"] += 1000
+        with self.assertRaises(NativeError):
+            self.db.upsert_interval(incompatible)
+        execute("DELETE FROM events WHERE id='" + row["eventId"] + "';")
+        with self.assertRaises(RetiredEventError):
+            self.db.upsert_interval(changed)
+
+    def test_legacy_activation_union_keeps_existing_object_identity(self):
+        row = interval()
+        self.db.upsert_interval(row)
+        before = value('SELECT to_json(id) FROM "smartDetectObjects";')
+        migrated = copy.deepcopy(row)
+        migrated.update(start=row["start"] - 1000, end=row["start"] + 2000, deliveredRevision=1)
+        migrated["provenance"].update(sourceUnionVersion=1, identityStart=row["start"],
+                                      sourceTypes=["frigate", "reolink"], mergePolicy="camera_class_time_union",
+                                      objectIdentityMatched=False)
+        self.db.upsert_interval(migrated)
+        self.assertEqual(self.counts()["objects"], 1)
+        self.assertEqual(value('SELECT to_json(id) FROM "smartDetectObjects";'), before)
+
     def test_preview_repair_changes_only_missing_preview(self):
         row = interval(); self.db.upsert_interval(row, Thumbnail(JPEG, row["start"]))
         full_id = native_id("thumbnail", row["start"], row["eventId"])

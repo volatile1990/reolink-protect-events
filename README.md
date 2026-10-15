@@ -2,6 +2,14 @@
 
 Imports **real camera AI classifications** from [reolink-bridge](https://github.com/volatile1990/reolink-bridge) as native UniFi Protect detections on the existing camera IDs. `people` becomes `person`, `car` becomes `vehicle`, and `dog_cat` becomes `animal`. Ordinary motion never becomes a person detection. No local image AI runs.
 
+An optional, explicitly mapped [Frigate source](docs/frigate-union.md) can contribute
+confirmed object detections through a private authenticated HTTP projection.
+Its intervals are united with Reolink by camera, class and overlapping time.
+Each source retains its own clears, replay state and timeout. Classification
+origin is recorded as camera, external model or mixed; this service still runs
+no image inference. Omitting the `frigate` configuration retains the original
+Reolink collection path for every camera.
+
 This implementation is pinned to **Protect 7.3.70** and its shipped UI **7.3.26**. It uses private console internals because Protect's published integration API does not provide Smart Detection ingestion. A version/schema mismatch stops native delivery while the source journal keeps collecting; applying the frontend patch additionally requires the exact known UI hashes. Supporting another Protect release requires inspecting and testing that release.
 
 ## Data flow

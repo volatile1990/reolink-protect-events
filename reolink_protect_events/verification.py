@@ -16,12 +16,19 @@ def verify_checks(report, event_id, expected_classes, camera_ids):
     cameras = report.get("cameras", [])
     selected = set(camera_ids or [camera])
     expected = sorted(set(expected_classes))
+    source_types = event.get("sourceTypes")
+    union = event.get("sourceUnionVersion") == 1 and isinstance(source_types, list) and bool(source_types) and set(source_types) <= {"reolink", "frigate"}
+    union_origin = "mixed" if union and len(set(source_types)) > 1 else "external-model" if union and source_types == ["frigate"] else "camera"
+    union_source = "reolink-and-frigate" if union_origin == "mixed" else "frigate-object-detection" if union_origin == "external-model" else "reolink-camera-ai"
+    ownership = event.get("classificationOrigin") == "camera" and event.get("sourceUnionVersion") is None if not union else (
+        event.get("classificationOrigin") == union_origin and event.get("source") == union_source and
+        event.get("mergePolicy") == "camera_class_time_union" and event.get("objectIdentityMatched") is False)
     checks = {
         "version": report.get("protectVersion") == VERSION,
         "bootstrap": report.get("bootstrapApiStatus") == 200,
         "eventApi": report.get("eventApiStatus") == 200 and event.get("id") == event_id,
         "eventCameraScope": camera in selected and set(c.get("id") for c in cameras) == selected and len(cameras) == len(selected),
-        "sourceOwnership": event.get("owner") == OWNER and event.get("schemaVersion") == 1 and event.get("classificationOrigin") == "camera",
+        "sourceOwnership": event.get("owner") == OWNER and event.get("schemaVersion") == 1 and ownership,
         "truthfulSource": event.get("score") is None and event.get("confidenceAvailable") is False and event.get("spatialTrackAvailable") is False and event.get("adapterVirtualZone") is True,
         "eventClasses": bool(expected) and set(expected) <= CLASSES and event.get("type") == "smartDetectZone" and sorted(event.get("smartDetectTypes", [])) == expected,
         "eventFilter": report.get("eventFilteredApi", {}).get("status") == 200 and report.get("eventFilteredApi", {}).get("found") is True,
@@ -42,6 +49,8 @@ def verify_checks(report, event_id, expected_classes, camera_ids):
         for key in ("thumbnailApi", "timelineThumbnailApi", "timelineThumbnailExplicitApi"))
     thumbnails = graph.get("thumbnails", [])
     checks["thumbnailGraph"] = all(any((t.get("isFullfov") is full or full is None and t.get("isFullfov") is False) and t.get("bytes", 0) > 0 and
-        t.get("width", 0) > 0 and t.get("height", 0) > 0 and t.get("timestamp") == event.get("start")
+        t.get("width", 0) > 0 and t.get("height", 0) > 0 and
+        (event.get("start", 0) <= t.get("timestamp", -1) <= (event.get("end") or event.get("start", 0) + 6000)
+         if union else t.get("timestamp") == event.get("start"))
         for t in thumbnails) for full in (None, True))
     return checks

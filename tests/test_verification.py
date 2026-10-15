@@ -36,6 +36,16 @@ class VerificationTests(unittest.TestCase):
         checks = verify_checks(report(), EVENT, ['person'], [CAMERA])
         self.assertTrue(all(checks.values()), checks)
 
+    def test_truthful_external_and_mixed_union_sources_are_verified(self):
+        for types, origin, source in ((["frigate"], "external-model", "frigate-object-detection"),
+                                      (["frigate", "reolink"], "mixed", "reolink-and-frigate")):
+            value = report()
+            value["event"].update(sourceUnionVersion=1, sourceTypes=types, classificationOrigin=origin,
+                                  source=source, mergePolicy="camera_class_time_union", objectIdentityMatched=False)
+            self.assertTrue(all(verify_checks(value, EVENT, ["person"], [CAMERA]).values()))
+            value["event"]["classificationOrigin"] = "camera"
+            self.assertFalse(verify_checks(value, EVENT, ["person"], [CAMERA])["sourceOwnership"])
+
     def test_previously_ignored_failures_are_rejected_individually(self):
         for name, mutate in (
             ('version', lambda r: r.update(protectVersion='new version')),

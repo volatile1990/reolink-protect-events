@@ -4,6 +4,7 @@
 Examples:
   python tools/test_postgres.py
   python tools/test_postgres.py --connector /path/to/approved/access.py --docker /usr/local/bin/docker
+  python tools/test_postgres.py --cpu-mode cpuset --process-mode rlimit
 
 No ports, host mounts, production credentials or existing databases are used.
 """
@@ -43,6 +44,34 @@ class Docker:
         return result.returncode, result.stdout, result.stderr
 
 
+def process_limit_args(mode):
+    if mode == "pids":
+        return ["--pids-limit", "64"]
+    if mode == "rlimit":
+        return ["--ulimit", "nproc=64:64"]
+    raise ValueError("Unsupported process-limit mode")
+
+
+def verify_nproc_limit(docker, name):
+    """Verify the actual database PID, not HostConfig or an exec helper's limit.
+
+    The official Debian postgres image execs postgres as UID 999 into PID 1 after
+    initialization. RLIMIT_NPROC applies to that non-root real UID, unlike root.
+    Its accounting scope is the shared real UID, not a cgroup/PID namespace.
+    """
+    status, output, _ = docker.run(["exec", name, "cat", "/proc/1/status", "/proc/1/limits"])
+    if status:
+        raise RuntimeError("PostgreSQL process-limit read failed")
+    command = re.findall(r"^Name:\s*(\S+)\s*$", output, re.MULTILINE)
+    users = re.findall(r"^Uid:\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$", output, re.MULTILINE)
+    limits = re.findall(r"^Max processes\s+(\S+)\s+(\S+)\s+processes\s*$", output, re.MULTILINE)
+    if command != ["postgres"] or users != [("999",) * 4] or limits != [("64", "64")]:
+        raise RuntimeError("PostgreSQL actual UID or RLIMIT_NPROC guard failed")
+    return {"method": "proc_pid1_status_and_limits", "pid": 1, "name": "postgres",
+            "realUid": 999, "soft": 64, "hard": 64,
+            "accountingScope": "shared_real_uid_999"}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--docker", default="docker")
@@ -50,6 +79,8 @@ def main():
     parser.add_argument("--image", default="postgres:16")
     parser.add_argument("--cpu-mode", choices=("quota", "cpuset"), default="quota",
                         help="Use cpuset for NAS kernels without the CPU CFS controller; pins CPU 0")
+    parser.add_argument("--process-mode", choices=("pids", "rlimit"), default="pids",
+                        help="Use verified UID999 RLIMIT_NPROC for NAS kernels without the PIDs controller")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if not re.fullmatch(r"postgres(?::[0-9]+(?:\.[0-9]+)?|@sha256:[a-f0-9]{64})", args.image):
@@ -61,6 +92,7 @@ def main():
               "syntheticDatabase": True, "productionDatabaseAccess": False, "memoryMiB": 256, "cpus": 1,
               "image": args.image, "testsRun": 0, "passed": False, "cleanupConfirmed": False}
     report["cpuLimitMode"] = args.cpu_mode
+    report["processLimitMode"] = args.process_mode
     log = io.StringIO()
     try:
         status, output, _ = docker.run(["image", "inspect", args.image, "--format", "{{.Id}}"])
@@ -69,7 +101,7 @@ def main():
         report["imageId"] = output.strip()
         cpu_args = ["--cpus", "1"] if args.cpu_mode == "quota" else ["--cpuset-cpus", "0"]
         status, output, error = docker.run(["run", "--detach", "--name", name, "--label", "rpe.integration.run=" + run_id,
-            "--network", "none", "--memory", "256m"] + cpu_args + ["--pids-limit", "64", "--shm-size", "16m",
+            "--network", "none", "--memory", "256m"] + cpu_args + process_limit_args(args.process_mode) + ["--shm-size", "16m",
             "--tmpfs", "/var/lib/postgresql/data:rw,nosuid,nodev,size=256m",
             "--env", "POSTGRES_HOST_AUTH_METHOD=trust", "--env", "POSTGRES_DB=unifi-protect", args.image,
             "postgres", "-c", "shared_buffers=16MB", "-c", "max_connections=16", "-c", "work_mem=1MB",
@@ -80,13 +112,15 @@ def main():
         report["containerId"] = output.strip()
         projected = '{"network":{{json .HostConfig.NetworkMode}},"ports":{{json .HostConfig.PortBindings}},' \
                     '"memory":{{json .HostConfig.Memory}},"cpuSet":{{json .HostConfig.CpusetCpus}},' \
+                    '"pidsLimit":{{json .HostConfig.PidsLimit}},' \
                     '"nanoCpus":{{json .HostConfig.NanoCpus}},"tmpfs":{{json .HostConfig.Tmpfs}},' \
                     '"mounts":{{json .Mounts}}}'
         status, output, _ = docker.run(["inspect", name, "--format", projected])
         isolation = json.loads(output)
         cpu_ok = isolation.get("cpuSet") == "0" if args.cpu_mode == "cpuset" else isolation.get("nanoCpus") == 1000000000
         if status or isolation.get("network") != "none" or isolation.get("ports") or isolation.get("memory") != 256 * 1024 * 1024 \
-                or not cpu_ok or "/var/lib/postgresql/data" not in (isolation.get("tmpfs") or {}) \
+                or not cpu_ok or (args.process_mode == "pids" and isolation.get("pidsLimit") != 64) \
+                or "/var/lib/postgresql/data" not in (isolation.get("tmpfs") or {}) \
                 or any(mount.get("Type") in ("bind", "volume") for mount in isolation.get("mounts", [])):
             raise RuntimeError("Isolated PostgreSQL resource or network guard failed")
         report["isolationVerified"] = True
@@ -94,10 +128,23 @@ def main():
         while True:
             status, _, _ = docker.run(["exec", name, "pg_isready", "-U", "postgres", "-d", "unifi-protect"], timeout=10)
             if status == 0:
-                break
+                if args.process_mode == "rlimit":
+                    try:
+                        # The entrypoint's temporary init server may answer
+                        # pg_isready before postgres has actually execed PID 1.
+                        report["processLimitEvidence"] = verify_nproc_limit(docker, name)
+                    except RuntimeError:
+                        pass
+                    else:
+                        break
+                else:
+                    break
             if time.monotonic() >= deadline:
                 raise RuntimeError("Isolated PostgreSQL did not become ready")
             time.sleep(0.25)
+        if args.process_mode != "rlimit":
+            report["processLimitEvidence"] = {"method": "docker_pids_controller", "pidsLimit": 64}
+        report["processLimitVerified"] = True
         spec = importlib.util.spec_from_file_location("postgres_integration_contracts", ROOT / "tests" / "test_postgres_integration.py")
         tests = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(tests)
