@@ -147,9 +147,11 @@ def poll(options, camera, cursor, active_ids, now_ms=None):
             window(middle, high, depth + 1)
         else:
             collect(values)
-    health = get("/health")
+    health = get("/health", {"camera": camera})
     if not isinstance(health, dict) or health.get("healthy") is not True:
         raise ValueError("frigate_detector_unhealthy")
+    if health.get("camera") != camera:
+        raise ValueError("frigate_health_camera_mismatch")
     window(after, through)
     # The start of a long-lived track can precede the history cursor by hours.
     # Query live tracks separately, and refresh saved live IDs to see their end.

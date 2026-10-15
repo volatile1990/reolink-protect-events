@@ -45,11 +45,16 @@ not expose Frigate's unrestricted internal API to the LAN. Plain HTTP is suitabl
 only on the explicitly restricted trusted local path. The shared HTTP helper's
 HTTPS mode does not validate certificates; do not treat it as authenticated TLS.
 
-Required endpoints are `/health` with boolean `healthy=true`, filtered
+Required endpoints are `/health?camera=...` with boolean `healthy=true` and the
+exact camera name echoed in `camera`, filtered
 `/api/events?camera=...&after=...&before=...&limit=200&include_thumbnails=0`, an
 `in_progress=1` list, and `/api/events/{id}` for previous active IDs. The health
 projection must check the actual camera processing and Coral process, not just
-the availability of Frigate's web server. Event fields are id, camera, label,
+the availability of Frigate's web server. Each mapped camera has its own health
+gate, polling worker and expiry. An unhealthy camera does not prevent healthy
+cameras' history from advancing or detections from arriving. Aggregate service
+health still reports the failure. The projection can retain global `/health`
+for compatibility with older single-camera collectors. Event fields are id, camera, label,
 start_time, end_time, false_positive, optional top_score and `data.type` with
 optional `data.top_score`. The contract follows Frigate 0.18.1's event API.
 

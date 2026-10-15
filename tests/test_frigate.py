@@ -289,7 +289,8 @@ class FrigateHttpTests(unittest.TestCase):
             self.assertEqual(headers["Authorization"], "Bearer " + options()["bearerToken"])
             self.assertLessEqual(kwargs["timeout"], 4)
             if parsed.path == "/health":
-                return 200, b'{"healthy":true}'
+                self.assertEqual(query.get("camera"), ["front"])
+                return 200, b'{"healthy":true,"camera":"front"}'
             if parsed.path.startswith("/api/events/"):
                 identifier = urllib.parse.unquote(parsed.path.split("/")[-1])
                 value = next((value for value in values if value["id"] == identifier), None)
@@ -329,7 +330,7 @@ class FrigateHttpTests(unittest.TestCase):
             value = item(end=10000)
             value.update(mutation)
             def get(url, *_args, **_kwargs):
-                return (200, b'{"healthy":true}') if urllib.parse.urlsplit(url).path == "/health" else (200, json.dumps([value]).encode())
+                return (200, b'{"healthy":true,"camera":"front"}') if urllib.parse.urlsplit(url).path == "/health" else (200, json.dumps([value]).encode())
             with patch("reolink_protect_events.frigate.get_bytes", side_effect=get):
                 with self.assertRaises(ValueError):
                     poll(options(), "front", START, [], START + 60000)
@@ -341,6 +342,13 @@ class FrigateHttpTests(unittest.TestCase):
                     poll(options(), "front", START, [], START + 60000)
                 self.assertEqual(get.call_count, 1)
 
+    def test_camera_health_cannot_be_borrowed_from_another_camera(self):
+        with patch("reolink_protect_events.frigate.get_bytes", return_value=(200, b'{"healthy":true,"camera":"other"}')) as get:
+            with self.assertRaisesRegex(ValueError, "frigate_health_camera_mismatch"):
+                poll(options(), "front", START, [], START + 60000)
+            self.assertIn("camera=front", get.call_args.args[0])
+            self.assertEqual(get.call_count, 1)
+
     def test_optional_config_does_not_change_legacy_and_rejects_secret_url(self):
         self.assertIsNone(settings(config()))
         for change in ({"url": "http://user:password@192.0.2.1"}, {"bearerToken": "x\r\nAuthorization: bad"}, {"cameraMap": {"front": "2" * 24}}):
@@ -351,6 +359,40 @@ class FrigateHttpTests(unittest.TestCase):
 
 
 class RuntimeFusionTests(unittest.TestCase):
+    def test_one_unhealthy_source_does_not_block_another_camera_history_or_reolink(self):
+        second = "2" * 24
+        value = config([bridge(), bridge(camera=second, host="192.168.30.215")])
+        value["frigate"] = options()
+        value["frigate"]["cameraMap"] = {"front": CAMERA, "side": second}
+        def source_poll(_options, name, *_args):
+            if name == "side":
+                raise ValueError("frigate_detector_unhealthy")
+            return batch([item(end=10000)], at=60000)
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Runtime(value, directory, capture_only=True)
+            try:
+                with patch("reolink_protect_events.runtime.time.time", return_value=(START + 60000) / 1000), \
+                     patch("reolink_protect_events.runtime.fetch_bridge", return_value=response([event(1, classes=["person"])])), \
+                     patch("reolink_protect_events.frigate.poll", side_effect=source_poll):
+                    runtime.once()
+                    for future in list(runtime._frigate_jobs):
+                        try:
+                            future.result()
+                        except ValueError:
+                            pass
+                    runtime.once()
+                health = json.loads((Path(directory) / "health.json").read_text())
+                self.assertFalse(health["frigateHealthy"])
+                self.assertEqual(health["frigate"][CAMERA]["consecutiveErrors"], 0)
+                self.assertGreater(health["frigate"][second]["consecutiveErrors"], 0)
+                self.assertEqual(runtime.journal.fusion.poll_state(CAMERA)[0], START + 60000)
+                self.assertIsNone(runtime.journal.fusion.poll_state(second)[0])
+                self.assertEqual(runtime.journal.cursor(CAMERA)["seq"], 1)
+                self.assertEqual(runtime.journal.cursor(second)["seq"], 1)
+                self.assertTrue(any("frigate" in row["provenance"]["sourceTypes"] for row in runtime.journal.pending() if row["cameraId"] == CAMERA))
+            finally:
+                runtime.close()
+
     def test_poll_failure_keeps_bridge_capture_and_saved_frigate_watermark(self):
         value = config()
         value["frigate"] = options()
