@@ -18,8 +18,11 @@ import threading
 import time
 import uuid
 
+from .native import AUDIO_TYPES
+
 
 CLASSES = frozenset(("person", "vehicle", "animal"))
+AUDIO_CLASSES = frozenset(AUDIO_TYPES.values())
 _GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 _ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _MAX_PACKET = 1024 * 1024
@@ -58,19 +61,26 @@ def event_packet(action, event, update_id=None):
         raise ValueError("Invalid event action or body")
     event_id = _identifier(event.get("id"), "event identity")
     camera_id = _identifier(event.get("camera"), "event camera")
-    if event.get("type") != "smartDetectZone":
-        raise ValueError("Only source-classified smartDetectZone events are supported")
+    event_type = event.get("type")
+    if event_type not in ("smartDetectZone", "smartAudioDetect"):
+        raise ValueError("Only source-classified visual or audio events are supported")
+    audio = event_type == "smartAudioDetect"
+    supported = AUDIO_CLASSES if audio else CLASSES
     classes = event.get("smartDetectTypes")
     if not isinstance(classes, list) or not classes or any(
-            not isinstance(kind, str) or kind not in CLASSES for kind in classes):
-        raise ValueError("Event requires real person, vehicle or animal classifications")
+            not isinstance(kind, str) or kind not in supported for kind in classes):
+        raise ValueError("Event requires matching source classifications")
     start, end = event.get("start"), event.get("end")
     if type(start) is not int or not 0 < start < 2 ** 53 or (
             end is not None and (type(end) is not int or not start <= end < 2 ** 53)):
         raise ValueError("Invalid event interval")
     metadata = event.get("metadata")
     expected_status = "enter" if end is None else "leave"
-    if not isinstance(metadata, dict) or metadata.get("zonesStatus", {}).get("1", {}).get("status") != expected_status:
+    if not isinstance(metadata, dict):
+        raise ValueError("Event metadata is required")
+    if audio and metadata.get("zonesStatus") != {}:
+        raise ValueError("Audio events must not invent a visual integration zone")
+    if not audio and metadata.get("zonesStatus", {}).get("1", {}).get("status") != expected_status:
         raise ValueError("Event integration zone status must match the interval")
     # The serialization copy prevents mutations to the caller's persisted body.
     body = json.loads(json.dumps(event, allow_nan=False))

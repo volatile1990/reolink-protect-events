@@ -113,6 +113,34 @@ class FakeAdapter:
 
 
 class CameraFeatureTests(unittest.TestCase):
+    def test_audio_features_are_explicit_per_camera_and_preserve_native_settings(self):
+        adapter = FakeAdapter()
+        adapter.rows[0]["featureFlags"]["smartDetectAudioTypes"] = ["alrmSpeak"]
+        adapter.rows[1]["featureFlags"]["smartDetectAudioTypes"] = ["alrmBark"]
+        selected = {IDS[0]: ["alrmBabyCry", "alrmBabyCry", "alrmGlassBreak"]}
+        tool = CameraFeatures(adapter)
+        plan = tool.plan(IDS, audio_types_by_camera=selected)
+        self.assertEqual(plan["audioTypesByCamera"], {IDS[0]: ["alrmBabyCry", "alrmGlassBreak"]})
+        for row in plan["cameras"]:
+            self.assertFalse(row["configured"]["featureFlags"]["hasMic"])
+            self.assertEqual(row["configured"]["smartDetectSettings"], row["original"]["smartDetectSettings"])
+        self.assertEqual(plan["cameras"][0]["configured"]["featureFlags"]["smartDetectAudioTypes"], ["alrmBabyCry", "alrmGlassBreak"])
+        self.assertEqual(plan["cameras"][1]["configured"]["featureFlags"]["smartDetectAudioTypes"], ["alrmBark"])
+        self.assertEqual(tool.public_plan(plan)["audioTypesByCamera"], plan["audioTypesByCamera"])
+        self.assertNotIn('"smartDetectSettings"=', tool._sql(plan))
+        self.assertEqual(adapter.rows[0]["featureFlags"]["smartDetectAudioTypes"], ["alrmSpeak"])
+        cleared = tool.plan(IDS, audio_types_by_camera={IDS[0]: []})
+        self.assertEqual(cleared["cameras"][0]["configured"]["featureFlags"]["smartDetectAudioTypes"], [])
+
+    def test_audio_capabilities_reject_wrong_camera_or_internal_source_names(self):
+        for supplied in ({"ffffffffffffffffffffffff": ["alrmBabyCry"]},
+                         {IDS[0]: ["babyCry"]}, {IDS[0]: ["alrmBurglar"]},
+                         {IDS[0]: "alrmBark"}, {IDS[0]: [None]}, []):
+            adapter = FakeAdapter()
+            with self.subTest(supplied=supplied), self.assertRaises(ValueError):
+                CameraFeatures(adapter).plan(IDS, audio_types_by_camera=supplied)
+            self.assertEqual(adapter.calls, [])
+
     def test_truthful_zone_and_narrow_field_changes(self):
         adapter = FakeAdapter()
         tool = CameraFeatures(adapter)

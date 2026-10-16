@@ -95,6 +95,19 @@ class JournalTests(unittest.TestCase):
         self.assertEqual(source_classes(event(1, raw=["face", "visitor", "motion", "true", "package"])), set())
         self.assertEqual(source_classes(event(1, raw=["people", "dog_cat", "car"])), {"person", "animal", "vehicle"})
 
+    def test_reolink_baby_cry_aliases_keep_audio_separate_from_objects(self):
+        for label in ("cry", "baby_cry", "babycry", " CRY "):
+            self.assertEqual(source_classes(event(1, raw=[label])), {"babyCry"})
+        self.assertEqual(source_classes(event(1, raw=["crying", "smoke", "bark"])), set())
+        self.journal.ingest(CAMERA, response([
+            event(1, classes=["person"], raw=["cry"]),
+            event(2, 3000, classes=["person"]),
+            event(3, 6000)]))
+        values = {p["classes"][0]: p for p in self.journal.pending()}
+        self.assertEqual(set(values), {"person", "babyCry"})
+        self.assertEqual(values["babyCry"]["end"], START + 3000)
+        self.assertEqual(values["person"]["end"], START + 6000)
+
     def test_dotnet_timestamp_preserves_millisecond(self):
         self.assertEqual(timestamp_ms("2026-10-09T23:02:27.5128436+00:00"), START)
         with self.assertRaises(ValueError):

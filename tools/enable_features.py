@@ -163,6 +163,9 @@ def refresh(state):
    raise RuntimeError('protect_api_camera_scope_changed')
   if not flags.get('hasSmartDetect') or flags['smartDetectTypes']!=item['configured']['featureFlags']['smartDetectTypes']:
    raise RuntimeError('protect_api_feature_flags_not_loaded')
+  expected_audio=item['configured']['featureFlags'].get('smartDetectAudioTypes')
+  if expected_audio is not None and flags.get('smartDetectAudioTypes')!=expected_audio:
+   raise RuntimeError('protect_api_audio_feature_flags_not_loaded')
   zones=current['smartDetectZones']
   expected_zones=item['configured']['smartDetectZones']
   if len(zones)!=1:raise RuntimeError('protect_api_camera_zones_changed')

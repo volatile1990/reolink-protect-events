@@ -129,6 +129,28 @@ class PacketTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             event_packet("update", inconsistent)
 
+    def test_audio_native_enums_pass_without_visual_zone_and_wrong_enum_family_fails(self):
+        native_audio = ("alrmBabyCry", "alrmBark", "alrmSpeak", "alrmGlassBreak", "alrmSiren", "alrmCarHorn", "alrmSmoke")
+        for kind in native_audio:
+            original = event()
+            original.update(type="smartAudioDetect", smartDetectTypes=[kind])
+            original["metadata"]["zonesStatus"] = {}
+            _, packet = event_packet("add", original, "audio-fixture")
+            header, body = decode_ucp(packet)
+            self.assertEqual(header["authorizationModelId"], original["camera"])
+            self.assertEqual(body["type"], "smartAudioDetect")
+            self.assertEqual(body["smartDetectTypes"], [kind])
+            self.assertEqual(body["metadata"]["zonesStatus"], {})
+            original["end"] = original["start"] + 1000
+            event_packet("update", original)
+        for event_type, classes in (("smartAudioDetect", ["person"]), ("smartAudioDetect", ["babyCry"]),
+                                    ("smartAudioDetect", ["alrmBabyCry", "animal"]),
+                                    ("smartDetectZone", ["alrmBark"])):
+            with self.assertRaises(ValueError):
+                event_packet("add", {**event(), "type": event_type, "smartDetectTypes": classes})
+        with self.assertRaisesRegex(ValueError, "visual integration zone"):
+            event_packet("add", {**event(), "type": "smartAudioDetect", "smartDetectTypes": ["alrmBabyCry"]})
+
     def test_unicode_lengths_are_bytes_and_nan_is_rejected(self):
         packet = encode_ucp({"name": "T\u00fcr"}, {"value": "\U0001f600"})
         self.assertEqual(decode_ucp(packet), ({"name": "T\u00fcr"}, {"value": "\U0001f600"}))

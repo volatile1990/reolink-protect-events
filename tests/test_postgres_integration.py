@@ -88,6 +88,72 @@ class PostgreSqlIntegrationTests(unittest.TestCase):
                        '\'invented\',(SELECT count(*) FROM "smartDetectObjects" WHERE metadata::text LIKE \'%"confidence":%\' OR attributes::text LIKE \'%"coord":%\'));')
         self.assertEqual(truths, {"scores": 0, "objectTypes": ["animal", "person", "vehicle"], "payload": [], "invented": 0})
 
+    def test_audio_event_search_graph_retry_and_retirement(self):
+        row = interval(classes=["babyCry"])
+        row["provenance"].update(sourceUnionVersion=1, identityStart=row["start"],
+            sourceTypes=["frigate", "reolink"], mergePolicy="camera_class_time_union", objectIdentityMatched=False)
+        event = self.db.upsert_interval(row, Thumbnail(JPEG, row["start"]))
+        self.assertEqual(event["type"], "smartAudioDetect")
+        self.assertEqual(event["smartDetectTypes"], ["alrmBabyCry"])
+        self.assertFalse(event["metadata"]["reolinkProtectEvents"]["adapterVirtualZone"])
+        self.assertEqual(event["metadata"]["zonesStatus"], {})
+        self.assertEqual(self.counts(), {"events": 1, "objects": 0, "tracks": 0,
+                                      "detectionLabels": 1, "thumbnails": 2, "labels": 3})
+        labels = value('SELECT json_agg(l.name ORDER BY l.name) FROM "detectionLabels" dl JOIN labels l ON l.lid=ANY(dl.labels);')
+        self.assertEqual(labels, ["camera:" + CAMERA, "eventType:smartAudioDetect", "smartDetectType:alrmBabyCry"])
+        self.assertTrue(value('SELECT to_json("smartDetectTypes"::jsonb ? \'alrmBabyCry\') FROM events;'))
+        execute("UPDATE events SET locked=true;")
+        closed = dict(row, end=row["start"] + 4000, deliveredRevision=1)
+        again = self.db.upsert_interval(closed)
+        self.assertEqual(again["end"], closed["end"])
+        self.assertEqual(again["metadata"]["detectedThumbnails"], event["metadata"]["detectedThumbnails"])
+        self.assertTrue(value("SELECT to_json(locked) FROM events;"))
+        self.assertEqual(self.counts()["objects"], 0)
+        execute("DELETE FROM events;")
+        with self.assertRaises(RetiredEventError):
+            self.db.upsert_interval(closed)
+
+    def test_late_details_enrich_stable_objects_and_correct_search_labels(self):
+        row = interval(classes=["vehicle", "animal"])
+        self.db.upsert_interval(row, Thumbnail(JPEG, row["start"]))
+        before = value('SELECT json_build_object(\'objects\',(SELECT json_agg(id ORDER BY id) FROM "smartDetectObjects"),'
+                       '\'tracks\',(SELECT json_agg(id ORDER BY id) FROM "smartDetectTracks"),'
+                       '\'thumbnails\',(SELECT json_agg(id ORDER BY id) FROM thumbnails));')
+        first_thumb = value("SELECT to_json(metadata::jsonb->'detectedThumbnails'->0->>'croppedId') FROM events;")
+        updated = copy.deepcopy(row)
+        updated["deliveredRevision"] = 1
+        updated["provenance"]["classificationDetails"] = {"vehicleType": ["bike"], "animalType": ["cat"]}
+        result = self.db.upsert_interval(updated)
+        attrs = value('SELECT json_object_agg(type,attributes) FROM "smartDetectObjects";')
+        self.assertEqual(attrs["vehicle"]["vehicleType"], {"val": "bike"})
+        self.assertEqual(attrs["animal"]["species"], {"val": "cat"})
+        thumbs = {thumb["type"]: thumb for thumb in result["metadata"]["detectedThumbnails"]}
+        self.assertEqual(thumbs["vehicle"]["attributes"]["vehicleType"], {"val": "bike"})
+        self.assertEqual(thumbs["animal"]["attributes"]["species"], {"val": "cat"})
+        self.assertEqual(first_thumb, result["metadata"]["detectedThumbnails"][0]["croppedId"])
+        labels = value('SELECT json_object_agg(COALESCE(o.type,\'event\'),x.names) FROM "detectionLabels" dl '
+            'LEFT JOIN "smartDetectObjects" o ON o.id=dl."objectId" CROSS JOIN LATERAL '
+            '(SELECT json_agg(l.name ORDER BY l.name) names FROM labels l WHERE l.lid=ANY(dl.labels)) x;')
+        self.assertIn("vehicleType:bike", labels["event"])
+        self.assertIn("species:cat", labels["event"])
+        self.assertIn("vehicleType:bike", labels["vehicle"])
+        self.assertNotIn("species:cat", labels["vehicle"])
+        self.assertIn("species:cat", labels["animal"])
+        self.assertNotIn("vehicleType:bike", labels["animal"])
+        updated["provenance"]["classificationDetails"] = {"vehicleType": ["bike", "bus"], "animalType": ["cat", "dog"]}
+        result = self.db.upsert_interval(updated)
+        attrs = value('SELECT json_object_agg(type,attributes) FROM "smartDetectObjects";')
+        self.assertNotIn("vehicleType", attrs["vehicle"])
+        self.assertNotIn("species", attrs["animal"])
+        for thumb in result["metadata"]["detectedThumbnails"]:
+            self.assertNotIn("vehicleType", thumb["attributes"])
+            self.assertNotIn("species", thumb["attributes"])
+        after = value('SELECT json_build_object(\'objects\',(SELECT json_agg(id ORDER BY id) FROM "smartDetectObjects"),'
+                      '\'tracks\',(SELECT json_agg(id ORDER BY id) FROM "smartDetectTracks"),'
+                      '\'thumbnails\',(SELECT json_agg(id ORDER BY id) FROM thumbnails));')
+        self.assertEqual(before, after)
+        self.assertEqual(self.counts()["objects"], 2)
+
     def test_thumbnail_variants_and_favorites_are_preserved(self):
         row = interval(); thumbnail = Thumbnail(JPEG, row["start"])
         self.db.upsert_interval(row, thumbnail)
@@ -233,11 +299,15 @@ class PostgreSqlIntegrationTests(unittest.TestCase):
         cameras = [CAMERA, "222222222222222222222222"]
         features = CameraFeatures(self.db)
         with tempfile.TemporaryDirectory(prefix="rpe-pg-feature-fixture-") as backup:
-            result = features.apply(cameras, backup)
+            result = features.apply(cameras, backup, audio_types_by_camera={CAMERA: ["alrmBabyCry", "alrmBark"]})
             configured = value('SELECT json_agg(row_to_json(cameras) ORDER BY id) FROM cameras;')
             for row in configured:
                 self.assertTrue(row["featureFlags"]["hasSmartDetect"])
                 self.assertTrue(row["featureFlags"]["syntheticUnchangedFlag"])
+                if row["id"] == CAMERA:
+                    self.assertEqual(row["featureFlags"]["smartDetectAudioTypes"], ["alrmBabyCry", "alrmBark"])
+                else:
+                    self.assertNotIn("smartDetectAudioTypes", row["featureFlags"])
                 self.assertEqual(row["smartDetectZones"], [INTEGRATION_ZONE])
                 self.assertEqual(row["smartDetectSettings"], {"objectTypes": []})
             # This represents a user's later native recognition change. Rollback

@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from reolink_protect_events.native import (
-    CLASSES, NativeAdapter, NativeError, RetiredEventError, SchemaError, Thumbnail,
+    AUDIO_TYPES, CLASSES, NativeAdapter, NativeError, RetiredEventError, SchemaError, Thumbnail,
     _REQUIRED_COLUMNS, native_id, sql_text,
 )
 
@@ -42,6 +42,78 @@ JPEG = bytes.fromhex("ffd8ffc00011080018002003011100021100031100ffda000801010000
 
 
 class NativeContractTests(unittest.TestCase):
+    @staticmethod
+    def decoded_json(sql):
+        import re
+        result = []
+        for encoded in re.findall(r"convert_from\(decode\('([0-9a-f]*)','hex'\),'UTF8'\)", sql):
+            try:
+                result.append(json.loads(bytes.fromhex(encoded).decode("utf-8")))
+            except ValueError:
+                pass
+        return result
+
+    def test_audio_uses_native_audio_event_enum_and_event_only_graph(self):
+        for source_class, native_class in AUDIO_TYPES.items():
+            with self.subTest(source_class=source_class):
+                sql, event = adapter().build_interval_sql(dict(INTERVAL, classes=[source_class]), Thumbnail(JPEG, START))
+                self.assertEqual(event["type"], "smartAudioDetect")
+                self.assertEqual(event["smartDetectTypes"], [native_class])
+                self.assertEqual(event["metadata"]["zonesStatus"], {})
+                self.assertFalse(event["metadata"]["reolinkProtectEvents"]["adapterVirtualZone"])
+                self.assertEqual(event["metadata"]["detectedThumbnails"], [
+                    {"clockBestWall": START, "type": native_class,
+                     "croppedId": native_id("thumbnail", START, INTERVAL["eventId"])}])
+                self.assertNotIn('INSERT INTO "smartDetectObjects"', sql)
+                self.assertNotIn('INSERT INTO "smartDetectTracks"', sql)
+                self.assertEqual(sql.count('INSERT INTO "detectionLabels"'), 1)
+                self.assertIn(sql_text("eventType:smartAudioDetect"), sql)
+                self.assertIn(sql_text("smartDetectType:" + native_class), sql)
+                self.assertNotIn(sql_text("zone:" + INTERVAL["cameraId"] + ":1"), sql)
+                self.assertNotIn('"smartDetectAudioTypes"', sql)
+
+    def test_audio_and_visual_are_separate_and_unknown_details_fail_closed(self):
+        for changes in ({"classes": ["person", "babyCry"]},
+                        {"classes": ["alrmBabyCry"]},
+                        {"classes": ["bark"], "details": {"animalType": ["dog"]}},
+                        {"classes": ["vehicle"], "details": {"vehicleType": ["sedan"]}},
+                        {"classes": ["vehicle"], "details": {"vehicleType": ["car"]}},
+                        {"classes": ["animal"], "details": {"animalType": ["dog_cat"]}},
+                        {"classes": ["person"], "details": {"vehicleType": ["bike"]}},
+                        {"classes": ["vehicle"], "details": {"vehicleType": "bike"}}):
+            row = copy.deepcopy(INTERVAL)
+            row["classes"] = changes["classes"]
+            if "details" in changes:
+                row["provenance"]["classificationDetails"] = changes["details"]
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                adapter().build_interval_sql(row)
+
+    def test_details_add_searchable_labels_without_fabricated_confidence(self):
+        row = copy.deepcopy(INTERVAL)
+        row["classes"] = ["vehicle", "animal"]
+        row["provenance"]["classificationDetails"] = {"vehicleType": ["bike"], "animalType": ["cat"]}
+        sql, event = adapter().build_interval_sql(row, Thumbnail(JPEG, START))
+        thumbs = {thumb["type"]: thumb for thumb in event["metadata"]["detectedThumbnails"]}
+        self.assertEqual(thumbs["vehicle"]["attributes"]["vehicleType"], {"val": "bike"})
+        self.assertEqual(thumbs["animal"]["attributes"]["species"], {"val": "cat"})
+        for label in ("vehicleType:bike", "species:cat"):
+            self.assertIn(sql_text(label), sql)
+        self.assertIn("attributes=EXCLUDED.attributes", sql)
+        self.assertIn("WITH ORDINALITY", sql)
+        self.assertNotIn('"confidence":', json.dumps(self.decoded_json(sql)))
+
+    def test_multiple_details_are_labels_without_choosing_one_object_subtype(self):
+        row = copy.deepcopy(INTERVAL)
+        row["classes"] = ["vehicle", "animal"]
+        row["provenance"]["classificationDetails"] = {
+            "vehicleType": ["bus", "bike", "bus"], "animalType": ["cat", "dog"]}
+        sql, event = adapter().build_interval_sql(row, Thumbnail(JPEG, START))
+        for thumb in event["metadata"]["detectedThumbnails"]:
+            self.assertNotIn("vehicleType", thumb["attributes"])
+            self.assertNotIn("species", thumb["attributes"])
+        for label in ("vehicleType:bus", "vehicleType:bike", "species:cat", "species:dog"):
+            self.assertIn(sql_text(label), sql)
+
     def test_schema_guard_accepts_live_schema_fixture(self):
         seen = []
         db = adapter(lambda sql: seen.append(sql) or json.dumps(schema_fixture()))

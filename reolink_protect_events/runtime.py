@@ -16,10 +16,13 @@ import urllib.error
 import urllib.request
 from .http_deadline import get_bytes
 
-CLASSES = frozenset(("person", "vehicle", "animal"))
+OBJECT_CLASSES = frozenset(("person", "vehicle", "animal"))
+AUDIO_CLASSES = frozenset(("babyCry", "bark", "speak", "glassBreak", "siren", "carHorn", "smoke"))
+CLASSES = OBJECT_CLASSES | AUDIO_CLASSES
 RAW_CLASSES = {"people": "person", "person": "person", "human": "person", "pedestrian": "person",
                "car": "vehicle", "vehicle": "vehicle", "dog_cat": "animal", "dogcat": "animal",
-               "animal": "animal", "pet": "animal", "dog": "animal", "cat": "animal"}
+               "animal": "animal", "pet": "animal", "dog": "animal", "cat": "animal",
+               "cry": "babyCry", "baby_cry": "babyCry", "babycry": "babyCry"}
 
 
 def timestamp_ms(value):
@@ -494,7 +497,8 @@ class Runtime:
                 if interval["notifiedRevision"] == 0:
                     start_event = json.loads(json.dumps(event))
                     start_event["end"] = None
-                    start_event["metadata"]["zonesStatus"]["1"]["status"] = "enter"
+                    if start_event.get("type") != "smartAudioDetect":
+                        start_event["metadata"]["zonesStatus"]["1"]["status"] = "enter"
                     client.send_event("add", start_event)
                     if event["end"] is not None:
                         client.send_event("update", event)

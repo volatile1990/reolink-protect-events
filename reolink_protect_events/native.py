@@ -18,6 +18,14 @@ from typing import Callable, Optional
 SUPPORTED_PROTECT_VERSION = "7.3.70"
 OWNER = "reolink-protect-events"
 CLASSES = frozenset(("person", "vehicle", "animal"))
+# Protect 7.3.70 stores both visual and audio enum values in the event's
+# smartDetectTypes column. smartDetectAudioTypes is a camera feature flag,
+# not a separate event column (inspected modules 648922, 573317, 610561).
+AUDIO_TYPES = {"babyCry": "alrmBabyCry", "bark": "alrmBark", "speak": "alrmSpeak",
+               "glassBreak": "alrmGlassBreak", "siren": "alrmSiren",
+               "carHorn": "alrmCarHorn", "smoke": "alrmSmoke"}
+_DETAIL_TYPES = {"vehicleType": ("vehicle", frozenset(("bike", "motorcycle", "bus"))),
+                 "animalType": ("animal", frozenset(("cat", "dog", "bird")))}
 _ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _SECRET_KEYS = frozenset(("password", "passwd", "secret", "token", "authorization",
                           "apikey", "privatekey", "credentials", "supervisortoken"))
@@ -76,6 +84,26 @@ def _safe_provenance(value, depth=0):
 
 def _json(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True, allow_nan=False)
+
+
+def _classification_details(provenance, classes):
+    """Keep source-supported details; an interval may contain several objects.
+
+    Multiple observed subtypes become searchable labels. A single scalar
+    attribute is emitted only when that interval has exactly one known value.
+    Neither a generic car label nor Reolink's dog_cat implies a finer subtype.
+    """
+    supplied = provenance.get("classificationDetails", {})
+    if not isinstance(supplied, dict) or not set(supplied) <= set(_DETAIL_TYPES):
+        raise ValueError("Invalid source classification details")
+    result = {}
+    for key, values in supplied.items():
+        kind, allowed = _DETAIL_TYPES[key]
+        if (kind not in classes or not isinstance(values, list) or not values or
+                any(not isinstance(value, str) or value not in allowed for value in values)):
+            raise ValueError("Classification details do not match the interval class")
+        result[key] = sorted(set(values))
+    return result
 
 
 def sql_text(value):
@@ -288,21 +316,29 @@ ROLLBACK;
             raise ValueError("Invalid interval delivery state")
         require_existing = require_existing or delivered_revision > 0
         classes = interval.get("classes")
-        if not isinstance(classes, (list, tuple)) or not classes or any(item not in CLASSES for item in classes):
-            raise ValueError("Interval requires real person, vehicle or animal classes")
+        if not isinstance(classes, (list, tuple)) or not classes or any(item not in CLASSES and item not in AUDIO_TYPES for item in classes):
+            raise ValueError("Interval requires supported visual or audio classes")
         classes = sorted(set(classes))
+        is_audio = all(kind in AUDIO_TYPES for kind in classes)
+        if not is_audio and any(kind in AUDIO_TYPES for kind in classes):
+            raise ValueError("Visual and audio classifications require separate intervals")
+        event_type = "smartAudioDetect" if is_audio else "smartDetectZone"
+        native_classes = sorted(AUDIO_TYPES[kind] for kind in classes) if is_audio else classes
         provenance = _safe_provenance(interval.get("provenance", {}))
         if not isinstance(provenance, dict) or not provenance:
             raise ValueError("Source provenance is required")
         if len(_json(provenance).encode("utf-8")) > 32768:
             raise ValueError("Provenance exceeds 32 KiB")
+        details = _classification_details(provenance, classes)
         union = provenance.get("sourceUnionVersion") == 1
         identity_start = _millis(provenance.get("identityStart"), "identityStart") if union else start
         source_types = provenance.get("sourceTypes", [])
         if union and (not isinstance(source_types, list) or not source_types or not set(source_types) <= {"reolink", "frigate"}):
             raise ValueError("Union requires explicit source types")
         origin = ("mixed" if len(set(source_types)) > 1 else "external-model" if source_types == ["frigate"] else "camera") if union else "camera"
-        source_name = ("reolink-and-frigate" if origin == "mixed" else "frigate-object-detection" if origin == "external-model" else "reolink-camera-ai")
+        source_name = ("reolink-and-frigate" if origin == "mixed" else
+                       "frigate-audio-detection" if origin == "external-model" and is_audio else
+                       "frigate-object-detection" if origin == "external-model" else "reolink-camera-ai")
         if isinstance(thumbnail, Mapping):
             thumbnail = Thumbnail(**thumbnail)
         if thumbnail is not None and not isinstance(thumbnail, Thumbnail):
@@ -310,21 +346,33 @@ ROLLBACK;
         metadata = {"source": source_name, "reolinkProtectEvents": {
             "owner": OWNER, "schemaVersion": 1, "classificationOrigin": origin,
             "confidenceAvailable": False, "spatialTrackAvailable": False,
-            "adapterVirtualZone": True, "sourceZoneIds": [],
+            "adapterVirtualZone": not is_audio, "sourceZoneIds": [],
             "provenance": provenance},
             # Zone 1 is an integration rule covering this camera, not an object box.
-            "zonesStatus": {"1": {"status": "enter" if end is None else "leave"}},
+            "zonesStatus": {} if is_audio else {"1": {"status": "enter" if end is None else "leave"}},
             "loiterStatus": {}, "linesStatus": {},
             "detectedThumbnails": []}
-        event = {"id": event_id, "modelKey": "event", "type": "smartDetectZone",
+        event = {"id": event_id, "modelKey": "event", "type": event_type,
                  "camera": camera_id, "start": start, "end": end, "score": None,
-                 "smartDetectTypes": classes, "metadata": metadata,
+                 "smartDetectTypes": native_classes, "metadata": metadata,
                  "thumbnail": "e-" + event_id, "thumbnailFullfov": None,
                  "heatmap": "e-" + event_id}
         eid, cid = sql_text(event_id), sql_text(camera_id)
         owner_predicate = "metadata::jsonb->'reolinkProtectEvents'->>'owner'=" + sql_text(OWNER)
-        class_sql = _sql_json(classes)
-        objects = {kind: native_id("object", identity_start, event_id + ":" + kind) for kind in classes}
+        class_sql = _sql_json(native_classes)
+        objects = {} if is_audio else {kind: native_id("object", identity_start, event_id + ":" + kind) for kind in classes}
+        attributes_by_class = {}
+        detail_labels_by_class = {kind: [] for kind in objects}
+        for kind in objects:
+            attributes = {"objectType": kind, "zone": [1], "adapterVirtualZone": True}
+            for key, values in details.items():
+                if _DETAIL_TYPES[key][0] != kind:
+                    continue
+                native_key = "species" if key == "animalType" else key
+                detail_labels_by_class[kind].extend(native_key + ":" + value for value in values)
+                if len(values) == 1:
+                    attributes[native_key] = {"val": values[0]}
+            attributes_by_class[kind] = attributes
         tid = native_id("track", identity_start, event_id)
         start_conflict = "start IS DISTINCT FROM %d" % start
         if union:
@@ -342,8 +390,8 @@ ROLLBACK;
                  # retention DELETE between this check and the upsert.
                  " PERFORM id FROM events WHERE id=%s FOR UPDATE;\n"
                  " IF %s AND NOT EXISTS (SELECT 1 FROM events WHERE id=%s AND \"deletedAt\" IS NULL) THEN RAISE EXCEPTION USING MESSAGE='reolink-protect-events:retired',ERRCODE='P0002'; END IF;\n"
-                 " IF EXISTS (SELECT 1 FROM events WHERE id=%s AND (NOT COALESCE(%s,false) OR type IS DISTINCT FROM 'smartDetectZone' OR \"cameraId\" IS DISTINCT FROM %s OR %s OR \"smartDetectTypes\"::jsonb IS DISTINCT FROM %s::jsonb OR \"deletedAt\" IS NOT NULL)) THEN RAISE EXCEPTION 'Integration event identity collision'; END IF;\n END $rpe$;"
-                 % (cid, eid, "true" if require_existing else "false", eid, eid, owner_predicate, cid, start_conflict, class_sql)]
+                 " IF EXISTS (SELECT 1 FROM events WHERE id=%s AND (NOT COALESCE(%s,false) OR type IS DISTINCT FROM %s OR \"cameraId\" IS DISTINCT FROM %s OR %s OR \"smartDetectTypes\"::jsonb IS DISTINCT FROM %s::jsonb OR \"deletedAt\" IS NOT NULL)) THEN RAISE EXCEPTION 'Integration event identity collision'; END IF;\n END $rpe$;"
+                 % (cid, eid, "true" if require_existing else "false", eid, eid, owner_predicate, sql_text(event_type), cid, start_conflict, class_sql)]
         if thumbnail:
             width, height = thumbnail.dimensions()
             thumb_id = native_id("thumbnail", identity_start, event_id)
@@ -360,9 +408,11 @@ ROLLBACK;
             lines.append("INSERT INTO thumbnails (id,\"cameraId\",\"eventId\",width,height,timestamp,content,\"isFullfov\",locked,\"createdAt\",\"updatedAt\")\n"
                 "VALUES (%s,%s,NULL,%d,%d,%d,decode('%s','hex'),NULL,false,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)\n"
                 "ON CONFLICT (id) DO NOTHING;" % (sql_text(preview_id), cid, width, height, thumbnail.timestamp, thumbnail.content.hex()))
-            metadata["detectedThumbnails"] = [{"objectId": objects[kind], "clockBestWall": thumbnail.timestamp,
-                "type": kind, "croppedId": thumb_id, "attributes": {"objectType": kind, "zone": [1], "adapterVirtualZone": True}}
-                for kind in classes]
+            metadata["detectedThumbnails"] = ([{"clockBestWall": thumbnail.timestamp,
+                "type": kind, "croppedId": thumb_id} for kind in native_classes] if is_audio else
+                [{"objectId": objects[kind], "clockBestWall": thumbnail.timestamp,
+                  "type": kind, "croppedId": thumb_id, "attributes": attributes_by_class[kind]}
+                 for kind in classes])
         # Retain the first thumbnail and a closed end on retries; never reopen a
         # finished interval, unlock an operator's favorite, or reset deletedAt.
         end_sql = "NULL" if end is None else str(end)
@@ -370,36 +420,51 @@ ROLLBACK;
         preview_sql = "NULL" if preview_id is None else sql_text(preview_id)
         bounds_update = 'start=EXCLUDED.start,"end"=EXCLUDED."end",' if union else '"end"=CASE WHEN EXCLUDED."end" IS NULL THEN events."end" ELSE GREATEST(events."end",EXCLUDED."end") END,'
         zone_case = "CASE WHEN EXCLUDED.\"end\" IS NOT NULL THEN 'leave' ELSE 'enter' END" if union else "CASE WHEN events.\"end\" IS NOT NULL OR EXCLUDED.\"end\" IS NOT NULL THEN 'leave' ELSE 'enter' END"
+        zones_sql = "'{}'::jsonb" if is_audio else "jsonb_build_object('1',jsonb_build_object('status',%s))" % zone_case
+        saved_thumbnails = "events.metadata::jsonb->'detectedThumbnails'"
+        if objects:
+            # Preserve the actual first image and timestamp, while allowing a
+            # late source to enrich the same stable object's classification.
+            cases = " ".join("WHEN item->>'objectId'=%s THEN item || jsonb_build_object('attributes',%s)" %
+                (sql_text(objects[kind]), _sql_json(attributes_by_class[kind], "jsonb")) for kind in objects)
+            saved_thumbnails = "(SELECT jsonb_agg(CASE %s ELSE item END ORDER BY ordinal) FROM jsonb_array_elements(events.metadata::jsonb->'detectedThumbnails') WITH ORDINALITY AS thumbs(item,ordinal))" % cases
         lines.append("INSERT INTO events (id,type,start,\"end\",\"cameraId\",score,\"smartDetectTypes\",metadata,locked,\"thumbnailId\",\"thumbnailFullfovId\",\"createdAt\",\"updatedAt\")\n"
-            "VALUES (%s,'smartDetectZone',%d,%s,%s,NULL,%s,%s,false,%s,%s,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)\n"
+            "VALUES (%s,%s,%d,%s,%s,NULL,%s,%s,false,%s,%s,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)\n"
             "ON CONFLICT (id) DO UPDATE SET %s\n"
-            "metadata=((events.metadata::jsonb || EXCLUDED.metadata::jsonb) || jsonb_build_object('detectedThumbnails',CASE WHEN jsonb_array_length(COALESCE(events.metadata::jsonb->'detectedThumbnails','[]'::jsonb))>0 THEN events.metadata::jsonb->'detectedThumbnails' ELSE EXCLUDED.metadata::jsonb->'detectedThumbnails' END,'zonesStatus',jsonb_build_object('1',jsonb_build_object('status',%s))))::json,\n"
+            "metadata=((events.metadata::jsonb || EXCLUDED.metadata::jsonb) || jsonb_build_object('detectedThumbnails',CASE WHEN jsonb_array_length(COALESCE(events.metadata::jsonb->'detectedThumbnails','[]'::jsonb))>0 THEN %s ELSE EXCLUDED.metadata::jsonb->'detectedThumbnails' END,'zonesStatus',%s))::json,\n"
             "\"thumbnailId\"=CASE WHEN events.\"thumbnailId\" IS NULL OR (events.\"thumbnailId\"=events.\"thumbnailFullfovId\" AND events.\"thumbnailId\"=EXCLUDED.\"thumbnailFullfovId\") THEN EXCLUDED.\"thumbnailId\" ELSE events.\"thumbnailId\" END,\"thumbnailFullfovId\"=COALESCE(events.\"thumbnailFullfovId\",EXCLUDED.\"thumbnailFullfovId\"),\"updatedAt\"=CURRENT_TIMESTAMP;"
-            % (eid, start, end_sql, cid, class_sql, _sql_json(metadata), preview_sql, thumb_sql, bounds_update, zone_case))
+            % (eid, sql_text(event_type), start, end_sql, cid, class_sql, _sql_json(metadata), preview_sql, thumb_sql, bounds_update, saved_thumbnails, zones_sql))
         if thumb_id:
             for variant_id in (thumb_id, preview_id):
                 lines.append("UPDATE thumbnails SET \"eventId\"=%s WHERE id=%s AND \"cameraId\"=%s AND (\"eventId\" IS NULL OR \"eventId\"=%s);"
                              % (eid, sql_text(variant_id), cid, eid))
-        label_names = ["eventType:smartDetectZone", "camera:" + camera_id, "zone:" + camera_id + ":1"]
-        label_names += ["smartDetectType:" + kind for kind in classes]
+        label_names = ["eventType:" + event_type, "camera:" + camera_id]
+        if not is_audio:
+            label_names.append("zone:" + camera_id + ":1")
+        label_names += ["smartDetectType:" + kind for kind in native_classes]
+        label_names += sorted({label for labels in detail_labels_by_class.values() for label in labels})
         for name in label_names:
             lid = native_id("label", 1000, name)
             lines.append("INSERT INTO labels (id,name,\"lastSeen\",\"createdAt\",\"updatedAt\") VALUES (%s,%s,%d,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)\n"
                 "ON CONFLICT (name) DO UPDATE SET \"lastSeen\"=GREATEST(labels.\"lastSeen\",EXCLUDED.\"lastSeen\"),\"updatedAt\"=CURRENT_TIMESTAMP;"
                 % (sql_text(lid), sql_text(name), end or start))
         for kind, object_id in objects.items():
-            attributes = {"objectType": kind, "zone": [1], "adapterVirtualZone": True}
+            attributes = attributes_by_class[kind]
             object_meta = {"reolinkProtectEvents": {"owner": OWNER, "classificationOrigin": origin,
                                                    "confidenceAvailable": False, "spatialTrackAvailable": False,
                                                    "adapterVirtualZone": True, "sourceZoneIds": []}}
+            relevant = {key: values for key, values in details.items() if _DETAIL_TYPES[key][0] == kind}
+            if relevant:
+                object_meta["reolinkProtectEvents"]["classificationDetails"] = relevant
             lines.append("INSERT INTO \"smartDetectObjects\" (id,\"eventId\",\"cameraId\",type,attributes,metadata,\"detectedAt\",\"thumbnailId\",\"createdAt\",\"updatedAt\")\n"
                 "VALUES (%s,%s,%s,%s,%s,%s,%d,%s,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)\n"
-                "ON CONFLICT (id) DO UPDATE SET \"thumbnailId\"=COALESCE(\"smartDetectObjects\".\"thumbnailId\",EXCLUDED.\"thumbnailId\"),%s\"updatedAt\"=CURRENT_TIMESTAMP\n"
+                "ON CONFLICT (id) DO UPDATE SET \"thumbnailId\"=COALESCE(\"smartDetectObjects\".\"thumbnailId\",EXCLUDED.\"thumbnailId\"),attributes=EXCLUDED.attributes,metadata=EXCLUDED.metadata,%s\"updatedAt\"=CURRENT_TIMESTAMP\n"
                 "WHERE \"smartDetectObjects\".\"eventId\"=EXCLUDED.\"eventId\" AND \"smartDetectObjects\".\"cameraId\"=EXCLUDED.\"cameraId\" AND \"smartDetectObjects\".type=EXCLUDED.type;"
                 % (sql_text(object_id), eid, cid, sql_text(kind), _sql_json(attributes), _sql_json(object_meta, "jsonb"), start, thumb_sql,
-                   '"detectedAt"=EXCLUDED."detectedAt",metadata=EXCLUDED.metadata,' if union else ''))
-        lines.append("INSERT INTO \"smartDetectTracks\" (id,\"eventId\",\"cameraId\",payload,\"createdAt\",\"updatedAt\") VALUES (%s,%s,%s,'[]'::json,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) ON CONFLICT (id) DO NOTHING;"
-                     % (sql_text(tid), eid, cid))
+                   '"detectedAt"=EXCLUDED."detectedAt",' if union else ''))
+        if not is_audio:
+            lines.append("INSERT INTO \"smartDetectTracks\" (id,\"eventId\",\"cameraId\",payload,\"createdAt\",\"updatedAt\") VALUES (%s,%s,%s,'[]'::json,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) ON CONFLICT (id) DO NOTHING;"
+                         % (sql_text(tid), eid, cid))
         def detection_label(object_id, names):
             key = event_id + ":" + (object_id or "event")
             label_id = native_id("detection-label", identity_start, key)
@@ -409,8 +474,8 @@ ROLLBACK;
             return "INSERT INTO \"detectionLabels\" (id,\"eventId\",\"objectId\",labels,\"createdAt\",\"updatedAt\") VALUES (%s,%s,%s,%s,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)\nON CONFLICT %s DO UPDATE SET labels=EXCLUDED.labels,\"updatedAt\"=CURRENT_TIMESTAMP;" % (sql_text(label_id), eid, object_sql, array_sql, target)
         lines.append(detection_label(None, label_names))
         for kind, oid in objects.items():
-            names = [name for name in label_names if not name.startswith("smartDetectType:")]
-            lines.append(detection_label(oid, names + ["smartDetectType:" + kind]))
+            names = [name for name in label_names if not name.startswith(("smartDetectType:", "vehicleType:", "species:"))]
+            lines.append(detection_label(oid, names + ["smartDetectType:" + kind] + detail_labels_by_class[kind]))
         lines.append("SELECT json_build_object('id',id,'modelKey','event','type',type,'camera',\"cameraId\",'start',start,'end',\"end\",'score',score,'smartDetectTypes',\"smartDetectTypes\",'metadata',metadata,'thumbnail','e-'||id,'thumbnailFullfov',\"thumbnailFullfovId\",'heatmap','e-'||id) FROM events WHERE id=%s;" % eid)
         lines.append("COMMIT;")
         return "\n".join(lines) + "\n", event

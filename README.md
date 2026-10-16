@@ -36,7 +36,14 @@ For outdoor cameras configure the bridge's `onvif.motion_event_policy` as `none`
 | people, person, human, pedestrian | person |
 | car, vehicle | vehicle |
 | dog_cat, dogcat, animal, pet, dog, cat | animal |
+| cry, baby_cry, babycry | native audio classification alrmBabyCry |
 | plain motion, face, visitor, unknown AI types | no invented supported class; original source fields remain in the journal |
+
+Version 1.4 also imports the selected Frigate audio labels as native
+`smartAudioDetect` events and retains supported vehicle and animal details on
+existing visual events. Audio has no visual integration zone, object or spatial
+track. See [the source contract](docs/frigate-union.md) for exact mappings and
+the supported rollback boundary.
 
 Repeated pushes extend the same class interval. Clear pushes close it. Camera reconnects, bridge restarts, replay gaps and the configured stale timeout close the previous interval with an explicit reason. Simultaneous different classes get separate native intervals. Timestamps refer to the bridge's UTC receipt of the camera push, retaining the original .NET timestamp in provenance.
 

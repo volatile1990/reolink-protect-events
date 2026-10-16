@@ -18,7 +18,22 @@ LABELS = {"person": "person", "car": "vehicle", "bus": "vehicle", "truck": "vehi
           "motorcycle": "vehicle", "bicycle": "vehicle", "dog": "animal", "cat": "animal",
           "bird": "animal", "horse": "animal", "sheep": "animal", "cow": "animal",
           "elephant": "animal", "bear": "animal", "zebra": "animal", "giraffe": "animal"}
+# These are audio-model labels, never object labels. Generic crying includes
+# adults and is deliberately not a baby-cry classification. A smoke alarm sound
+# identifies an audible alarm; it does not identify smoke or carbon monoxide.
+AUDIO_LABELS = {"bark": "bark", "speech": "speak", "shatter": "glassBreak",
+                "siren": "siren", "honk": "carHorn", "smoke_detector": "smoke",
+                "fire_alarm": "smoke"}
+DETAIL_LABELS = {"bicycle": ("vehicleType", "bike"), "motorcycle": ("vehicleType", "motorcycle"),
+                 "bus": ("vehicleType", "bus"), "cat": ("animalType", "cat"),
+                 "dog": ("animalType", "dog"), "bird": ("animalType", "bird")}
 IDENTIFIER = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
+
+
+def classification_details(label):
+    """Only source-supported subtypes; generic car/pet remains generic."""
+    detail = DETAIL_LABELS.get(label)
+    return {detail[0]: [detail[1]]} if detail else {}
 
 
 def settings(config):
@@ -58,7 +73,7 @@ def settings(config):
 
 
 def event(value, camera, now_ms):
-    """Keep only real object-event fields; arbitrary upstream data never persists."""
+    """Keep checked object/audio-event fields; arbitrary data never persists."""
     if not isinstance(value, dict) or value.get("camera") != camera or not isinstance(value.get("id"), str) or not IDENTIFIER.fullmatch(value["id"]):
         raise ValueError("invalid_frigate_event_identity")
     label = value.get("label")
@@ -87,20 +102,32 @@ def event(value, camera, now_ms):
     if "false_positive" not in value or (value["false_positive"] is not None and type(value["false_positive"]) is not bool):
         raise ValueError("invalid_frigate_false_positive")
     legacy_flag = value["false_positive"]
-    if legacy_flag is None:
+    nested_score = data.get("top_score")
+    valid_nested_score = type(nested_score) in (int, float) and math.isfinite(nested_score) and 0 <= nested_score <= 1
+    if object_type == "audio":
+        # Frigate 0.18.1's AudioActivityManager creates events with type=audio;
+        # EventProcessor persists score and top_score in data. Audio has no
+        # object false-positive lifecycle, so nullable legacy flags are valid
+        # only alongside that real source score, never by themselves.
+        if not valid_nested_score:
+            raise ValueError("invalid_frigate_audio_data")
+        score = nested_score
+    elif legacy_flag is None:
         # Frigate 0.18.1 persists accepted object events in Event.data, while its
         # deprecated top_score/false_positive columns can both be SQL NULL.
         # This is NOT equivalent to a missing flag or a generic motion event.
         # Require the actual object-data shape and a real nested source score.
-        nested_score = data.get("top_score")
-        if object_type != "object" or type(nested_score) not in (int, float) or not math.isfinite(nested_score) or not 0 <= nested_score <= 1:
+        if object_type != "object" or not valid_nested_score:
             raise ValueError("invalid_frigate_nullable_object_data")
-    accepted = object_type == "object" and legacy_flag is not True
+    accepted = object_type in ("object", "audio") and legacy_flag is not True
+    labels = AUDIO_LABELS if object_type == "audio" else LABELS
     return {"id": value["id"], "camera": camera, "label": label, "start": start, "end": end,
             "type": object_type,
-            "class": LABELS.get(label) if accepted else None,
+            "class": labels.get(label) if accepted else None,
             "falsePositive": legacy_flag, "topScore": score,
-            "acceptanceBasis": ("object_data_with_nullable_legacy_flag" if legacy_flag is None else "explicit_false_positive_false") if accepted else None}
+            "acceptanceBasis": ("audio_data_with_source_score" if object_type == "audio" else
+                                "object_data_with_nullable_legacy_flag" if legacy_flag is None else
+                                "explicit_false_positive_false") if accepted else None}
 
 
 def poll(options, camera, cursor, active_ids, now_ms=None):

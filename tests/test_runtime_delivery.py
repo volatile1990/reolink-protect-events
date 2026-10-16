@@ -199,6 +199,19 @@ class RuntimeDeliveryTests(unittest.TestCase):
         self.assertEqual(closed["end"], START + 6000)
         self.assertEqual(self.native.rows[event_id]["metadata"]["zonesStatus"]["1"]["status"], "leave")
 
+    def test_audio_closed_replay_notifies_without_fabricating_visual_zone(self):
+        event_id = self.ingest([source(1, classes=("babyCry",)), source(2, 6000, classes=())])[0]["eventId"]
+        audio = {"id": event_id, "modelKey": "event", "type": "smartAudioDetect", "camera": CAMERA,
+                 "start": START, "end": START + 6000, "smartDetectTypes": ["alrmBabyCry"],
+                 "metadata": {"zonesStatus": {}, "detectedThumbnails": []}}
+        with patch.object(self.native, "upsert_interval", return_value=audio):
+            self.runtime.deliver()
+        self.assertEqual([action for action, _ in self.client.sent], ["add", "update"])
+        self.assertIsNone(self.client.sent[0][1]["end"])
+        self.assertEqual(self.client.sent[1][1]["end"], START + 6000)
+        self.assertTrue(all(item[1]["metadata"]["zonesStatus"] == {} for item in self.client.sent))
+        self.assertEqual(self.row(event_id)["notified"], self.row(event_id)["revision"])
+
     def test_database_failure_backs_off_one_poison_interval_and_delivers_another(self):
         first = self.ingest([source(1, classes=("person", "vehicle"))])
         bad, good = first[0]["eventId"], first[1]["eventId"]

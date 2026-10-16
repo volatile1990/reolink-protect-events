@@ -8,7 +8,7 @@ object data in `data`. Explicit NULL is supported only with the real object type
 and a valid nested `data.top_score`; the original NULL and acceptance basis remain
 in provenance. A missing flag, malformed nullable object data or an explicit true
 flag cannot become a supported detection. Generic motion,
-manual timeline entries, audio, unknown types and unsupported labels cannot
+manual timeline entries, unknown types and unsupported labels cannot
 create a supported class. Inference and video decoding remain in Frigate, not
 on the Protect console. The native adapter remains pinned to Protect 7.3.70.
 
@@ -16,6 +16,31 @@ The supported label map is `person` to person; car, bus, truck, motorcycle and
 bicycle to vehicle; dog, cat, bird, horse, sheep, cow, elephant, bear, zebra and
 giraffe to animal. These are mappings for labels actually emitted by the chosen
 model and enabled in Frigate, not a promise that every model detects every animal.
+
+Version 1.4 accepts real `data.type="audio"` events only with a finite nested
+`data.top_score` from 0 to 1 and an explicit false or NULL legacy false-positive
+flag. Labels map as follows: bark to alrmBark, speech to alrmSpeak, shatter to
+alrmGlassBreak, siren to alrmSiren, honk to alrmCarHorn, and smoke_detector or
+fire_alarm to alrmSmoke. The last class describes an audible alarm, not visual
+smoke or carbon monoxide. Generic crying is deliberately excluded; the specific
+Reolink cry signal supplies alrmBabyCry. Audio and visual classes remain separate
+native intervals and use the existing camera/class/time union for duplicates.
+
+Supported source details enrich the same native visual event and object:
+bicycle becomes vehicleType:bike, motorcycle and bus retain their vehicleType;
+cat, dog and bird become species. Generic car is not inferred to be a sedan,
+and Reolink dog_cat does not identify a species. All supported detail values are
+searchable. A scalar native attribute is emitted only for a single unambiguous
+value. Metadata updates preserve the existing event, object and thumbnail IDs,
+recorded pixels and timestamp. Source diagnostic lists are bounded separately
+from the full set of detail evidence.
+
+After audio inputs have entered the journal, keep version 1.4 or later. Disable
+audio capture and capability flags for a scoped rollback; retain the journal,
+existing native events and the union-aware binary. Do not blindly downgrade to
+an older binary that rejects audio classes. NAS audio configuration must also
+update the host supervisor's configuration hashes while its own service is
+stopped, then use its normal managed start path.
 
 ## Private interface
 

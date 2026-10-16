@@ -8,6 +8,9 @@ import hashlib
 import json
 import time
 
+from .frigate import classification_details
+from .runtime import AUDIO_CLASSES
+
 
 class Fusion:
     def __init__(self, journal, cameras, options):
@@ -185,7 +188,8 @@ class Fusion:
                     for row in self.db.execute("SELECT camera,source,source_id,class,start,last_seen,provenance FROM fusion_inputs WHERE camera=? AND source='frigate' AND source_id=? AND end IS NULL", (camera, item["id"])).fetchall():
                         self._close(row, at, "frigate_classification_withdrawn")
                     continue
-                meta = {"source": "frigate-object-detection", "sourceEventId": item["id"], "sourceLabel": item["label"],
+                meta = {"source": "frigate-audio-detection" if item["type"] == "audio" else "frigate-object-detection",
+                        "sourceEventId": item["id"], "sourceLabel": item["label"],
                         "topScore": item["topScore"], "falsePositive": item["falsePositive"],
                         "acceptanceBasis": item["acceptanceBasis"], "classificationInferred": True,
                         "timeBasis": "frigate_event_utc", "endIsTimeoutEstimate": False,
@@ -270,9 +274,10 @@ class Fusion:
                         right = matches[index + 1][1] if index + 1 < len(matches) else end
                         relevant = [item for item in members if (right is None or item[2] <= right) and (item[3] is None or item[3] >= left)]
                         sources = sorted({item[0] for item in relevant})
+                        audio = label in AUDIO_CLASSES
                         meta = {"adapter": "reolink-protect-events", "sourceUnionVersion": 1,
                             "identityStart": json.loads(raw).get("identityStart", old_start),
-                            "source": "reolink-and-frigate" if len(sources) > 1 else "frigate-object-detection" if sources == ["frigate"] else "reolink-camera-ai",
+                            "source": "reolink-and-frigate" if len(sources) > 1 else ("frigate-audio-detection" if audio else "frigate-object-detection") if sources == ["frigate"] else "reolink-camera-ai",
                             "classificationOrigin": "mixed" if len(sources) > 1 else "external-model" if sources == ["frigate"] else "camera",
                             "classificationInferred": "frigate" in sources, "spatialDataAvailable": False,
                             "mergePolicy": "camera_class_time_union", "objectIdentityMatched": False,
@@ -281,6 +286,19 @@ class Fusion:
                             "sourceIntervals": [{"source": item[0], "id": item[1], "start": item[2], "end": item[3],
                                 "details": json.loads(item[4])} for item in relevant[:16]],
                             "endIsTimeoutEstimate": any(json.loads(item[4]).get("endIsTimeoutEstimate", False) for item in relevant)}
+                        # The bounded diagnostic sourceIntervals list is not a
+                        # classification limit. Preserve all genuine subtype
+                        # evidence across the full connected component, even
+                        # when its first occurrence is after the 16th input.
+                        detail_values = {}
+                        if not audio:
+                            for item in relevant:
+                                details = json.loads(item[4])
+                                if item[0] == "frigate":
+                                    for key, values in classification_details(details.get("sourceLabel")).items():
+                                        detail_values.setdefault(key, set()).update(values)
+                        if detail_values:
+                            meta["classificationDetails"] = {key: sorted(values) for key, values in sorted(detail_values.items())}
                         prior_meta = json.loads(raw)
                         if isinstance(prior_meta.get("thumbnailSelection"), dict):
                             # Preserve the exact chosen recorded pixels across

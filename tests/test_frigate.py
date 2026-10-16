@@ -38,6 +38,12 @@ def batch(items, at=30000, cursor=None):
             "missingIds": [], "initial": False, "requests": 2, "backlogMs": 0}
 
 
+def audio_item(identifier="audio-1", label="bark", start=0, end=None):
+    value = item(identifier, start, end, label, false_positive=None)
+    value.update(top_score=None, data={"type": "audio", "score": 0.91, "top_score": 0.91})
+    return value
+
+
 class FusionTests(unittest.TestCase):
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory()
@@ -78,6 +84,70 @@ class FusionTests(unittest.TestCase):
         values = self.sync()
         self.assertEqual(len(values), 3)
         self.assertEqual(sorted(value["classes"][0] for value in values), ["person", "person", "vehicle"])
+
+    def test_audio_union_is_by_camera_and_class_without_merging_object_events(self):
+        self.j.ingest(BRIDGE, response([event(1, classes=["bark", "animal"], raw=["cry"]), event(2, 5000)]))
+        self.j.fusion.frigate(CAMERA, batch([
+            audio_item(start=2000, end=10000),
+            audio_item("speech", "speech", end=8000),
+            item("dog", label="dog", end=6000)]))
+        values = self.sync()
+        self.assertEqual(len(values), 4)
+        by_class = {value["classes"][0]: value for value in values}
+        self.assertEqual(set(by_class), {"bark", "speak", "babyCry", "animal"})
+        bark = by_class["bark"]
+        self.assertEqual((bark["start"], bark["end"]), (START, START + 10000))
+        self.assertEqual(bark["provenance"]["sourceTypes"], ["frigate", "reolink"])
+        self.assertEqual(by_class["speak"]["provenance"]["source"], "frigate-audio-detection")
+        self.assertNotIn("classificationDetails", bark["provenance"])
+        self.assertEqual(by_class["animal"]["provenance"]["classificationDetails"], {"animalType": ["dog"]})
+
+    def test_detail_only_change_updates_existing_delivery_and_keeps_identity_and_times(self):
+        self.j.fusion.frigate(CAMERA, batch([item("same", label="car", end=8000)]))
+        old = self.sync()[0]
+        self.j.acknowledge(old["eventId"], old["revision"], "delivered")
+        self.j.acknowledge(old["eventId"], old["revision"], "notified")
+        self.j.fusion.frigate(CAMERA, batch([item("same", label="bus", end=8000)], at=40000))
+        new = self.sync(40000)[0]
+        self.assertEqual((new["eventId"], new["start"], new["end"]), (old["eventId"], old["start"], old["end"]))
+        self.assertEqual(new["revision"], old["revision"] + 1)
+        self.assertEqual(new["deliveredRevision"], old["revision"])
+        self.assertEqual(new["provenance"]["classificationDetails"], {"vehicleType": ["bus"]})
+        self.j.fusion.frigate(CAMERA, batch([item("same", label="bus", end=8000)], at=50000))
+        self.assertEqual(self.sync(50000)[0]["revision"], new["revision"])
+
+    def test_details_use_full_union_history_beyond_bounded_diagnostic_members(self):
+        inputs = [item("car-%02d" % index, label="car", end=8000) for index in range(16)]
+        inputs.extend([item("late-bus", label="bus", start=1000, end=7000),
+                       item("late-bike", label="bicycle", start=2000, end=6000),
+                       item("late-motorcycle", label="motorcycle", start=3000, end=5000)])
+        self.j.fusion.frigate(CAMERA, batch(inputs))
+        value = self.sync()[0]
+        self.assertEqual(value["provenance"]["sourceIntervalCount"], 19)
+        self.assertEqual(len(value["provenance"]["sourceIntervals"]), 16)
+        self.assertEqual(value["provenance"]["classificationDetails"], {"vehicleType": ["bike", "bus", "motorcycle"]})
+
+    def test_historical_detail_refresh_does_not_change_any_source_watermark(self):
+        self.j.fusion.frigate(CAMERA, batch([item(label="bird", end=8000)]))
+        before = self.sync()[0]
+        self.j.acknowledge(before["eventId"], before["revision"], "delivered")
+        self.j.acknowledge(before["eventId"], before["revision"], "notified")
+        old_meta = copy.deepcopy(before["provenance"])
+        old_meta.pop("classificationDetails")
+        self.j.db.execute("UPDATE intervals SET provenance=? WHERE id=?", (json.dumps(old_meta), before["eventId"]))
+        cursor = self.j.fusion.poll_state(CAMERA)
+        bridge_cursor = self.j.cursor(CAMERA)
+        with self.j.db:
+            self.j.fusion.dirty(CAMERA, "animal", START)
+        after = self.sync()[0]
+        self.assertEqual(after["provenance"]["classificationDetails"], {"animalType": ["bird"]})
+        self.assertEqual(self.j.fusion.poll_state(CAMERA), cursor)
+        self.assertEqual(self.j.cursor(CAMERA), bridge_cursor)
+        self.assertEqual(after["eventId"], before["eventId"])
+        self.assertEqual((after["start"], after["end"]), (before["start"], before["end"]))
+        self.assertEqual(after["revision"], before["revision"] + 1)
+        self.assertEqual(after["deliveredRevision"], before["revision"])
+        self.assertEqual(after["notifiedRevision"], before["revision"])
 
     def test_epoch_boundary_closes_only_reolink(self):
         self.j.ingest(BRIDGE, response([event(1, classes=["person"])]))
@@ -267,6 +337,39 @@ class FrigateHttpTests(unittest.TestCase):
         self.assertIsNone(normalize(value, "front", START + 60000)["class"])
         value["false_positive"] = False
         self.assertEqual(normalize(value, "front", START + 60000)["class"], "person")
+
+    def test_actual_018_audio_shape_maps_only_supported_specific_labels(self):
+        expected = {"bark": "bark", "speech": "speak", "shatter": "glassBreak", "siren": "siren",
+                    "honk": "carHorn", "smoke_detector": "smoke", "fire_alarm": "smoke"}
+        for label, kind in expected.items():
+            for flag in (None, False):
+                value = audio_item(label=label, end=8000)
+                value["false_positive"] = flag
+                parsed = normalize(value, "front", START + 60000)
+                self.assertEqual(parsed["class"], kind)
+                self.assertEqual(parsed["topScore"], 0.91)
+                self.assertIs(parsed["falsePositive"], flag)
+                self.assertEqual(parsed["acceptanceBasis"], "audio_data_with_source_score")
+        for label in ("crying", "baby_cry", "baby_cry_infant_cry", "person", "dog", "carbon_monoxide"):
+            self.assertIsNone(normalize(audio_item(label=label), "front", START + 60000)["class"])
+        for label in expected:
+            self.assertIsNone(normalize(item(label=label), "front", START + 60000)["class"])
+
+    def test_audio_requires_real_nested_score_and_does_not_hide_source_rejection(self):
+        for score in (None, True, -0.1, 1.1, float("nan"), "0.9"):
+            value = audio_item()
+            value["data"]["top_score"] = score
+            with self.assertRaisesRegex(ValueError, "invalid_frigate_(audio_data|score)"):
+                normalize(value, "front", START + 60000)
+        value = audio_item()
+        del value["false_positive"]
+        with self.assertRaisesRegex(ValueError, "invalid_frigate_false_positive"):
+            normalize(value, "front", START + 60000)
+        value = audio_item()
+        value["false_positive"] = True
+        parsed = normalize(value, "front", START + 60000)
+        self.assertIsNone(parsed["class"])
+        self.assertIsNone(parsed["acceptanceBasis"])
 
     def test_nullable_flag_never_substitutes_for_actual_object_data(self):
         for data in ({}, {"type": "motion", "top_score": 0.9}, {"type": "manual", "top_score": 0.9},

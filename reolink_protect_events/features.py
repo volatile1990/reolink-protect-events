@@ -91,6 +91,26 @@ _CAMERA_FIELDS = ("featureFlags", "smartDetectZones")
 _BACKUP_CAMERA_FIELDS = ("featureFlags", "smartDetectSettings", "smartDetectZones")
 
 
+def _audio_types_by_camera(ids, supplied):
+    """Validate explicit native audio capabilities per selected camera.
+
+    Omitted cameras keep their current flags. An explicit empty list clears
+    only that camera's advertised audio capabilities. This does not enable a
+    detector or change native camera recording/recognition settings.
+    """
+    from .native import AUDIO_TYPES
+    selected = camera_ids(ids)
+    if not isinstance(supplied, dict) or not set(supplied) <= set(selected):
+        raise ValueError("Audio feature cameras must be explicitly selected")
+    allowed = set(AUDIO_TYPES.values())
+    result = {}
+    for identity, values in supplied.items():
+        if not isinstance(values, list) or any(not isinstance(value, str) or value not in allowed for value in values):
+            raise ValueError("Unsupported native audio feature type")
+        result[identity] = sorted(set(values))
+    return result
+
+
 class CameraFeatures:
     """Version-guarded, compare-and-swap changes to two camera JSON fields.
 
@@ -131,7 +151,8 @@ class CameraFeatures:
                 raise FeatureError("Invalid persisted camera feature representation")
         return rows
 
-    def plan(self, ids):
+    def plan(self, ids, audio_types_by_camera=None):
+        audio = None if audio_types_by_camera is None else _audio_types_by_camera(ids, audio_types_by_camera)
         rows = self._read(ids)
         result = {"schemaVersion": 1, "protectVersion": VERSION, "cameraIds": camera_ids(ids),
                   "state": "prepared", "cameras": []}
@@ -142,19 +163,26 @@ class CameraFeatures:
             if zones and zones != [INTEGRATION_ZONE]:
                 raise FeatureError("Existing camera zones cannot be replaced by a non-spatial source integration")
             desired["featureFlags"].update(hasSmartDetect=True, smartDetectTypes=DETECTION_CLASSES)
+            if audio is not None and row["id"] in audio:
+                desired["featureFlags"]["smartDetectAudioTypes"] = audio[row["id"]]
             desired["smartDetectZones"] = [INTEGRATION_ZONE]
             result["cameras"].append({"id": row["id"], "original": original, "configured": desired})
         result["managedFields"] = list(_CAMERA_FIELDS)
         result["nativeRecognitionSettingsPreserved"] = True
         result["userAgreementUnchanged"] = True
+        if audio is not None:
+            result["audioTypesByCamera"] = audio
         return result
 
     @staticmethod
     def public_plan(plan):
-        return {"protectVersion": VERSION, "cameraIds": plan["cameraIds"], "fields": list(_CAMERA_FIELDS),
+        result = {"protectVersion": VERSION, "cameraIds": plan["cameraIds"], "fields": list(_CAMERA_FIELDS),
                 "hasSmartDetect": True, "smartDetectTypes": DETECTION_CLASSES,
                 "zone": INTEGRATION_ZONE, "restartRequired": True,
                 "nativeRecognitionSettingsPreserved": True, "userAgreementUnchanged": True}
+        if "audioTypesByCamera" in plan:
+            result["audioTypesByCamera"] = plan["audioTypesByCamera"]
+        return result
 
     @staticmethod
     def _sql(plan, restore=False):
@@ -186,9 +214,9 @@ class CameraFeatures:
         lines.extend(["END $rpe_features$;", "SELECT json_build_object('configuredCameras',%d);" % len(selected), "COMMIT;"])
         return "\n".join(lines)
 
-    def apply(self, ids, backup_dir):
+    def apply(self, ids, backup_dir, audio_types_by_camera=None):
         from .native import _read_json_output
-        plan = self.plan(ids)
+        plan = self.plan(ids, audio_types_by_camera)
         root = Path(backup_dir)
         if root.is_symlink():
             raise FeatureError("Backup directory must not be a symlink")
@@ -354,14 +382,20 @@ def main():
     parser.add_argument("--backup-dir", default="/data/reolink-protect-events/feature-backups")
     parser.add_argument("--manifest")
     parser.add_argument("--include-all-ui-alarm-scope", action="store_true")
+    parser.add_argument("--audio-types-file", help="JSON mapping of camera IDs to native alrm* feature lists")
     args = parser.parse_args()
     if args.action in ("camera-plan", "configure-cameras", "rollback-cameras"):
         from .native import NativeAdapter
         cameras = CameraFeatures(NativeAdapter())
+        audio_types = None
+        if args.audio_types_file:
+            if args.action == "rollback-cameras":
+                parser.error("rollback-cameras uses its saved manifest, not --audio-types-file")
+            audio_types = json.loads(Path(args.audio_types_file).read_text(encoding="utf-8"))
         if args.action == "camera-plan":
-            result = cameras.public_plan(cameras.plan(args.camera))
+            result = cameras.public_plan(cameras.plan(args.camera, audio_types))
         elif args.action == "configure-cameras":
-            result = cameras.apply(args.camera, args.backup_dir)
+            result = cameras.apply(args.camera, args.backup_dir, audio_types)
         else:
             if not args.manifest:
                 parser.error("rollback-cameras requires --manifest")
