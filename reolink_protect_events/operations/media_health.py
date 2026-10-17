@@ -90,7 +90,7 @@ def _progress(report, wanted=None):
 
 
 def run_once(config, root=None, *, mode='quick', prior=None, now_ms=None, api=None, fetch=None, probe=None,
-             camera_ids=None, clock=None, sleep=None):
+             camera_ids=None, clock=None, sleep=None, startup_probe=None):
     """Public readonly health API. Full means actual UBV metadata for every mode.
 
     Payload decoding is intentionally not claimed by metadata probes. External
@@ -129,9 +129,12 @@ def run_once(config, root=None, *, mode='quick', prior=None, now_ms=None, api=No
                 report,bootstrap=inspect(config,prior=previous,now_ms=sample_time(),api=api,fetch=fetch,
                                          deadline=deadline,clock=clock)
         report['activeProbeCameraIds']=[];report['fullActiveCoverage']=False
+        report['fmp4StartupCoverageVerified']=False
         if mode=='full' and report['ok'] and not timeout:
+            from .fmp4 import configuration, probe_fmp4
+            startup_options=configuration(config)
             probe=probe or probe_ubv; by_id={c['id']:c for c in selected_cameras(config,bootstrap)}
-            evidence={}
+            evidence={};startup_evidence={}
             for row in report['cameras']:
                 if row['cameraId']not in wanted:continue
                 camera=by_id[row['cameraId']]
@@ -139,6 +142,11 @@ def run_once(config, root=None, *, mode='quick', prior=None, now_ms=None, api=No
                 for channel in sorted(set([c for _,_,c in qualities(camera)]+[automatic_channel(camera)])):
                     result=probe(config,camera,channel,seconds=8)
                     evidence[row['cameraId']].append(result)
+                # Serialize the optional browser-clock startup read with the
+                # UBV reads. Never create a second concurrent viewer.
+                if startup_options['enabled']:
+                    startup_evidence[row['cameraId']]=(startup_probe or probe_fmp4)(
+                        config,camera,automatic_channel(camera),seconds=12)
             # The full sweep can last more than two minutes. Refresh both source
             # and recording age, preserving the original comparison checkpoint.
             report,bootstrap=inspect(config,prior=previous,now_ms=sample_time(),api=api,fetch=fetch)
@@ -146,10 +154,15 @@ def run_once(config, root=None, *, mode='quick', prior=None, now_ms=None, api=No
                 if row['cameraId']not in evidence:continue
                 row['activeProbes']=evidence[row['cameraId']]
                 active_ok=all(p.get('ok')is True for p in row['activeProbes'])
+                if row['cameraId']in startup_evidence:
+                    row['fmp4StartupProbe']=startup_evidence[row['cameraId']]
+                    active_ok=active_ok and row['fmp4StartupProbe'].get('ok')is True
                 row['ok']=row['ok']and active_ok
                 if not active_ok and row['sourceHealthy']:row['cause']='protect_media_unhealthy'
             report['activeProbeCameraIds']=sorted(evidence)
             report['fullActiveCoverage']=set(evidence)==known
+            report['fmp4StartupCoverageVerified']=bool(startup_evidence)and set(startup_evidence)==wanted \
+                and all(p.get('ok')is True for p in startup_evidence.values())
             report['ok']=report['scopeValid']and all(row['ok']for row in report['cameras'])
         report['recordingProgressSampleSeconds']=round(clock()-began,3) if observe or mode=='full' else None
         report['recordingProgressObserved']=_progress(report)

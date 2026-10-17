@@ -190,8 +190,12 @@ class ScopedInstallerTests(unittest.TestCase):
                 'monitor': {'active': self.health_monitor, 'enabled': self.health_monitor}}
 
     def request(self, **extra):
-        return dict({'mode': 'install', 'eventsOnly': True, 'owner': self.owner,
-                     'package': base64.b64encode(b'fixture-package').decode(), 'digest': 'b' * 64}, **extra)
+        request={'mode': 'install', 'eventsOnly': True, 'owner': self.owner,
+                 'package': base64.b64encode(b'fixture-package').decode(), 'digest': 'b' * 64}
+        if extra.get('updateMonitor')is True:
+            request['expectedConfigSha256']=hashlib.sha256((self.root/'config.json').read_bytes()).hexdigest()
+            request['expectedDeploymentSha256']=hashlib.sha256((self.root/'deployment.json').read_bytes()).hexdigest()
+        return dict(request,**extra)
 
     def enroll_group(self):
         with closing(sqlite3.connect(self.root / 'journal.sqlite3')) as database, database:
@@ -397,8 +401,87 @@ class ScopedInstallerTests(unittest.TestCase):
             self.installer.execute(self.request())
         self.assertEqual(self.monitor_commands(), [])
 
+    def test_events_only_monitor_upgrade_changes_two_owned_units_preserving_all_config(self):
+        self.health_monitor=True
+        original=(self.root/'config.json').read_bytes()
+        result=self.installer.execute(self.request(updateMonitor=True))
+        self.assertTrue(result['ok']);self.assertTrue(result['deployment']['updateMonitor'])
+        self.assertEqual((self.root/'config.json').read_bytes(),original)
+        self.assertIn(b'reolink_protect_events.operations.monitor',self.monitor.read_bytes())
+        deployed=json.loads((self.root/'deployment.json').read_text());backup=Path(deployed['backup'])
+        self.assertEqual((backup/self.monitor.name).read_bytes(),b'previous monitor unit')
+        self.assertTrue(json.loads((backup/'service-state.json').read_text())['updateMonitor'])
+        self.assertEqual({c[-1]for c in self.calls if isinstance(c,tuple)and c[:2]==('systemctl','start')},
+            {self.unit.name,self.monitor.name})
+        self.assertFalse(any('docker'in str(c)or'unifi-protect.service'in str(c)for c in self.calls))
+
+    def test_fmp4_config_patch_requires_digest_and_changes_only_owned_field(self):
+        self.health_monitor=True
+        self.cfg['bridges']=[{'cameraId':'a'*24}]
+        config_path=self.root/'config.json';original=json.dumps(self.cfg).encode();config_path.write_bytes(original)
+        options={'enabled':True,'fullGopCameraIds':[],'nginxFilePins':[]}
+        request=self.request(updateMonitor=True,fmp4Startup=options,expectedConfigSha256=hashlib.sha256(original).hexdigest())
+        result=self.installer.execute(request);self.assertTrue(result['ok'])
+        after=json.loads(config_path.read_bytes());self.assertEqual(after.pop('fmp4Startup'),options)
+        self.assertEqual(after,self.cfg)
+        deployed=json.loads((self.root/'deployment.json').read_text());backup=Path(deployed['backup'])
+        self.assertEqual((backup/'config.json').read_bytes(),original)
+        with closing(sqlite3.connect(self.root/'journal.sqlite3'))as database:
+            self.assertEqual(database.execute('SELECT id FROM genuine_source').fetchall(),[(11,)])
+
+    def test_monitor_unit_cas_and_config_digest_drift_never_stop_services(self):
+        with self.assertRaisesRegex(RuntimeError,'^monitor_configuration_CAS_mismatch$'):
+            self.installer.execute(self.request(updateMonitor=True,fmp4Startup={'enabled':True},expectedConfigSha256='0'*64))
+        with self.assertRaisesRegex(RuntimeError,'^monitor_metadata_CAS_mismatch$'):
+            self.installer.execute(self.request(updateMonitor=True,expectedDeploymentSha256='0'*64))
+        def mutate_monitor(args):
+            if args[:3]==['/usr/bin/python3','-m','compileall']:self.monitor.write_bytes(b'external monitor edit')
+        self.run_hook=mutate_monitor
+        with self.assertRaisesRegex(RuntimeError,'^events_only_deployment_drift$'):
+            self.installer.execute(self.request(updateMonitor=True))
+        self.assertFalse(any(c[:2]==('systemctl','stop')for c in self.calls if isinstance(c,tuple)))
+
+    def test_monitor_upgrade_failure_restores_both_owned_units(self):
+        original=(self.root/'config.json').read_bytes();failed=[False]
+        def fail_once(args):
+            if args==['systemctl','start',self.monitor.name]and not failed[0]:
+                failed[0]=True;raise RuntimeError('synthetic_monitor_start_failure')
+        self.run_hook=fail_once
+        with self.assertRaisesRegex(RuntimeError,'^synthetic_monitor_start_failure$'):
+            self.installer.execute(self.request(updateMonitor=True))
+        self.assertEqual(self.monitor.read_bytes(),b'previous monitor unit')
+        self.assertEqual(self.unit.read_bytes(),b'previous native unit')
+        self.assertEqual((self.root/'config.json').read_bytes(),original)
+
+    def test_monitor_upgrade_failure_does_not_overwrite_external_edit(self):
+        def fail_with_external_change(args):
+            if args==['systemctl','start',self.monitor.name]:
+                self.monitor.write_bytes(b'external monitor edit after activation')
+                raise RuntimeError('synthetic_start_failure')
+        self.run_hook=fail_with_external_change
+        with self.assertRaisesRegex(RuntimeError,'^monitor_owned_files_rollback_drift$'):
+            self.installer.execute(self.request(updateMonitor=True))
+        self.assertEqual(self.monitor.read_bytes(),b'external monitor edit after activation')
+
+    def test_monitor_upgrade_detects_foreign_edit_during_stop_without_overwriting(self):
+        self.cfg['bridges']=[{'cameraId':'a'*24}]
+        (self.root/'config.json').write_text(json.dumps(self.cfg))
+        original_unit=self.unit.read_bytes()
+        def external_config_at_stop(args):
+            if args==['systemctl','stop',self.monitor.name]:
+                (self.root/'config.json').write_bytes(b'external config edit while stopping')
+        self.run_hook=external_config_at_stop
+        with self.assertRaisesRegex(RuntimeError,'^monitor_owned_files_rollback_drift$'):
+            self.installer.execute(self.request(updateMonitor=True,fmp4Startup={'enabled':True}))
+        self.assertEqual((self.root/'config.json').read_bytes(),b'external config edit while stopping')
+        self.assertEqual(self.unit.read_bytes(),original_unit)
+        self.assertTrue((self.monitor_root/'maintenance.json').exists())
+        self.assertFalse(any(c[:2]==('systemctl','start')for c in self.calls if isinstance(c,tuple)))
+
     def test_events_only_requests_and_grouping_bounds_are_validated_before_staging(self):
         invalid = [self.request(eventsOnly='true'), self.request(eventsOnly=True, mode='capture'),
+                   self.request(updateMonitor=True,eventsOnly=False),self.request(updateMonitor='true'),
+                   self.request(fmp4Startup={'enabled':True}),
                    self.request(eventsOnly=False, eventGrouping={'enabled': True, 'maxSpanSeconds': 120}),
                    self.request(eventGrouping={'enabled': True, 'maxSpanSeconds': 29}),
                    self.request(eventGrouping={'enabled': True, 'maxSpanSeconds': 301}),
@@ -438,6 +521,12 @@ class ScopedDeployCliTests(unittest.TestCase):
             with self.subTest(argv=argv), patch('sys.argv', ['deploy.py'] + argv), patch('sys.stderr'):
                 with self.assertRaises(SystemExit):
                     self.tool.main()
+
+    def test_monitor_upgrade_and_public_startup_options_require_explicit_scope(self):
+        for argv in (['install','--update-monitor'],['install','--events-only','--update-monitor',
+                     '--fmp4-startup-config','options.json']):
+            with patch('sys.argv',['deploy.py']+argv),patch('sys.stderr'):
+                with self.assertRaises(SystemExit):self.tool.main()
 
     def test_events_only_failure_retains_owned_maintenance_and_reports_owner(self):
         calls = []

@@ -22,6 +22,14 @@ def response(events, instance=INSTANCE, oldest=1, newest=None):
 
 
 class JournalTests(unittest.TestCase):
+    def test_single_counter_read_uses_index_without_aggregating_source_or_publication_history(self):
+        self.assertEqual(self.journal.counter('nativeImportErrors'),0)
+        with self.journal.db:self.journal.count('nativeImportErrors',12)
+        queries=[];self.journal.db.set_trace_callback(queries.append)
+        self.assertEqual(self.journal.counter('nativeImportErrors'),12)
+        self.journal.db.set_trace_callback(None)
+        self.assertEqual(len(queries),1)
+        self.assertNotIn('publication_intervals',queries[0]);self.assertNotIn('sources',queries[0])
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory()
         self.path = Path(self.folder.name) / "journal.sqlite3"

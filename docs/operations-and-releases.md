@@ -73,6 +73,37 @@ they were. The active configuration must already match the verified camera
 mapping. The regular installer retains its existing monitor installation and
 automatic-thumbnail defaults.
 
+For changes to the owned media monitor as well, explicitly add `--update-monitor`
+to this Events-only installation. That backs up, replaces and restarts both owned
+units from the same release while preserving thumbnail settings and the live
+journal. It does not invoke the NAS/six-bridge release controller. Rollback restores
+both prior units and configuration; source journal and monitor repair budgets stay
+current.
+
+An optional public JSON file can enable the fMP4 startup gate during that same
+transaction:
+
+```console
+python tools/deploy.py install --events-only --update-monitor --fmp4-startup-config /path/to/public-startup-options.json --expected-config-sha256 CURRENT_PRIVATE_CONFIG_SHA256 --expected-deployment-sha256 CURRENT_DEPLOYMENT_JSON_FILE_SHA256 --dependency-cache /path/to/public-wheel-cache
+```
+
+The JSON contains `enabled: true`, `fullGopCameraIds` and `nginxFilePins` (path/SHA256
+pairs). The full-GOP allowlist is limited to the reviewed Eingang
+`6ac8ae7001ab6d03e4006410`, Garage `6ac83fed00bd6d03e4001b81`, Garten
+`6ac844bf02026d03e4001f5f` and Vor dem Haus `6ac8ae7102b76d03e4006447` IDs.
+Enable an exception only when its actual frontend scope has been reviewed and
+freshly pinned. It requires exact current hashes for
+`/etc/nginx/nginx.conf`, `/ssd1/.data/unifi-core/config/http/shared-runnable-protect.conf`
+and `/ssd1/.data/unifi-core/config/http/upstream-protect_api_backend.conf`. Obtain
+those from the verified frontend plan and fresh readback, not from an arbitrary
+changed configuration. Symlink parents and changed files invalidate the gate.
+Only the private `fmp4Startup` field is added or replaced, after the whole private
+configuration digest matches; backup, file fsync and parent-directory fsync precede
+activation. Monitor upgrades also require the current deployment JSON file digest;
+both units, configuration and metadata are checked again before any stop and each
+owned write. A later conflicting edit blocks automatic overwrite and rollback;
+the maintenance lease is retained for review.
+
 To enroll subsequent visual intervals in the grouping projection, explicitly
 enable it during that scoped installation:
 
@@ -103,7 +134,7 @@ If activation fails after groups were enrolled and the prior binary cannot
 service them, automatic recovery keeps the compatible Events release, restores
 the prior configuration with new enrollment disabled and checks fresh native
 health. The failed installation reports this recovery explicitly; it does not
-claim an old-binary rollback. An Events-only recovery also leaves the monitor
+claim an old-binary rollback. An Events-only recovery without `--update-monitor` leaves the monitor
 untouched. Ordinary pre-enrollment failures restore the prior Events release.
 If success or healthy compatible recovery cannot be confirmed, the Events-only
 CLI retains its owned maintenance marker and reports `maintenanceOwner` with
@@ -189,9 +220,38 @@ checker correction therefore does not need another identical bridge build.
 Events and writes its own state under `/data/reolink-protect-monitor`. It samples
 source readiness, current audio metadata, camera connection and recording progress
 every 30 seconds. One bounded eight-second Automatic stream probe runs at a time,
-roughly every 50 seconds; all six cameras rotate in about five minutes. A new
-source connection epoch prioritizes that camera. Quiet cameras need no detections
-to pass these checks.
+roughly every 50 seconds; all six cameras rotate in about five minutes. The global
+rotation keeps its own cursor/deadline and cannot be consumed by repeated suspect
+or exhausted-budget cameras. New connection epochs and suspect media receive
+additional probes between global slots, with a 30-second per-camera minimum.
+Successful results expire after 15 minutes and are invalidated by source epoch or
+source/recorder failure. `healthy` requires fresh active coverage; `verifying`
+means quick source/recorder checks passed but active coverage is incomplete.
+Quiet cameras need no detections to pass these checks.
+
+With `fmp4Startup.enabled`, each camera alternates its UBV read with one 12-second
+fMP4 startup read, so both paths rotate over all six in about ten minutes, with
+only one new viewer at a time. The full acceptance gate adds one serialized fMP4
+Automatic read per selected camera. It checks the very first fragment, media-clock
+continuity, epoch origin, overlapping track clocks, actual elapsed progress and freshness;
+actual raw or split-framed `mdat` bytes must equal the declared sample sizes, and
+every counted sample has positive size. Metadata parsing has a global track/sample
+work limit as well as a byte limit. Unsupported padding stays unverified;
+the first audio/video clock starts may differ by up to five seconds for a four-second
+full GOP, with at least two seconds of shared timeline. This is not a lip-sync check;
+no warmup hides a startup timestamp jump. Browser flags are wall clock, progressive,
+extended metadata, 100-ms fragments and no zero rebasing. The probe uses native
+loopback EMS TCP, with `allowPartialGOP=false` only for the pinned frontend
+exception; it explicitly does not certify frontend authentication, UI quality
+switching or handset playback. Pin drift reports `attention`, prevents stream
+repair and cannot retain a green fMP4 result.
+
+Both positive and negative probe evidence expire after fifteen minutes and are
+bound to a known current source epoch. Expired errors prompt another active read;
+they cannot authorize recorder repair. Failure streaks restart when the source
+epoch changes, while persisted repair-attempt budgets remain intact. A fresh
+fMP4-only packaging or clock failure remains degraded with `review_fmp4_startup`;
+it never toggles a healthy UBV recorder or consumes its repair budget.
 
 The monitor distinguishes unhealthy bridge input from stalled Protect playback.
 For a healthy source with a repeated native failure it can perform the audited,
@@ -201,7 +261,9 @@ required. Settings for every other camera and the NVR are checked for preservati
 The temporary TCP phase must itself deliver a valid Automatic stream before
 the original setting is restored. Both media phases have a 45-second budget and
 at most three sequential eight-second probes, reserving bounded source/stream
-setup time before dispatch. Only a stream with zero WebSocket frames, zero
+setup time before dispatch. A later asynchronous `not ready` state after restoration
+waits within the same budget, rechecking exact settings, healthy source and lease
+ownership on every pass, without charging another viewer attempt or PATCH. Only a stream with zero WebSocket frames, zero
 binary bytes, no tracks and no transport/parser error can wait for readiness.
 Received corrupt bytes, invalid AAC, broken clocks or an unhealthy source fail
 immediately. Every attempt rechecks fresh source media and the exact settings

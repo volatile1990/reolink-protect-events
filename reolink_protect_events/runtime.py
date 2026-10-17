@@ -182,6 +182,11 @@ class Journal:
     def count(self, name, amount=1):
         self.db.execute("INSERT INTO counters VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=value+excluded.value", (name, amount))
 
+    def counter(self, name):
+        """Read one indexed counter without aggregating the publication history."""
+        row = self.db.execute("SELECT value FROM counters WHERE name=?", (name,)).fetchone()
+        return row[0] if row else 0
+
     def _close(self, row, at, reason, source=None):
         event_id, start, last_seen, provenance = row
         meta = json.loads(provenance)
@@ -663,7 +668,7 @@ class Runtime:
                 with self._state_lock:
                     self._native_state = {"atMs": int(time.time() * 1000), "nativeReady": worker.native_ready,
                         "nativeError": worker.native_error, "nativeDurationMs": round((time.monotonic() - began) * 1000, 2),
-                        "importErrors": worker.journal.health()["counters"].get("nativeImportErrors", 0)}
+                        "importErrors": worker.journal.counter("nativeImportErrors")}
                 self._stop.wait(0.1)
         except Exception as error:
             with self._state_lock:

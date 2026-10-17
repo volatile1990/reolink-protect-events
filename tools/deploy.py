@@ -28,12 +28,24 @@ def main():
     parser.add_argument('--expected-digest', help='Required current deployment digest for rollback')
     parser.add_argument('--events-only', action='store_true',
                         help='Install only the Events service; preserve the media monitor and thumbnail settings')
+    parser.add_argument('--update-monitor', action='store_true',
+                        help='With --events-only, also upgrade its owned media-monitor unit; preserve thumbnail configuration')
+    parser.add_argument('--fmp4-startup-config', type=Path,
+                        help='Public explicit startup flags/nginx pins JSON; requires --update-monitor and current config digest')
+    parser.add_argument('--expected-config-sha256')
+    parser.add_argument('--expected-deployment-sha256', help='Current deployment.json file digest for an owned monitor upgrade')
     parser.add_argument('--group-visual-events', action='store_true',
                         help='Enable visual event grouping during an Events-only installation')
     parser.add_argument('--group-max-span-seconds', type=int, default=120)
     args = parser.parse_args()
     if args.events_only and args.mode != 'install':
         parser.error('--events-only requires install')
+    if args.update_monitor and not args.events_only:
+        parser.error('--update-monitor requires --events-only')
+    if args.update_monitor and (not args.expected_config_sha256 or not args.expected_deployment_sha256):
+        parser.error('--update-monitor requires current configuration and deployment file digests')
+    if args.fmp4_startup_config and (not args.update_monitor or not args.expected_config_sha256):
+        parser.error('--fmp4-startup-config requires --update-monitor and --expected-config-sha256')
     if args.group_visual_events and not args.events_only:
         parser.error('--group-visual-events requires --events-only')
     if not 30 <= args.group_max_span_seconds <= 300:
@@ -44,6 +56,13 @@ def main():
     request = {'mode': args.mode}
     if args.mode == 'install':
         request['eventsOnly'] = args.events_only
+        request['updateMonitor'] = args.update_monitor
+        if args.update_monitor:
+            request['expectedConfigSha256'] = args.expected_config_sha256
+            request['expectedDeploymentSha256'] = args.expected_deployment_sha256
+    if args.fmp4_startup_config:
+        request['fmp4Startup'] = json.loads(args.fmp4_startup_config.read_text(encoding='utf-8'))
+        request['expectedConfigSha256'] = args.expected_config_sha256
     if args.group_visual_events:
         request['eventGrouping'] = {'enabled': True, 'maxSpanSeconds': args.group_max_span_seconds}
     if args.mode == 'rollback':

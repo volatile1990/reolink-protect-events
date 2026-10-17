@@ -50,6 +50,16 @@ def write(path, data):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+    sync_directory(path.parent)
+
+
+def sync_directory(path):
+    if os.name != 'nt':
+        descriptor = os.open(str(path), os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
 
 def get_config():
@@ -197,7 +207,8 @@ def restore(backup):
     state = backup_state(backup)
     events_only = state.get('eventsOnly', False)
     states = {service: state}
-    if not events_only:
+    update_monitor = state.get('updateMonitor', False)
+    if not events_only or update_monitor:
         states[monitor_unit.name] = state.get('monitor', {'active': False, 'enabled': False})
     current_states = {name: state_of(name) for name in states}
     for name in states:
@@ -217,7 +228,7 @@ def restore(backup):
         if not previous['enabled']:
             subprocess.run(['systemctl', 'disable', name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
     paths = (unit, root / 'config.json', root / 'deployment.json')
-    if not events_only:
+    if not events_only or update_monitor:
         paths += (monitor_unit,)
     for p in paths:
         saved = backup / p.name
@@ -252,7 +263,7 @@ def retain_compatible_runtime(backup, release, reason='legacy_grouping_rollback_
     validate_packaged_config(release, cfg)
     run(['systemctl', 'stop', service])
     write(root / 'config.json', json.dumps(cfg).encode())
-    if not state.get('eventsOnly', False):
+    if not state.get('eventsOnly', False) or state.get('updateMonitor', False):
         prior_monitor = state.get('monitor', {'active': False, 'enabled': False})
         subprocess.run(['systemctl', 'stop', monitor_unit.name], stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL, timeout=60)
@@ -395,6 +406,17 @@ def execute(request):
     events_only = request.get('eventsOnly', False)
     if type(events_only) is not bool or events_only and mode != 'install':
         raise RuntimeError('events_only_mode_invalid')
+    update_monitor = request.get('updateMonitor', False)
+    if type(update_monitor) is not bool or update_monitor and not events_only:
+        raise RuntimeError('monitor_update_mode_invalid')
+    if update_monitor and any(not isinstance(request.get(key), str) or len(request[key]) != 64
+                              for key in ('expectedConfigSha256', 'expectedDeploymentSha256')):
+        raise RuntimeError('monitor_update_CAS_required')
+    startup_options = request.get('fmp4Startup')
+    if startup_options is not None and (not update_monitor or not isinstance(startup_options, dict)
+            or not isinstance(request.get('expectedConfigSha256'), str)
+            or len(request['expectedConfigSha256']) != 64):
+        raise RuntimeError('fmp4_update_request_invalid')
     grouping = request.get('eventGrouping')
     if grouping is not None and (not events_only or not isinstance(grouping, dict)
             or set(grouping) != {'enabled', 'maxSpanSeconds'} or grouping.get('enabled') is not True
@@ -412,25 +434,43 @@ def execute(request):
     if deployed.exists():
         previous = json.loads(deployed.read_text())
         same_grouping = grouping is None or json.loads((root / 'config.json').read_text()).get('eventGrouping') == grouping
+        same_startup = startup_options is None or json.loads((root / 'config.json').read_text()).get('fmp4Startup') == startup_options
         if previous.get('sha256') == digest and previous.get('mode') == mode \
-                and previous.get('eventsOnly', False) == events_only and same_grouping:
+                and previous.get('eventsOnly', False) == events_only and same_grouping and same_startup \
+                and previous.get('updateMonitor', False) == update_monitor:
             h = health()
-            if h['health']['healthy'] and (events_only or all(h['monitor'].values())):
+            if h['health']['healthy'] and (events_only and not update_monitor or all(h['monitor'].values())):
+                if startup_options is not None:
+                    from .fmp4 import configuration, verify_configuration
+                    verify_configuration(configuration(json.loads((root / 'config.json').read_text())))
                 return {'ok': True, 'deployment': {k: previous[k] for k in ('sha256', 'mode', 'release', 'version', 'activatedAtMs')},
                         'resumedExistingDeployment': True, **h}
     cfg = get_config()
+    if update_monitor:
+        if not deployed.exists() or hashlib.sha256(deployed.read_bytes()).hexdigest() != request['expectedDeploymentSha256']:
+            raise RuntimeError('monitor_metadata_CAS_mismatch')
+        if hashlib.sha256((root / 'config.json').read_bytes()).hexdigest() != request['expectedConfigSha256']:
+            raise RuntimeError('monitor_configuration_CAS_mismatch')
     original_files = {}
     if events_only:
         current_config = root / 'config.json'
         secure(current_config)
         if not current_config.exists() or cfg != json.loads(current_config.read_text()):
             raise RuntimeError('events_only_configuration_drift')
-        for path in (unit, current_config, root / 'deployment.json'):
+        guarded_paths = (unit, current_config, root / 'deployment.json') + ((monitor_unit,) if update_monitor else ())
+        for path in guarded_paths:
             secure(path)
             original_files[path] = path.read_bytes() if path.exists() else None
     else:
         cfg['thumbnailSelection'] = {'mode': 'automatic', 'maxCandidates': 4, 'windowSeconds': 6,
                                     'settleSeconds': 3, 'recordingLagMs': 1500, 'historyDays': 30, 'budgetSeconds': 8}
+    if startup_options is not None:
+        if hashlib.sha256((root / 'config.json').read_bytes()).hexdigest() != request['expectedConfigSha256']:
+            raise RuntimeError('fmp4_configuration_CAS_mismatch')
+        from .fmp4 import configuration, verify_configuration
+        candidate = dict(cfg, fmp4Startup=startup_options)
+        verify_configuration(configuration(candidate))
+        cfg = candidate
     if grouping is not None:
         cfg['eventGrouping'] = dict(grouping)
     secure(monitor_root)
@@ -455,17 +495,22 @@ def execute(request):
     validate_packaged_config(release, cfg)
     backup = root / 'backups' / (str(int(time.time())) + '-' + uuid.uuid4().hex[:12])
     backup.mkdir(parents=True, mode=0o700)
+    sync_directory(backup.parent)
     state = state_of(service)
     state['monitor'] = state_of(monitor_unit.name)
     state['eventsOnly'] = events_only
+    state['updateMonitor'] = update_monitor
     write(backup / 'service-state.json', json.dumps(state).encode())
     paths = (unit, root / 'config.json', root / 'deployment.json')
-    if not events_only:
+    if not events_only or update_monitor:
         paths += (monitor_unit,)
     for p in paths:
         if p.exists():
             secure(p)
             shutil.copy2(p, backup / p.name)
+            if os.name != 'nt':
+                with (backup / p.name).open('rb') as stream:
+                    os.fsync(stream.fileno())
     journal = root / 'journal.sqlite3'
     if journal.exists():
         secure(journal)
@@ -477,24 +522,37 @@ def execute(request):
             with closing(sqlite3.connect(str(backup / 'journal.sqlite3'))) as destination:
                 source.backup(destination, pages=256, sleep=0.05, progress=progress)
         os.chmod(backup / 'journal.sqlite3', 0o600)
+    sync_directory(backup)
     if events_only and any((path.read_bytes() if path.exists() else None) != previous
                            for path, previous in original_files.items()):
         raise RuntimeError('events_only_deployment_drift')
+    if startup_options is not None:
+        verify_configuration(configuration(cfg))
     started = int(time.time() * 1000)
+    owned_writes = {}
+    def install_owned(path, content):
+        if update_monitor:
+            secure(path)
+            current = path.read_bytes() if path.exists() else None
+            if current != owned_writes.get(path, original_files[path]):
+                raise RuntimeError('monitor_owned_files_write_drift')
+        owned_writes[path] = content
+        write(path, content)
     try:
-        services = (service,) if events_only else (service, monitor_unit.name)
+        services = (service,) if events_only and not update_monitor else (service, monitor_unit.name)
         for name in services:
             path = unit if name == service else monitor_unit
             if path.exists() or (state if name == service else state['monitor'])['active']:
                 run(['systemctl', 'stop', name])
-        if not events_only or grouping is not None:
-            write(root / 'config.json', json.dumps(cfg).encode())
-        write(unit, unit_text(release, capture=mode == 'capture').encode())
-        if not events_only:
-            write(monitor_unit, unit_text(release, monitoring=True).encode())
-        write(root / 'deployment.json', json.dumps({'sha256': digest, 'mode': mode, 'release': str(release),
+        if not events_only or grouping is not None or startup_options is not None:
+            install_owned(root / 'config.json', json.dumps(cfg).encode())
+        install_owned(unit, unit_text(release, capture=mode == 'capture').encode())
+        if not events_only or update_monitor:
+            install_owned(monitor_unit, unit_text(release, monitoring=True).encode())
+        install_owned(root / 'deployment.json', json.dumps({'sha256': digest, 'mode': mode, 'release': str(release),
               'backup': str(backup), 'sourceRevision': manifest['sourceRevision'], 'sourceSha256': manifest['sourceSha256'],
               'version': manifest['version'], 'activatedAtMs': started, 'eventsOnly': events_only,
+              'updateMonitor': update_monitor,
               'visualGroupCompatible': group_compatible}).encode())
         run(['systemctl', 'daemon-reload'])
         for name in services:
@@ -505,9 +563,10 @@ def execute(request):
             try:
                 h = health()
                 if h['health']['atMs'] > started and h['health']['mode'] == ('capture' if mode == 'capture' else 'native') \
-                        and h['health']['healthy'] and (events_only or all(h['monitor'].values())):
+                        and h['health']['healthy'] and (events_only and not update_monitor or all(h['monitor'].values())):
                     return {'ok': True, 'deployment': {'sha256': digest, 'mode': mode, 'release': str(release),
                             'version': manifest['version'], 'activatedAtMs': started, 'eventsOnly': events_only,
+                            'updateMonitor': update_monitor,
                             'visualGroupCompatible': group_compatible}, 'journalBackedUp': journal.exists(), **h}
             except (FileNotFoundError, ValueError, RuntimeError):
                 pass
@@ -515,6 +574,11 @@ def execute(request):
         raise RuntimeError('deployment_health_timeout')
     except Exception:
         try:
+            if update_monitor:
+                for path, original in original_files.items():
+                    current = path.read_bytes() if path.exists() else None
+                    if current not in (original, owned_writes.get(path, original)):
+                        raise RuntimeError('monitor_owned_files_rollback_drift')
             restore(backup)
         except RuntimeError as rollback_error:
             reason = str(rollback_error)

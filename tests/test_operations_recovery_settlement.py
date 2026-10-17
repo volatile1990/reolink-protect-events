@@ -61,6 +61,61 @@ class RecoverySettlementTests(unittest.TestCase):
         self.assertEqual(receipt['postRepairActiveProbeAttempts'],2)
         self.assertTrue(receipt['temporaryActiveProbe']['ok']);self.assertTrue(receipt['postRepairActiveProbe']['ok'])
         self.assert_original()
+
+    def test_later_async_not_ready_after_original_restore_waits_without_extra_patch_or_media_attempt(self):
+        not_ready=[0]
+        def transition(config,path,method='GET',body=None,**kwargs):
+            value=self.api(config,path,method=method,body=body,**kwargs)
+            if method=='GET'and self.api.patches and self.api.patches[-1][1]is None:
+                receipt=read_json(self.root/'recovery.json')
+                if receipt['phase']in('restored','restored-readiness-settling')and not_ready[0]<3:
+                    not_ready[0]+=1
+                    camera=next(c for c in value['cameras']if c['id']==self.cid)
+                    camera['videoReconfigurationInProgress']=True;camera['hasRecordingStarted']=False
+            return value
+        report=self.repair([good_probe(),good_probe()],api=transition)
+        self.assertTrue(report['ok'],report);self.assertEqual(not_ready[0],3)
+        self.assertEqual([flag for flag,_ in self.calls],[True,None])
+        self.assertEqual(read_json(self.root/'recovery.json')['postRepairActiveProbeAttempts'],1)
+        self.assertGreaterEqual(read_json(self.root/'recovery.json')['postRepairActiveProbeReadinessPolls'],2)
+        self.assert_original()
+
+    def test_async_readiness_wait_keeps_settings_cas_and_source_failures_hard(self):
+        def drift(config,path,method='GET',body=None,**kwargs):
+            value=self.api(config,path,method=method,body=body,**kwargs)
+            if method=='GET'and self.api.patches and self.api.patches[-1][1]is None:
+                receipt=read_json(self.root/'recovery.json')
+                if receipt['phase']=='restored-readiness-settling':
+                    self.api.boot['cameras'][-1]['recordingSettings']={'mode':'motion'}
+                    return copy.deepcopy(self.api.boot)
+                if receipt['phase']=='restored':
+                    value['cameras'][0]['hasRecordingStarted']=False
+            return value
+        report=self.repair([good_probe()],api=drift)
+        self.assertFalse(report['ok']);self.assertEqual(report['errorCode'],'recovery_settings_drift')
+        self.assertEqual(len(self.calls),1);self.assertEqual([flag for _,flag in self.api.patches],[True,None])
+
+    def test_async_readiness_is_bounded_and_owner_change_never_starts_media(self):
+        from reolink_protect_events.operations.safety import OperationError
+        camera=self.api.boot['cameras'][0]
+        receipt={'schemaVersion':1,'cameraId':self.cid,'phase':'restored',
+            'originalSettingsSha256':self.original,'restoredOriginalTcp':True}
+        camera['hasRecordingStarted']=False
+        write_json(self.root/'recovery.json',receipt)
+        with self.assertRaises(OperationError)as failure:
+            recovery._media_wait(self.config,self.root,self.api,metrics,
+                lambda *_a,**_kw:self.fail('not-ready camera cannot start viewer'),receipt,False,
+                clock=self.clock,sleep=self.clock.sleep)
+        self.assertEqual(failure.exception.code,'recovery_active_settlement_timeout')
+        self.assertLessEqual(self.clock.elapsed,45);self.assertFalse(self.api.patches)
+        self.clock=Clock()
+        def changed_owner(seconds):
+            self.clock.sleep(seconds);write_json(self.root/'maintenance.json',{'owner':'someone-else'})
+        with self.assertRaises(OperationError)as failure:
+            recovery._media_wait(self.config,self.root,self.api,metrics,
+                lambda *_a,**_kw:self.fail('lost lease cannot start viewer'),receipt,False,
+                clock=self.clock,sleep=changed_owner)
+        self.assertEqual(failure.exception.code,'recovery_maintenance_active');self.assertFalse(self.api.patches)
     def test_real_error_or_any_frame_or_byte_is_not_waitable_readiness(self):
         failures=[]
         for key,value in (('errorCode','ubv_checksum_mismatch'),('websocketFrames',1),

@@ -111,6 +111,29 @@ class ExpansionProjectionContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "invalid_frigate_event_identity"):
             event(projected, "vor_dem_haus", START + 60000)
 
+    def test_global_health_keeps_all_six_expected_cameras_when_backend_entries_disappear(self):
+        for keep in ({"vor_dem_haus"}, set()):
+            stats = self.stats()
+            stats["cameras"] = {name: row for name, row in stats["cameras"].items() if name in keep}
+            result = self.proxy.health_view(stats)
+            self.assertEqual(set(result["cameras"]), set(self.proxy.CAMERAS))
+            self.assertFalse(result["overall_healthy"])
+            for name in self.proxy.CAMERAS - keep:
+                self.assertFalse(result["cameras"][name]["healthy"])
+                self.assertFalse(self.proxy.health_view(stats, name)["healthy"])
+            self.assertEqual(result["healthy"], "vor_dem_haus" in keep)
+
+    def test_global_health_requires_every_expected_source_but_ignores_unconfigured_extras(self):
+        stats = self.stats()
+        stats["cameras"]["unconfigured"] = {"camera_fps": 0, "process_fps": 0}
+        result = self.proxy.health_view(stats)
+        self.assertEqual(len(result["cameras"]), 6)
+        self.assertTrue(result["overall_healthy"])
+        stats.pop("cameras")
+        result = self.proxy.health_view(stats)
+        self.assertEqual(len(result["cameras"]), 6)
+        self.assertFalse(result["overall_healthy"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -136,6 +136,7 @@ class MonitorTests(unittest.TestCase):
         cid=self.config['bridges'][0]['cameraId']
         write_json(self.root/'state.json',{'schemaVersion':1,'startedAtMs':self.now-120000,
             'lastProbeAtMs':self.now,'rotation':0,'cameras':{cid:{'failures':2,
+            'connectionEpoch':1,'failureSourceEpoch':1,
             'recordingEnds':{'high':self.now,'low':self.now},'repairAttempts':[self.now-1200000,self.now-1000000]}}})
         report=self.sample(self.now+30000,allow_repair=True)
         row=next(r for r in report['cameras']if r['cameraId']==cid)

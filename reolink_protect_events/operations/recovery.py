@@ -74,24 +74,38 @@ def _source_guard(config,camera,fetch):
 
 
 def _media_wait(config,root,api,fetch,probe,receipt,temporary,*,clock,sleep,maintenance_owner=None):
-    """Prove native Automatic before/after restore; only empty readiness may wait."""
+    """Prove Automatic after bounded asynchronous readiness and empty-start waits."""
     from .ubv import probe_ubv
     probe=probe or probe_ubv;deadline=clock()+MEDIA_SETTLEMENT_SECONDS
     field='temporaryActiveProbe'if temporary else'postRepairActiveProbe'
     path=Path(root)/'recovery.json'
-    for attempt in range(1,MEDIA_SETTLEMENT_MAX_ATTEMPTS+1):
+    attempt=0
+    while attempt<MEDIA_SETTLEMENT_MAX_ATTEMPTS:
         need(not maintenance_blocks(root,maintenance_owner),'recovery_maintenance_active')
         remaining=deadline-clock()
         reserve=SOURCE_READ_RESERVE_SECONDS+MEDIA_PROBE_RESERVE_SECONDS
         need(remaining>reserve,'recovery_active_settlement_timeout')
         boot=api(config,'/api/bootstrap',timeout=min(8,remaining-reserve))
         camera=_guard(config,boot,receipt,temporary)
-        need(camera.get('state')=='CONNECTED'and camera.get('hasRecordingStarted') is True
-             and camera.get('videoReconfigurationInProgress') is False,'recovery_camera_not_ready')
         need(deadline-clock()>reserve,'recovery_active_settlement_timeout')
         _source_guard(config,camera,fetch)
+        need(camera.get('isUpdating')is not True,'recovery_camera_updating')
+        need(not maintenance_blocks(root,maintenance_owner),'recovery_maintenance_active')
+        ready=(camera.get('state')=='CONNECTED'and camera.get('hasRecordingStarted') is True
+               and camera.get('videoReconfigurationInProgress') is False)
+        if not ready:
+            # A successful restore can trigger a later asynchronous recorder
+            # transition even after _wait observed two ready samples. Polling
+            # that known state is not a media attempt or another forceTcp send.
+            # Every pass rechecks the exact settings, source and lease owner.
+            remaining=deadline-clock()
+            need(remaining>reserve+1,'recovery_active_settlement_timeout')
+            receipt['phase']='temporary-readiness-settling'if temporary else'restored-readiness-settling'
+            receipt[field+'ReadinessPolls']=receipt.get(field+'ReadinessPolls',0)+1
+            write_json(path,receipt);sleep(1);continue
         need(deadline-clock()>=MEDIA_PROBE_RESERVE_SECONDS,'recovery_active_settlement_timeout')
         need(not maintenance_blocks(root,maintenance_owner),'recovery_maintenance_active')
+        attempt+=1
         receipt['phase']='temporary-media-settling'if temporary else'restored-media-settling'
         receipt[field+'Attempts']=attempt;write_json(path,receipt)
         verify=probe(config,camera,automatic_channel(camera),seconds=MEDIA_PROBE_SECONDS)
