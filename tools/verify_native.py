@@ -78,6 +78,10 @@ start=event['start']-1000
 end=max(event.get('end') or event['start'],event['start'])+1000
 metadata=event.get('metadata') or {}
 own=metadata.get('reolinkProtectEvents') or {}
+provenance=own.get('provenance') or {}
+if provenance.get('visualGroupVersion')==1 and event.get('end') is None:
+ span=provenance.get('groupMaxSpanMs')
+ if type(span) is int and 30000<=span<=300000: end=event['start']+span+1000
 expected_types=sorted(set(expected_classes))
 event_summary={'id':event.get('id'),'camera':camera,'type':event.get('type'),'start':event.get('start'),'end':event.get('end'),'score':event.get('score'),'smartDetectTypes':event.get('smartDetectTypes'),
   'owner':own.get('owner'),'schemaVersion':own.get('schemaVersion'),
@@ -85,6 +89,10 @@ event_summary={'id':event.get('id'),'camera':camera,'type':event.get('type'),'st
  'source':metadata.get('source'),'sourceUnionVersion':(own.get('provenance') or {}).get('sourceUnionVersion'),
  'sourceTypes':(own.get('provenance') or {}).get('sourceTypes'),'mergePolicy':(own.get('provenance') or {}).get('mergePolicy'),
  'objectIdentityMatched':(own.get('provenance') or {}).get('objectIdentityMatched'),
+ 'identityStart':provenance.get('identityStart'),'visualGroupVersion':provenance.get('visualGroupVersion'),
+ 'groupIdentityStart':provenance.get('groupIdentityStart'),'activationMs':provenance.get('activationMs'),
+ 'groupMaxSpanMs':provenance.get('groupMaxSpanMs'),'classIntervalsComplete':provenance.get('classIntervalsComplete'),
+ 'classIntervals':provenance.get('classIntervals'),
  'historicalImport':(own.get('provenance') or {}).get('historicalImport',False),'endIsTimeoutEstimate':(own.get('provenance') or {}).get('endIsTimeoutEstimate',False)}
 def search(kind,confidence):
  query=urllib.parse.urlencode([('start',start),('end',end),('labels[]','camera:'+camera),('labels[]','smartDetectType:'+kind),('minConfidence',confidence),('limit',50),('orderDirection','asc')])

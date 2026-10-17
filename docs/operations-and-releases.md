@@ -51,6 +51,65 @@ python tools/protect_ops.py status --config /path/to/local-controller.json
 python tools/protect_ops.py resume --config /path/to/local-controller.json --run /path/to/receipt
 ```
 
+## Events-only release
+
+For a change confined to native event import, install a clean, committed Events
+package without running the six-bridge release controller:
+
+```console
+python -m unittest discover -s tests
+python tools/test_postgres.py
+python tools/deploy.py install --events-only --dependency-cache /path/to/public-wheel-cache
+python tools/deploy.py status
+```
+
+This path stages and verifies the same immutable package and ARM64 decoder, then
+validates the private configuration with that package's runtime before stopping
+Events. It backs up the Events unit, private configuration, deployment metadata
+and a consistent SQLite journal. It restarts only
+`reolink-protect-native-events.service`; the media-monitor unit and process,
+thumbnail selection, bridge containers, camera settings and Controls remain as
+they were. The active configuration must already match the verified camera
+mapping. The regular installer retains its existing monitor installation and
+automatic-thumbnail defaults.
+
+To enroll subsequent visual intervals in the grouping projection, explicitly
+enable it during that scoped installation:
+
+```console
+python tools/deploy.py install --events-only --group-visual-events --group-max-span-seconds 120 --dependency-cache /path/to/public-wheel-cache
+```
+
+The span limit accepts 30–300 seconds and defaults to 120. These options add only
+the private `eventGrouping` setting, with `enabled: true` and `maxSpanSeconds`.
+Credentials stay on the console and reach the staged validator only through
+stdin. The deployment receipt records its Events-only scope and the presence
+of the manifest-verified grouping runtime.
+
+Manual rollback requires the current package digest:
+
+```console
+python tools/deploy.py rollback --expected-digest CURRENT_PACKAGE_SHA256
+```
+
+Once the journal contains `visual_group_members`, rollback to a runtime without
+that projection is rejected before any service stops. To stop new enrollment,
+set `eventGrouping.enabled` to `false` in the private console configuration and
+restart Events while retaining the compatible release. It continues servicing
+existing groups. Do not restore a historical journal or delete memberships to
+bypass this guard.
+
+If activation fails after groups were enrolled and the prior binary cannot
+service them, automatic recovery keeps the compatible Events release, restores
+the prior configuration with new enrollment disabled and checks fresh native
+health. The failed installation reports this recovery explicitly; it does not
+claim an old-binary rollback. An Events-only recovery also leaves the monitor
+untouched. Ordinary pre-enrollment failures restore the prior Events release.
+If success or healthy compatible recovery cannot be confirmed, the Events-only
+CLI retains its owned maintenance marker and reports `maintenanceOwner` with
+`maintenanceRetained: true`. Inspect and verify recovery before clearing that
+exact marker; no successful installation is reported in this case.
+
 ## Release gates and restoration
 
 1. Require clean committed source trees. Freeze UTF-8 sources with LF line endings

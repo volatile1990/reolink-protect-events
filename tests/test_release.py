@@ -150,6 +150,24 @@ class ReleaseTests(unittest.TestCase):
 
 
 class InstallerVerificationTests(unittest.TestCase):
+    def test_packaged_config_validation_uses_staged_runtime_and_private_stdin_only(self):
+        config = {'privateFixture': 'not-for-argv', 'eventGrouping': {'enabled': True, 'maxSpanSeconds': 120}}
+        with patch.object(installer.subprocess, 'run') as command:
+            command.return_value.returncode = 0
+            installer.validate_packaged_config(Path('/fixture/staged-release'), config)
+            args, options = command.call_args.args[0], command.call_args.kwargs
+            self.assertEqual(args[0], '/usr/bin/python3')
+            self.assertIn('sys.path.insert(0,sys.argv[1])', args[2])
+            self.assertIn('validate_config(json.load(sys.stdin))', args[2])
+            self.assertEqual(args[3], str(Path('/fixture/staged-release')))
+            self.assertNotIn('not-for-argv', ' '.join(args))
+            self.assertEqual(json.loads(options['input']), config)
+            self.assertEqual(options['stdout'], installer.subprocess.DEVNULL)
+            self.assertEqual(options['stderr'], installer.subprocess.DEVNULL)
+            command.return_value.returncode = 1
+            with self.assertRaisesRegex(RuntimeError, '^packaged_configuration_invalid$'):
+                installer.validate_packaged_config(Path('/fixture/staged-release'), config)
+
     def test_exact_package_members_hash_and_manifest_required(self):
         data,digest=package();members,meta=installer.verified_members(data,digest)
         self.assertEqual(len(members),len(meta['members'])+1)
@@ -209,12 +227,14 @@ class InstallerVerificationTests(unittest.TestCase):
                  patch.object(installer.os,'geteuid',return_value=0,create=True), \
                  patch.object(installer,'get_config',return_value={'bridges':[]}), \
                  patch.object(installer,'run',side_effect=run),patch.object(installer,'health',return_value=health), \
+                 patch.object(installer,'validate_packaged_config') as validate, \
                  patch.object(installer,'state_of',side_effect=lambda _:{'active':True,'enabled':True}), \
                  patch.object(installer.subprocess,'run'):
                 import base64
                 result=installer.execute({'mode':'install','package':base64.b64encode(archive).decode(),
                                           'digest':digest,'owner':owner})
                 self.assertTrue(result['journalBackedUp'])
+                validate.assert_called_once()
                 backups=list((root/'backups').iterdir());self.assertEqual(len(backups),1)
                 with closing(sqlite3.connect(backups[0]/'journal.sqlite3'))as database:
                     self.assertEqual(database.execute('SELECT sequence FROM fixture_events').fetchall(),[(7,)])

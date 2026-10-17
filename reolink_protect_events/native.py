@@ -106,6 +106,51 @@ def _classification_details(provenance, classes):
     return result
 
 
+def _visual_group_times(provenance, classes, start, end, identity_start):
+    """Validate the narrowly scoped visual-group publication protocol.
+
+    Complete, clipped class intervals are evidence about classification times;
+    they are never object coordinates or timestamps for the selected pixels.
+    """
+    if "visualGroupVersion" not in provenance:
+        return None
+    if type(provenance["visualGroupVersion"]) is not int or provenance["visualGroupVersion"] != 1:
+        raise ValueError("Unsupported visual group version")
+    if (not set(classes) <= CLASSES or type(provenance.get("sourceUnionVersion")) is not int or
+            provenance["sourceUnionVersion"] != 1):
+        raise ValueError("Visual groups require the visual source-union protocol")
+    group_identity = _millis(provenance.get("groupIdentityStart"), "groupIdentityStart")
+    activation = _millis(provenance.get("activationMs"), "activationMs")
+    span = provenance.get("groupMaxSpanMs")
+    if group_identity != identity_start or not activation <= start <= group_identity:
+        raise ValueError("Invalid visual group identity or activation boundary")
+    if type(span) is not int or not 30000 <= span <= 300000:
+        raise ValueError("Invalid visual group maximum span")
+    bound = start + span
+    if group_identity >= bound or (end is not None and (end <= start or end > bound)):
+        raise ValueError("Visual group exceeds its maximum span")
+    supplied = provenance.get("classIntervals")
+    if provenance.get("classIntervalsComplete") is not True or not isinstance(supplied, dict) or set(supplied) != set(classes):
+        raise ValueError("Complete visual group class intervals are required")
+    detected = {}
+    for kind, intervals in supplied.items():
+        if not isinstance(intervals, list) or not intervals:
+            raise ValueError("Visual group class intervals must be nonempty")
+        previous_end = start
+        for item in intervals:
+            if not isinstance(item, dict) or set(item) != {"start", "end"}:
+                raise ValueError("Invalid visual group class interval")
+            left = _millis(item["start"], "class interval start")
+            right = _millis(item["end"], "class interval end", optional=True)
+            if (previous_end is None or left < previous_end or left < start or left >= bound or
+                    (right is None and end is not None) or
+                    (right is not None and (right <= left or right > bound or (end is not None and right > end)))):
+                raise ValueError("Visual group class intervals must be sorted, disjoint and clipped")
+            previous_end = right
+        detected[kind] = intervals[0]["start"]
+    return detected
+
+
 def sql_text(value):
     """A UTF-8 SQL expression, safe regardless of quote/backslash settings.
 
@@ -332,6 +377,16 @@ ROLLBACK;
         details = _classification_details(provenance, classes)
         union = provenance.get("sourceUnionVersion") == 1
         identity_start = _millis(provenance.get("identityStart"), "identityStart") if union else start
+        group_times = _visual_group_times(provenance, classes, start, end, identity_start)
+        grouped = group_times is not None
+        def class_contains(kind, timestamp):
+            return any(item["start"] <= timestamp and (item["end"] is None or timestamp < item["end"])
+                       for item in provenance["classIntervals"][kind])
+        def class_contains_sql(kind, timestamp):
+            return ("EXISTS (SELECT 1 FROM jsonb_array_elements(%s::jsonb) observed "
+                    "WHERE (observed->>'start')::bigint<=%s AND "
+                    "(observed->>'end' IS NULL OR %s<(observed->>'end')::bigint))" %
+                    (_sql_json(provenance["classIntervals"][kind]), timestamp, timestamp))
         source_types = provenance.get("sourceTypes", [])
         if union and (not isinstance(source_types, list) or not source_types or not set(source_types) <= {"reolink", "frigate"}):
             raise ValueError("Union requires explicit source types")
@@ -380,6 +435,22 @@ ROLLBACK;
             # Immutable identityStart keeps objects/tracks/thumb IDs stable even
             # when delayed genuine history extends the start backwards.
             start_conflict = "COALESCE((metadata::jsonb->'reolinkProtectEvents'->'provenance'->>'identityStart')::bigint,start) IS DISTINCT FROM %d" % identity_start
+        stored_provenance = "metadata::jsonb->'reolinkProtectEvents'->'provenance'"
+        class_conflict = '\"smartDetectTypes\"::jsonb IS DISTINCT FROM %s::jsonb' % class_sql
+        if grouped:
+            # Existing groups may only gain genuine visual classes. Ordinary
+            # events cannot opt into this permission by changing provenance.
+            protocol_values = {"sourceUnionVersion": 1, "visualGroupVersion": 1,
+                               "identityStart": identity_start, "groupIdentityStart": identity_start,
+                               "activationMs": provenance["activationMs"],
+                               "groupMaxSpanMs": provenance["groupMaxSpanMs"]}
+            protocol_conflicts = ["%s->>%s IS DISTINCT FROM %s" %
+                (stored_provenance, sql_text(key), sql_text(str(value)))
+                for key, value in protocol_values.items()]
+            class_conflict = "(" + " OR ".join(protocol_conflicts + [
+                'NOT COALESCE("smartDetectTypes"::jsonb <@ %s::jsonb,false)' % class_sql]) + ")"
+        else:
+            class_conflict = "(%s OR %s ? 'visualGroupVersion')" % (class_conflict, stored_provenance)
         thumb_id = None
         preview_id = None
         lines = ["BEGIN;", "SET LOCAL statement_timeout = '10s';",
@@ -390,8 +461,8 @@ ROLLBACK;
                  # retention DELETE between this check and the upsert.
                  " PERFORM id FROM events WHERE id=%s FOR UPDATE;\n"
                  " IF %s AND NOT EXISTS (SELECT 1 FROM events WHERE id=%s AND \"deletedAt\" IS NULL) THEN RAISE EXCEPTION USING MESSAGE='reolink-protect-events:retired',ERRCODE='P0002'; END IF;\n"
-                 " IF EXISTS (SELECT 1 FROM events WHERE id=%s AND (NOT COALESCE(%s,false) OR type IS DISTINCT FROM %s OR \"cameraId\" IS DISTINCT FROM %s OR %s OR \"smartDetectTypes\"::jsonb IS DISTINCT FROM %s::jsonb OR \"deletedAt\" IS NOT NULL)) THEN RAISE EXCEPTION 'Integration event identity collision'; END IF;\n END $rpe$;"
-                 % (cid, eid, "true" if require_existing else "false", eid, eid, owner_predicate, sql_text(event_type), cid, start_conflict, class_sql)]
+                  " IF EXISTS (SELECT 1 FROM events WHERE id=%s AND (NOT COALESCE(%s,false) OR type IS DISTINCT FROM %s OR \"cameraId\" IS DISTINCT FROM %s OR %s OR %s OR \"deletedAt\" IS NOT NULL)) THEN RAISE EXCEPTION 'Integration event identity collision'; END IF;\n END $rpe$;"
+                  % (cid, eid, "true" if require_existing else "false", eid, eid, owner_predicate, sql_text(event_type), cid, start_conflict, class_conflict)]
         if thumbnail:
             width, height = thumbnail.dimensions()
             thumb_id = native_id("thumbnail", identity_start, event_id)
@@ -412,13 +483,15 @@ ROLLBACK;
                 "type": kind, "croppedId": thumb_id} for kind in native_classes] if is_audio else
                 [{"objectId": objects[kind], "clockBestWall": thumbnail.timestamp,
                   "type": kind, "croppedId": thumb_id, "attributes": attributes_by_class[kind]}
-                 for kind in classes])
+                 for kind in classes if not grouped or class_contains(kind, thumbnail.timestamp)])
         # Retain the first thumbnail and a closed end on retries; never reopen a
         # finished interval, unlock an operator's favorite, or reset deletedAt.
         end_sql = "NULL" if end is None else str(end)
         thumb_sql = "NULL" if thumb_id is None else sql_text(thumb_id)
         preview_sql = "NULL" if preview_id is None else sql_text(preview_id)
         bounds_update = 'start=EXCLUDED.start,"end"=EXCLUDED."end",' if union else '"end"=CASE WHEN EXCLUDED."end" IS NULL THEN events."end" ELSE GREATEST(events."end",EXCLUDED."end") END,'
+        if grouped:
+            bounds_update += '"smartDetectTypes"=EXCLUDED."smartDetectTypes",'
         zone_case = "CASE WHEN EXCLUDED.\"end\" IS NOT NULL THEN 'leave' ELSE 'enter' END" if union else "CASE WHEN events.\"end\" IS NOT NULL OR EXCLUDED.\"end\" IS NOT NULL THEN 'leave' ELSE 'enter' END"
         zones_sql = "'{}'::jsonb" if is_audio else "jsonb_build_object('1',jsonb_build_object('status',%s))" % zone_case
         saved_thumbnails = "events.metadata::jsonb->'detectedThumbnails'"
@@ -427,7 +500,18 @@ ROLLBACK;
             # late source to enrich the same stable object's classification.
             cases = " ".join("WHEN item->>'objectId'=%s THEN item || jsonb_build_object('attributes',%s)" %
                 (sql_text(objects[kind]), _sql_json(attributes_by_class[kind], "jsonb")) for kind in objects)
-            saved_thumbnails = "(SELECT jsonb_agg(CASE %s ELSE item END ORDER BY ordinal) FROM jsonb_array_elements(events.metadata::jsonb->'detectedThumbnails') WITH ORDINALITY AS thumbs(item,ordinal))" % cases
+            valid_pixels = ""
+            if grouped:
+                # A genuine later clear may shorten an open class past the
+                # selected frame. Remove only that obsolete class association;
+                # the event preview, stored image bytes and favorites stay put.
+                valid_pixels = " WHERE " + " OR ".join("(item->>'objectId'=%s AND EXISTS "
+                    "(SELECT 1 FROM thumbnails pixel WHERE pixel.id=item->>'croppedId' "
+                    "AND pixel.\"cameraId\"=events.\"cameraId\" AND pixel.\"eventId\"=events.id "
+                    "AND pixel.timestamp=(item->>'clockBestWall')::bigint AND %s))" %
+                    (sql_text(objects[kind]), class_contains_sql(kind, "pixel.timestamp"))
+                    for kind in classes)
+            saved_thumbnails = "(SELECT COALESCE(jsonb_agg(CASE %s ELSE item END ORDER BY ordinal),'[]'::jsonb) FROM jsonb_array_elements(events.metadata::jsonb->'detectedThumbnails') WITH ORDINALITY AS thumbs(item,ordinal)%s)" % (cases, valid_pixels)
         lines.append("INSERT INTO events (id,type,start,\"end\",\"cameraId\",score,\"smartDetectTypes\",metadata,locked,\"thumbnailId\",\"thumbnailFullfovId\",\"createdAt\",\"updatedAt\")\n"
             "VALUES (%s,%s,%d,%s,%s,NULL,%s,%s,false,%s,%s,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)\n"
             "ON CONFLICT (id) DO UPDATE SET %s\n"
@@ -438,6 +522,24 @@ ROLLBACK;
             for variant_id in (thumb_id, preview_id):
                 lines.append("UPDATE thumbnails SET \"eventId\"=%s WHERE id=%s AND \"cameraId\"=%s AND (\"eventId\" IS NULL OR \"eventId\"=%s);"
                              % (eid, sql_text(variant_id), cid, eid))
+        if grouped:
+            # A class can use the genuine first full-frame image only if its
+            # actual pixel timestamp falls in that class's observed interval.
+            # A later person must not inherit an earlier car-only image.
+            specs = [{"objectId": objects[kind], "type": kind, "attributes": attributes_by_class[kind],
+                      "intervals": provenance["classIntervals"][kind]}
+                     for kind in classes]
+            lines.append("UPDATE events e SET metadata=jsonb_set(e.metadata::jsonb,'{detectedThumbnails}',"
+                "COALESCE(e.metadata::jsonb->'detectedThumbnails','[]'::jsonb) || COALESCE(("
+                "SELECT jsonb_agg((spec-'intervals') || jsonb_build_object('clockBestWall',t.timestamp,'croppedId',t.id)) "
+                "FROM jsonb_array_elements(%s::jsonb) spec JOIN thumbnails t ON t.id=e.\"thumbnailFullfovId\" "
+                "AND t.\"cameraId\"=e.\"cameraId\" AND t.\"isFullfov\" IS TRUE "
+                "WHERE EXISTS (SELECT 1 FROM jsonb_array_elements(spec->'intervals') observed "
+                "WHERE (observed->>'start')::bigint<=t.timestamp AND "
+                "(observed->>'end' IS NULL OR t.timestamp<(observed->>'end')::bigint)) "
+                "AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(e.metadata::jsonb->'detectedThumbnails','[]'::jsonb)) old "
+                "WHERE old->>'objectId'=spec->>'objectId')),'[]'::jsonb),true)::json WHERE e.id=%s;"
+                % (_sql_json(specs), eid))
         label_names = ["eventType:" + event_type, "camera:" + camera_id]
         if not is_audio:
             label_names.append("zone:" + camera_id + ":1")
@@ -456,11 +558,16 @@ ROLLBACK;
             relevant = {key: values for key, values in details.items() if _DETAIL_TYPES[key][0] == kind}
             if relevant:
                 object_meta["reolinkProtectEvents"]["classificationDetails"] = relevant
+            object_time = group_times[kind] if grouped else start
+            object_thumbnail = ('(SELECT "thumbnailFullfovId" FROM events e JOIN thumbnails t '
+                'ON t.id=e."thumbnailFullfovId" WHERE e.id=%s AND %s)' %
+                (eid, class_contains_sql(kind, "t.timestamp"))) if grouped else thumb_sql
+            object_thumbnail_update = 'EXCLUDED."thumbnailId"' if grouped else 'COALESCE("smartDetectObjects"."thumbnailId",EXCLUDED."thumbnailId")'
             lines.append("INSERT INTO \"smartDetectObjects\" (id,\"eventId\",\"cameraId\",type,attributes,metadata,\"detectedAt\",\"thumbnailId\",\"createdAt\",\"updatedAt\")\n"
                 "VALUES (%s,%s,%s,%s,%s,%s,%d,%s,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)\n"
-                "ON CONFLICT (id) DO UPDATE SET \"thumbnailId\"=COALESCE(\"smartDetectObjects\".\"thumbnailId\",EXCLUDED.\"thumbnailId\"),attributes=EXCLUDED.attributes,metadata=EXCLUDED.metadata,%s\"updatedAt\"=CURRENT_TIMESTAMP\n"
+                "ON CONFLICT (id) DO UPDATE SET \"thumbnailId\"=%s,attributes=EXCLUDED.attributes,metadata=EXCLUDED.metadata,%s\"updatedAt\"=CURRENT_TIMESTAMP\n"
                 "WHERE \"smartDetectObjects\".\"eventId\"=EXCLUDED.\"eventId\" AND \"smartDetectObjects\".\"cameraId\"=EXCLUDED.\"cameraId\" AND \"smartDetectObjects\".type=EXCLUDED.type;"
-                % (sql_text(object_id), eid, cid, sql_text(kind), _sql_json(attributes), _sql_json(object_meta, "jsonb"), start, thumb_sql,
+                % (sql_text(object_id), eid, cid, sql_text(kind), _sql_json(attributes), _sql_json(object_meta, "jsonb"), object_time, object_thumbnail, object_thumbnail_update,
                    '"detectedAt"=EXCLUDED."detectedAt",' if union else ''))
         if not is_audio:
             lines.append("INSERT INTO \"smartDetectTracks\" (id,\"eventId\",\"cameraId\",payload,\"createdAt\",\"updatedAt\") VALUES (%s,%s,%s,'[]'::json,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) ON CONFLICT (id) DO NOTHING;"

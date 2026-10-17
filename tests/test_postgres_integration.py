@@ -54,6 +54,18 @@ def interval(index=1, **changes):
     return result
 
 
+def visual_group(classes=("vehicle",), end=None):
+    row = interval(classes=list(classes), end=end)
+    first = row["start"]
+    row["provenance"] = {"sourceUnionVersion": 1, "identityStart": first,
+        "sourceTypes": ["reolink"], "visualGroupVersion": 1, "groupIdentityStart": first,
+        "activationMs": first - 1000, "groupMaxSpanMs": 120000,
+        "classIntervalsComplete": True,
+        "classIntervals": {kind: [{"start": first + (2000 if kind == "person" else 0), "end": end}]
+                           for kind in classes}}
+    return row
+
+
 def adapter():
     return NativeAdapter(execute=execute, version_reader=lambda: "7.3.70")
 
@@ -87,6 +99,140 @@ class PostgreSqlIntegrationTests(unittest.TestCase):
                        '\'payload\',(SELECT payload FROM "smartDetectTracks"),'
                        '\'invented\',(SELECT count(*) FROM "smartDetectObjects" WHERE metadata::text LIKE \'%"confidence":%\' OR attributes::text LIKE \'%"coord":%\'));')
         self.assertEqual(truths, {"scores": 0, "objectTypes": ["animal", "person", "vehicle"], "payload": [], "invented": 0})
+
+    def test_visual_group_live_expansion_preserves_pixels_favorite_and_both_searches(self):
+        row = visual_group()
+        first = row["start"]
+        original = self.db.upsert_interval(row, Thumbnail(JPEG, first + 100))
+        execute("UPDATE events SET locked=true; UPDATE thumbnails SET locked=true;")
+        before = value('SELECT json_build_object(\'objects\',(SELECT json_agg(id) FROM "smartDetectObjects"),'
+                       '\'tracks\',(SELECT json_agg(id) FROM "smartDetectTracks"),'
+                       '\'thumbnails\',(SELECT json_agg(id ORDER BY id) FROM thumbnails),'
+                       '\'preview\',(SELECT "thumbnailId" FROM events));')
+        expanded = visual_group(("vehicle", "person"))
+        expanded["deliveredRevision"] = 1
+        event = self.db.upsert_interval(expanded)
+        self.assertEqual(event["smartDetectTypes"], ["person", "vehicle"])
+        self.assertEqual(event, self.db.upsert_interval(copy.deepcopy(expanded)))
+        self.assertEqual(self.counts()["events"], 1)
+        self.assertEqual(self.counts()["objects"], 2)
+        self.assertEqual(self.counts()["thumbnails"], 2)
+        actual = value('SELECT json_build_object(\'times\',(SELECT json_object_agg(type,"detectedAt") FROM "smartDetectObjects"),'
+                       '\'tracks\',(SELECT json_agg(id) FROM "smartDetectTracks"),'
+                       '\'thumbnails\',(SELECT json_agg(id ORDER BY id) FROM thumbnails),'
+                       '\'preview\',(SELECT "thumbnailId" FROM events),\'locked\',(SELECT locked FROM events),'
+                       '\'pixelTimes\',(SELECT json_agg(timestamp ORDER BY id) FROM thumbnails),'
+                       '\'bothClasses\',(SELECT "smartDetectTypes"::jsonb ? \'person\' AND "smartDetectTypes"::jsonb ? \'vehicle\' FROM events));')
+        self.assertEqual(actual["times"], {"vehicle": first, "person": first + 2000})
+        self.assertEqual(actual["tracks"], before["tracks"])
+        self.assertEqual(actual["thumbnails"], before["thumbnails"])
+        self.assertEqual(actual["preview"], before["preview"])
+        self.assertEqual(actual["pixelTimes"], [first + 100, first + 100])
+        self.assertTrue(actual["locked"])
+        self.assertTrue(actual["bothClasses"])
+        thumbs = {thumb["type"]: thumb for thumb in event["metadata"]["detectedThumbnails"]}
+        self.assertEqual(set(thumbs), {"vehicle"})
+        self.assertEqual({thumb["clockBestWall"] for thumb in thumbs.values()}, {first + 100})
+        self.assertEqual(thumbs["vehicle"], original["metadata"]["detectedThumbnails"][0])
+        self.assertIsNone(value('SELECT json_build_object(\'thumbnail\',"thumbnailId") FROM "smartDetectObjects" WHERE type=\'person\';')["thumbnail"])
+        labels = value('SELECT json_object_agg(COALESCE(o.type,\'event\'),x.names) FROM "detectionLabels" dl '
+            'LEFT JOIN "smartDetectObjects" o ON o.id=dl."objectId" CROSS JOIN LATERAL '
+            '(SELECT json_agg(l.name ORDER BY l.name) names FROM labels l WHERE l.lid=ANY(dl.labels)) x;')
+        for kind in ("person", "vehicle"):
+            self.assertIn("smartDetectType:" + kind, labels["event"])
+            self.assertIn("smartDetectType:" + kind, labels[kind])
+        self.assertNotIn("smartDetectType:vehicle", labels["person"])
+        self.assertNotIn("smartDetectType:person", labels["vehicle"])
+        self.assertEqual(event["metadata"]["reolinkProtectEvents"]["provenance"]["classIntervals"],
+                         expanded["provenance"]["classIntervals"])
+        closed = visual_group(("vehicle", "person"), end=first + 5000)
+        closed["deliveredRevision"] = 1
+        self.assertEqual(self.db.upsert_interval(closed)["end"], first + 5000)
+        self.assertTrue(value('SELECT to_json(bool_and(locked)) FROM thumbnails;'))
+
+    def test_visual_group_protocol_cannot_promote_downgrade_remove_or_change_identity(self):
+        group = visual_group(("vehicle", "person"))
+        self.db.upsert_interval(group, Thumbnail(JPEG, group["start"]))
+        before = self.counts()
+        removal = visual_group()
+        downgrade = copy.deepcopy(group)
+        downgrade["provenance"] = {"sourceUnionVersion": 1, "identityStart": group["start"], "sourceTypes": ["reolink"]}
+        candidates = [removal, downgrade, dict(group, cameraId="222222222222222222222222")]
+        for field, amount in (("identityStart", 1), ("activationMs", -1), ("groupMaxSpanMs", 1000)):
+            changed = copy.deepcopy(group)
+            changed["provenance"][field] += amount
+            if field == "identityStart":
+                changed["provenance"]["groupIdentityStart"] += amount
+            candidates.append(changed)
+        for candidate in candidates:
+            with self.subTest(candidate=candidate), self.assertRaises(NativeError):
+                self.db.upsert_interval(candidate, Thumbnail(JPEG, group["start"]))
+            self.assertEqual(self.counts(), before)
+        ordinary = interval(2, classes=["vehicle"])
+        self.db.upsert_interval(ordinary)
+        with self.assertRaises(NativeError):
+            self.db.upsert_interval(dict(ordinary, classes=["vehicle", "person"]))
+        promoted = visual_group()
+        promoted.update(eventId=ordinary["eventId"], start=ordinary["start"])
+        for field in ("identityStart", "groupIdentityStart"):
+            promoted["provenance"][field] = ordinary["start"]
+        promoted["provenance"]["classIntervals"]["vehicle"][0]["start"] = ordinary["start"]
+        before = self.counts()
+        with self.assertRaises(NativeError):
+            self.db.upsert_interval(promoted)
+        self.assertEqual(self.counts(), before)
+
+    def test_visual_group_late_clear_removes_only_invalid_class_image_association(self):
+        row = visual_group(("person", "vehicle"))
+        first = row["start"]
+        initial = self.db.upsert_interval(row, Thumbnail(JPEG, first + 5000))
+        self.assertEqual({thumb["type"] for thumb in initial["metadata"]["detectedThumbnails"]}, {"person", "vehicle"})
+        execute("UPDATE events SET locked=true; UPDATE thumbnails SET locked=true;")
+        picture_sql = ('SELECT json_build_object(\'event\',(SELECT json_build_object(\'preview\',"thumbnailId",'
+            '\'full\',"thumbnailFullfovId",\'locked\',locked) FROM events),'
+            '\'images\',(SELECT json_agg(json_build_object(\'id\',id,\'bytes\',encode(content,\'hex\'),'
+            '\'time\',timestamp,\'locked\',locked) ORDER BY id) FROM thumbnails));')
+        before = value(picture_sql)
+        counts = self.counts()
+        cleared = visual_group(("person", "vehicle"), end=first + 8000)
+        cleared["deliveredRevision"] = 1
+        cleared["provenance"]["classIntervals"]["person"][0]["end"] = first + 4000
+        event = self.db.upsert_interval(cleared)
+        self.assertEqual(event["smartDetectTypes"], ["person", "vehicle"])
+        self.assertEqual([thumb["type"] for thumb in event["metadata"]["detectedThumbnails"]], ["vehicle"])
+        objects = value('SELECT json_object_agg(type,json_build_object(\'time\',"detectedAt",\'image\',"thumbnailId")) '
+                        'FROM "smartDetectObjects";')
+        self.assertEqual(objects["person"]["time"], first + 2000)
+        self.assertIsNone(objects["person"]["image"])
+        self.assertIsNotNone(objects["vehicle"]["image"])
+        self.assertEqual(value(picture_sql), before)
+        self.assertEqual(self.counts(), counts)
+        for kind in ("person", "vehicle"):
+            matches = value('SELECT to_json(count(*)) FROM "detectionLabels" dl JOIN labels l '
+                'ON l.lid=ANY(dl.labels) WHERE l.name=\'smartDetectType:' + kind + '\';')
+            self.assertEqual(matches, 2)  # Event search and the genuine class object.
+        self.assertEqual(event, self.db.upsert_interval(cleared))
+
+    def test_visual_group_retired_expansion_and_later_thumbnail_do_not_resurrect(self):
+        row = visual_group()
+        self.db.upsert_interval(row)
+        expanded = visual_group(("vehicle", "person"))
+        expanded["deliveredRevision"] = 1
+        before_image = self.db.upsert_interval(expanded)
+        self.assertEqual(before_image["metadata"]["detectedThumbnails"], [])
+        with_image = self.db.upsert_interval(expanded, Thumbnail(JPEG, row["start"] + 2500))
+        self.assertEqual(len(with_image["metadata"]["detectedThumbnails"]), 2)
+        self.assertEqual(value('SELECT to_json(count(*)) FROM "smartDetectObjects" WHERE "thumbnailId" IS NOT NULL;'), 2)
+        execute('UPDATE events SET "deletedAt"=CURRENT_TIMESTAMP;')
+        before = self.counts()
+        with self.assertRaises(RetiredEventError):
+            self.db.upsert_interval(expanded)
+        self.assertEqual(self.counts(), before)
+        execute('DELETE FROM events;')
+        before = self.counts()
+        with self.assertRaises(RetiredEventError):
+            self.db.upsert_interval(expanded, Thumbnail(JPEG, row["start"]))
+        self.assertEqual(self.counts(), before)
 
     def test_audio_event_search_graph_retry_and_retirement(self):
         row = interval(classes=["babyCry"])

@@ -10,6 +10,11 @@ origin is recorded as camera, external model or mixed; this service still runs
 no image inference. Omitting the `frigate` configuration retains the original
 Reolink collection path for every camera.
 
+Version 1.5 can additionally publish [multiple simultaneous visual types in one
+event](docs/visual-event-groups.md). This optional, bounded grouping preserves
+each class's real time intervals and search labels; it does not alter video
+recording or combine audio with visual detections.
+
 This implementation is pinned to **Protect 7.3.70** and its shipped UI **7.3.26**. It uses private console internals because Protect's published integration API does not provide Smart Detection ingestion. A version/schema mismatch stops native delivery while the source journal keeps collecting; applying the frontend patch additionally requires the exact known UI hashes. Supporting another Protect release requires inspecting and testing that release.
 
 ## Data flow

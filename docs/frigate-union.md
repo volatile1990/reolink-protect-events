@@ -113,7 +113,10 @@ Reolink collection continues and only that source expires.
 
 The output covers the temporal union of each camera/class's source intervals.
 A Reolink clear cannot close a still-active Frigate detection, or conversely.
-Different classes and separated time intervals remain separate. A brief
+Different classes and separated time intervals remain separate in the source
+fusion. The optional [visual publication grouping](visual-event-groups.md) can
+combine genuinely overlapping visual classes into one bounded Protect event
+while preserving these independent source intervals. A brief
 finalization delay gives the other poll time to discover an overlapping event;
 the actual source end is retained. Source interval details remain in SQLite;
 native provenance includes up to 16 contributing intervals and their total

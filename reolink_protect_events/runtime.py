@@ -48,6 +48,19 @@ def source_classes(event):
         RAW_CLASSES[x.strip().lower()] for x in raw if isinstance(x, str) and x.strip().lower() in RAW_CLASSES}
 
 
+def grouping_settings(config):
+    """Explicit opt-in, bounded visual presentation; audio stays independent."""
+    value = config.get("eventGrouping")
+    if value is None:
+        return {"enabled": False, "maxSpanSeconds": 120}
+    if not isinstance(value, dict) or set(value) - {"enabled", "maxSpanSeconds"}:
+        raise ValueError("invalid_event_grouping")
+    enabled, span = value.get("enabled", False), value.get("maxSpanSeconds", 120)
+    if type(enabled) is not bool or type(span) is not int or not 30 <= span <= 300:
+        raise ValueError("invalid_event_grouping")
+    return {"enabled": enabled, "maxSpanSeconds": span}
+
+
 def validate_config(config):
     if not isinstance(config, dict) or not isinstance(config.get("bridges"), list) or not config["bridges"]:
         raise ValueError("invalid_config")
@@ -76,6 +89,7 @@ def validate_config(config):
     settings(config)
     from .frigate import settings as frigate_settings
     frigate_settings(config)
+    grouping_settings(config)
     return config
 
 
@@ -151,6 +165,8 @@ class Journal:
         CREATE INDEX IF NOT EXISTS media_pending ON media(next_attempt,last_attempt) WHERE done=0 AND attempts<20;
         """)
         self.fusion = None
+        from .visual_groups import VisualGroups
+        self.visual_groups = VisualGroups(self, (), {"enabled": False, "maxSpanSeconds": 120})
 
     def enable_fusion(self, cameras, options):
         from .fusion import Fusion
@@ -293,15 +309,29 @@ class Journal:
             self.fusion.expire(now_ms, replaying_cameras)
 
     def pending(self):
-        rows = self.db.execute("SELECT i.id,i.camera,i.class,i.start,i.end,i.provenance,i.revision,i.delivered_revision,i.notified_revision FROM intervals i LEFT JOIN delivery_failures f ON f.event_id=i.id WHERE (i.delivered_revision<i.revision OR i.notified_revision<i.revision) AND COALESCE(f.next_attempt,0)<=? ORDER BY i.start LIMIT 16", (int(time.time() * 1000),)).fetchall()
-        return [{"eventId": r[0], "cameraId": r[1], "classes": [r[2]], "start": r[3], "end": r[4],
+        # The native outbox owns a separate SQLite connection. Enroll before its
+        # SELECT under the SAME writer lock: a newly committed source must not
+        # race between enrollment and this publication snapshot as a legacy row.
+        try:
+            with self.db:
+                if not self.db.in_transaction:
+                    self.db.execute("BEGIN IMMEDIATE")
+                self.visual_groups.sync(int(time.time() * 1000))
+                rows = self.db.execute("SELECT i.id,i.camera,i.class,i.start,i.end,i.provenance,i.revision,i.delivered_revision,i.notified_revision,i.classes FROM publication_intervals i LEFT JOIN delivery_failures f ON f.event_id=i.id WHERE (i.delivered_revision<i.revision OR i.notified_revision<i.revision) AND COALESCE(f.next_attempt,0)<=? ORDER BY i.start LIMIT 16", (int(time.time() * 1000),)).fetchall()
+        except Exception:
+            self.visual_groups.invalidate()
+            raise
+        return [{"eventId": r[0], "cameraId": r[1], "classes": json.loads(r[9]) if r[9] else [r[2]], "start": r[3], "end": r[4],
                  "provenance": json.loads(r[5]), "revision": r[6], "deliveredRevision": r[7], "notifiedRevision": r[8]} for r in rows]
+
+    def publication_table(self, event_id):
+        return "visual_groups" if self.db.execute("SELECT 1 FROM visual_groups WHERE id=?", (event_id,)).fetchone() else "intervals"
 
     def acknowledge(self, event_id, revision, stage):
         if stage not in ("delivered", "notified"):
             raise ValueError("invalid_delivery_stage")
         with self.db:
-            self.db.execute("UPDATE intervals SET " + stage + "_revision=MAX(" + stage + "_revision,?) WHERE id=?", (revision, event_id))
+            self.db.execute("UPDATE " + self.publication_table(event_id) + " SET " + stage + "_revision=MAX(" + stage + "_revision,?) WHERE id=?", (revision, event_id))
             if stage == "notified":
                 self.db.execute("DELETE FROM delivery_failures WHERE event_id=?", (event_id,))
 
@@ -314,23 +344,24 @@ class Journal:
 
     def health(self):
         counters = dict(self.db.execute("SELECT name,value FROM counters"))
-        oldest = self.db.execute("SELECT MIN(start) FROM intervals WHERE delivered_revision<revision OR notified_revision<revision").fetchone()[0]
+        oldest = self.db.execute("SELECT MIN(start) FROM publication_intervals WHERE delivered_revision<revision OR notified_revision<revision").fetchone()[0]
         return {"counters": counters,
                 "lastNativeDeliveryMs": counters.get("lastNativeDeliveryMs"),
                 "oldestPendingStartMs": oldest,
                 "oldestPendingAgeMs": max(0, int(time.time() * 1000) - oldest) if oldest is not None else 0,
-                "pending": self.db.execute("SELECT COUNT(*) FROM intervals WHERE delivered_revision<revision OR notified_revision<revision").fetchone()[0],
-                "openIntervals": self.db.execute("SELECT COUNT(*) FROM intervals WHERE end IS NULL").fetchone()[0],
-                "pendingThumbnails": self.db.execute("SELECT COUNT(*) FROM media WHERE done=0 AND attempts<20").fetchone()[0],
-                "failedThumbnails": self.db.execute("SELECT COUNT(*) FROM media WHERE done=0 AND attempts>=20").fetchone()[0],
+                "pending": self.db.execute("SELECT COUNT(*) FROM publication_intervals WHERE delivered_revision<revision OR notified_revision<revision").fetchone()[0],
+                "openIntervals": self.db.execute("SELECT COUNT(*) FROM publication_intervals WHERE end IS NULL").fetchone()[0],
+                "pendingThumbnails": self.db.execute("SELECT COUNT(*) FROM media m JOIN publication_intervals i ON i.id=m.event_id WHERE m.done=0 AND m.attempts<20").fetchone()[0],
+                "failedThumbnails": self.db.execute("SELECT COUNT(*) FROM media m JOIN publication_intervals i ON i.id=m.event_id WHERE m.done=0 AND m.attempts>=20").fetchone()[0],
                 "retryIntervals": self.db.execute("SELECT COUNT(*) FROM delivery_failures").fetchone()[0],
                 "sourceRows": self.db.execute("SELECT COUNT(*) FROM sources").fetchone()[0],
-                "thumbnailErrorReasons": dict(self.db.execute("SELECT COALESCE(error_reason,'unknown'),COUNT(*) FROM media WHERE done=0 AND error_reason IS NOT NULL GROUP BY error_reason"))}
+                "thumbnailErrorReasons": dict(self.db.execute("SELECT COALESCE(m.error_reason,'unknown'),COUNT(*) FROM media m JOIN publication_intervals i ON i.id=m.event_id WHERE m.done=0 AND m.error_reason IS NOT NULL GROUP BY m.error_reason")),
+                "visualGroups": self.db.execute("SELECT COUNT(*) FROM visual_groups").fetchone()[0]}
 
     def pending_media(self, now_ms):
-        rows = self.db.execute("SELECT i.id,i.camera,i.class,i.start,i.end,i.provenance,i.delivered_revision FROM media m JOIN intervals i ON i.id=m.event_id WHERE m.done=0 AND m.attempts<20 AND m.next_attempt<=? AND m.last_attempt<? AND i.start<? AND i.delivered_revision=i.revision ORDER BY i.start LIMIT 1",
+        rows = self.db.execute("SELECT i.id,i.camera,i.class,i.start,i.end,i.provenance,i.delivered_revision,i.classes FROM media m JOIN publication_intervals i ON i.id=m.event_id WHERE m.done=0 AND m.attempts<20 AND m.next_attempt<=? AND m.last_attempt<? AND i.start<? AND i.delivered_revision=i.revision ORDER BY i.start LIMIT 1",
                                (now_ms, now_ms - 15000, now_ms - 1500)).fetchall()
-        return [{"eventId": r[0], "cameraId": r[1], "classes": [r[2]], "start": r[3], "end": r[4], "provenance": json.loads(r[5]), "deliveredRevision": r[6]} for r in rows]
+        return [{"eventId": r[0], "cameraId": r[1], "classes": json.loads(r[7]) if r[7] else [r[2]], "start": r[3], "end": r[4], "provenance": json.loads(r[5]), "deliveredRevision": r[6]} for r in rows]
 
     def media_attempt(self, event_id, now_ms, success, error_reason=None):
         with self.db:
@@ -345,19 +376,20 @@ class Journal:
             self.db.execute("UPDATE media SET next_attempt=? WHERE event_id=? AND done=0", (ready_at, event_id))
 
     def media_interval(self, event_id):
-        row = self.db.execute("SELECT id,camera,class,start,end,provenance,delivered_revision,revision FROM intervals WHERE id=?", (event_id,)).fetchone()
-        return {"eventId": row[0], "cameraId": row[1], "classes": [row[2]], "start": row[3], "end": row[4],
+        row = self.db.execute("SELECT id,camera,class,start,end,provenance,delivered_revision,revision,classes FROM publication_intervals WHERE id=?", (event_id,)).fetchone()
+        return {"eventId": row[0], "cameraId": row[1], "classes": json.loads(row[8]) if row[8] else [row[2]], "start": row[3], "end": row[4],
                 "provenance": json.loads(row[5]), "deliveredRevision": row[6], "revision": row[7]} if row else None
 
     def media_selection(self, event_id, selection):
         # Preserve source/classification fields. Pin before the native write so
         # a crash after its commit cannot silently choose another sample time.
         with self.db:
-            row = self.db.execute("SELECT provenance FROM intervals WHERE id=?", (event_id,)).fetchone()
+            table = self.publication_table(event_id)
+            row = self.db.execute("SELECT provenance FROM " + table + " WHERE id=?", (event_id,)).fetchone()
             if row:
                 provenance = json.loads(row[0])
                 provenance.setdefault("thumbnailSelection", selection)
-                self.db.execute("UPDATE intervals SET provenance=? WHERE id=?", (json.dumps(provenance), event_id))
+                self.db.execute("UPDATE " + table + " SET provenance=? WHERE id=?", (json.dumps(provenance), event_id))
                 self.db.execute("UPDATE media SET selection=? WHERE event_id=?", (json.dumps(provenance["thumbnailSelection"]), event_id))
                 return provenance["thumbnailSelection"]
         return selection
@@ -375,11 +407,12 @@ class Journal:
     def prune(self, now_ms, days=30):
         """The journal is separate from Protect retention; never resurrect delivered rows."""
         cutoff = now_ms - days * 86400000
+        self.visual_groups.prune(cutoff)
         with self.db:
             self.db.execute("DELETE FROM sources WHERE at<?", (cutoff,))
             self.db.execute("DELETE FROM intervals WHERE end<? AND delivered_revision=revision AND notified_revision=revision", (cutoff,))
-            self.db.execute("DELETE FROM media WHERE event_id NOT IN (SELECT id FROM intervals)")
-            self.db.execute("DELETE FROM delivery_failures WHERE event_id NOT IN (SELECT id FROM intervals)")
+            self.db.execute("DELETE FROM media WHERE event_id NOT IN (SELECT id FROM publication_intervals)")
+            self.db.execute("DELETE FROM delivery_failures WHERE event_id NOT IN (SELECT id FROM publication_intervals)")
         if self.fusion is not None:
             self.fusion.prune(cutoff)
         self.db.execute("PRAGMA wal_checkpoint(PASSIVE)")
@@ -396,6 +429,9 @@ class Runtime:
             self.journal.enable_fusion(self.frigate_config["cameraMap"].values(), self.frigate_config)
         from .fusion import Fusion
         Fusion.deactivate_unmapped(self.journal, self.frigate_config["cameraMap"].values() if self.frigate_config is not None else ())
+        from .visual_groups import VisualGroups
+        self.journal.visual_groups = VisualGroups(self.journal,
+            [bridge["cameraId"] for bridge in config["bridges"]], grouping_settings(config))
         self.frigate_health = {}
         self._frigate_last_poll = {}
         self.capture_only = capture_only
@@ -709,6 +745,7 @@ class Runtime:
         self.journal.expire(now_ms, replaying)
         if self.journal.fusion is not None:
             self.journal.fusion.sync(now_ms)
+        self.journal.visual_groups.sync(now_ms)
         if self._native_thread is None:
             if not self.capture_only:
                 self.check_native()

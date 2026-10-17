@@ -41,6 +41,18 @@ def adapter(execute=None, version="7.3.70"):
 JPEG = bytes.fromhex("ffd8ffc00011080018002003011100021100031100ffda0008010100003f0000ffd9")
 
 
+def visual_group(classes=("vehicle",), end=None):
+    row = copy.deepcopy(INTERVAL)
+    row.update(classes=list(classes), end=end)
+    row["provenance"] = {"sourceUnionVersion": 1, "identityStart": START,
+        "sourceTypes": ["reolink"], "visualGroupVersion": 1, "groupIdentityStart": START,
+        "activationMs": START - 1000, "groupMaxSpanMs": 120000,
+        "classIntervalsComplete": True,
+        "classIntervals": {kind: [{"start": START + (500 if kind == "person" else 0), "end": end}]
+                           for kind in classes}}
+    return row
+
+
 class NativeContractTests(unittest.TestCase):
     @staticmethod
     def decoded_json(sql):
@@ -199,6 +211,57 @@ class NativeContractTests(unittest.TestCase):
         self.assertEqual(sql.count('INSERT INTO "smartDetectObjects"'), 3)
         self.assertEqual(sql.count('INSERT INTO "detectionLabels"'), 4)
         self.assertEqual(sql.count('INSERT INTO "smartDetectTracks"'), 1)
+
+    def test_visual_group_expansion_is_scoped_and_uses_real_class_times(self):
+        row = visual_group(("vehicle", "person"))
+        sql, event = adapter().build_interval_sql(row)
+        self.assertEqual(event["smartDetectTypes"], ["person", "vehicle"])
+        self.assertIn('"smartDetectTypes"=EXCLUDED."smartDetectTypes"', sql)
+        self.assertIn('"smartDetectTypes"::jsonb <@', sql)
+        for key in ("visualGroupVersion", "groupIdentityStart", "activationMs", "groupMaxSpanMs"):
+            self.assertIn(sql_text(key), sql)
+        self.assertIn(",%d,(SELECT \"thumbnailFullfovId\"" % (START + 500), sql)
+        self.assertIn(",%d,(SELECT \"thumbnailFullfovId\"" % START, sql)
+        self.assertIn("'clockBestWall',t.timestamp", sql)
+        self.assertIn("pixel.timestamp=(item->>'clockBestWall')::bigint", sql)
+        self.assertIn('"thumbnailId"=EXCLUDED."thumbnailId"', sql)
+        self.assertNotIn("'clockBestWall',%d" % (START + 500), sql)
+        self.assertEqual(event["metadata"]["detectedThumbnails"], [])
+        ordinary_sql, _ = adapter().build_interval_sql(INTERVAL)
+        self.assertIn('"smartDetectTypes"::jsonb IS DISTINCT FROM', ordinary_sql)
+        self.assertNotIn('"smartDetectTypes"=EXCLUDED."smartDetectTypes"', ordinary_sql)
+
+    def test_visual_group_rejects_incomplete_unclipped_or_unsupported_protocol(self):
+        changes = [{"visualGroupVersion": True}, {"visualGroupVersion": 2},
+                   {"sourceUnionVersion": 0}, {"classIntervalsComplete": False},
+                   {"classIntervals": {}}, {"groupIdentityStart": START + 1},
+                   {"activationMs": START + 1}, {"groupMaxSpanMs": 300001},
+                   {"classIntervals": {"vehicle": [{"start": START - 1, "end": None}]}},
+                   {"classIntervals": {"vehicle": [{"start": START, "end": START}]}},
+                   {"classIntervals": {"vehicle": [{"start": START, "end": START + 120001}]}},
+                   {"classIntervals": {"vehicle": [{"start": START, "end": START + 2000},
+                                                     {"start": START + 1000, "end": None}]}}]
+        for change in changes:
+            row = visual_group()
+            row["provenance"].update(change)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                adapter().build_interval_sql(row)
+        for row in (visual_group(end=START + 120001),
+                    dict(visual_group(), end=START + 1000),
+                    visual_group(("babyCry",))):
+            with self.subTest(row=row), self.assertRaises(ValueError):
+                adapter().build_interval_sql(row)
+
+    def test_visual_group_thumbnail_keeps_pixel_time_distinct_from_detection_time(self):
+        row = visual_group(("person", "vehicle"), end=START + 3000)
+        _, event = adapter().build_interval_sql(row, Thumbnail(JPEG, START + 250))
+        self.assertEqual([thumb["type"] for thumb in event["metadata"]["detectedThumbnails"]], ["vehicle"])
+        self.assertEqual({thumb["clockBestWall"] for thumb in event["metadata"]["detectedThumbnails"]},
+                         {START + 250})
+        self.assertEqual(event["metadata"]["reolinkProtectEvents"]["provenance"]["classIntervals"]["person"][0]["start"],
+                         START + 500)
+        _, event = adapter().build_interval_sql(row, Thumbnail(JPEG, START + 750))
+        self.assertEqual({thumb["type"] for thumb in event["metadata"]["detectedThumbnails"]}, {"person", "vehicle"})
 
     def test_closed_interval_and_source_time_retained(self):
         interval = dict(INTERVAL, end=START + 12000)

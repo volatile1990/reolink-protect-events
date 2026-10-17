@@ -26,9 +26,26 @@ def main():
     parser.add_argument('--host', default='unifi-dream-machine')
     parser.add_argument('--dependency-cache', type=Path)
     parser.add_argument('--expected-digest', help='Required current deployment digest for rollback')
+    parser.add_argument('--events-only', action='store_true',
+                        help='Install only the Events service; preserve the media monitor and thumbnail settings')
+    parser.add_argument('--group-visual-events', action='store_true',
+                        help='Enable visual event grouping during an Events-only installation')
+    parser.add_argument('--group-max-span-seconds', type=int, default=120)
     args = parser.parse_args()
+    if args.events_only and args.mode != 'install':
+        parser.error('--events-only requires install')
+    if args.group_visual_events and not args.events_only:
+        parser.error('--group-visual-events requires --events-only')
+    if not 30 <= args.group_max_span_seconds <= 300:
+        parser.error('--group-max-span-seconds must be between 30 and 300')
+    if args.group_max_span_seconds != 120 and not args.group_visual_events:
+        parser.error('--group-max-span-seconds requires --group-visual-events')
     owner = uuid.uuid4().hex
     request = {'mode': args.mode}
+    if args.mode == 'install':
+        request['eventsOnly'] = args.events_only
+    if args.group_visual_events:
+        request['eventGrouping'] = {'enabled': True, 'maxSpanSeconds': args.group_max_span_seconds}
     if args.mode == 'rollback':
         if not args.expected_digest:
             parser.error('Rollback requires the expected current deployment digest')
@@ -38,11 +55,30 @@ def main():
         request.update(package=base64.b64encode(data).decode(), digest=manifest['packageSha256'], owner=owner)
         if not invoke(ROOT, args.host, {'action': 'installer', 'request': {'mode': 'maintenance', 'owner': owner, 'enable': True}}).get('ok'):
             raise RuntimeError('maintenance_failed')
+    value = None
     try:
         value = invoke(ROOT, args.host, {'action': 'installer', 'request': request}, timeout=300)
+    except Exception as error:
+        if not args.events_only:
+            raise
+        value = {'ok': False, 'errorCode': 'deployment_failed', 'errorType': type(error).__name__}
     finally:
         if args.mode in ('install', 'capture'):
-            invoke(ROOT, args.host, {'action': 'installer', 'request': {'mode': 'maintenance', 'owner': owner, 'enable': False}})
+            verified = value is not None and (value.get('ok') is True
+                or value.get('recovery', {}).get('healthy') is True)
+            if not args.events_only or verified:
+                try:
+                    released = invoke(ROOT, args.host, {'action': 'installer', 'request': {
+                        'mode': 'maintenance', 'owner': owner, 'enable': False}})
+                    if args.events_only and not released.get('ok'):
+                        raise RuntimeError('maintenance_release_failed')
+                except Exception:
+                    if not args.events_only:
+                        raise
+                    value.update(ok=False, errorCode='maintenance_release_failed',
+                                 maintenanceRetained=True, maintenanceOwner=owner)
+            else:
+                value.update(maintenanceRetained=True, maintenanceOwner=owner)
     print(json.dumps(value))
     return 0 if value.get('ok') else 1
 
