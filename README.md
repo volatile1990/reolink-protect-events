@@ -15,6 +15,12 @@ event](docs/visual-event-groups.md). This optional, bounded grouping preserves
 each class's real time intervals and search labels; it does not alter video
 recording or combine audio with visual detections.
 
+Version 1.5.4 keeps the same publication and thumbnail contracts while joining
+filtered media candidates directly to the legacy and group tables. This avoids
+rebuilding the full `publication_intervals` view on SQLite 3.34 for each media
+poll and thumbnail status count. Source history, manual groups, audio events,
+retry deadlines, notification rules and polling intervals remain unchanged.
+
 This implementation is pinned to **Protect 7.3.70** and its shipped UI **7.3.26**. It uses private console internals because Protect's published integration API does not provide Smart Detection ingestion. A version/schema mismatch stops native delivery while the source journal keeps collecting; applying the frontend patch additionally requires the exact known UI hashes. Supporting another Protect release requires inspecting and testing that release.
 
 ## Data flow

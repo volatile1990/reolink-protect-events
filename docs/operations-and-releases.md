@@ -73,6 +73,20 @@ they were. The active configuration must already match the verified camera
 mapping. The regular installer retains its existing monitor installation and
 automatic-thumbnail defaults.
 
+The low-level installer can separately pin a pre-existing six-camera Frigate
+`ConnectionRefusedError` outage through `existingFrigateFailure`. This requires
+Events-only scope without a monitor, grouping or startup-options change, current
+configuration/deployment digests, and a server-validated failure fingerprint.
+After restart, all six Reolink sources must have fresh successful polls, native
+delivery must be ready, the outbox must be empty, and error counters must remain
+unchanged. The result explicitly reports
+`deploymentAcceptance: events-native-ready-existing-frigate-failure`; overall
+`health.healthy` stays false. The ordinary installer and CLI still require full
+health. This option neither starts Frigate nor clears its NAS protection latch.
+Rollback of such a release requires an explicit low-level `owner` and that
+owner's current maintenance lease, in addition to the current package digest.
+Events-only writes and rollback check all owned files and the lease throughout.
+
 For changes to the owned media monitor as well, explicitly add `--update-monitor`
 to this Events-only installation. That backs up, replaces and restarts both owned
 units from the same release while preserving thumbnail settings and the live
