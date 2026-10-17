@@ -198,6 +198,32 @@ class ScopedInstallerTests(unittest.TestCase):
             database.execute('CREATE TABLE IF NOT EXISTS visual_group_members(id INTEGER)')
             database.execute('INSERT INTO visual_group_members VALUES(22)')
 
+    def enroll_manual_group(self):
+        with closing(sqlite3.connect(self.root / 'journal.sqlite3')) as database, database:
+            database.execute('CREATE TABLE IF NOT EXISTS visual_group_manual(group_id TEXT PRIMARY KEY)')
+            database.execute("INSERT INTO visual_group_manual VALUES('historical-parcel')")
+
+    def set_package_manual_capability(self):
+        module = self.members['reolink_protect_events/visual_groups.py'] + b'MANUAL_GROUP_SCHEMA_VERSION = 1\n'
+        self.members['reolink_protect_events/visual_groups.py'] = module
+        self.manifest['members'][0]['sha256'] = hashlib.sha256(module).hexdigest()
+        self.members['reolink_protect_events/release.json'] = json.dumps(self.manifest).encode()
+
+    def rollback_target(self, manual=False):
+        release = Path(self.prior['release']) / 'reolink_protect_events'
+        release.mkdir(parents=True)
+        module = b'"""Verified previous projection runtime."""\n'
+        if manual:
+            module += b'MANUAL_GROUP_SCHEMA_VERSION = 1\n'
+        (release / 'visual_groups.py').write_bytes(module)
+        (release / 'release.json').write_text(json.dumps({'members': [
+            {'path': 'reolink_protect_events/visual_groups.py', 'sha256': hashlib.sha256(module).hexdigest()}]}))
+        target = dict(self.prior, visualGroupCompatible=True, version='1.5.1' if manual else '1.5.0')
+        backup = Path(self.prior['backup'])
+        backup.mkdir(parents=True)
+        (backup / 'deployment.json').write_text(json.dumps(target))
+        return target, backup
+
     def monitor_commands(self):
         return [args for args in self.calls if isinstance(args, tuple) and len(args) > 2
                 and args[0] == 'systemctl' and args[-1] == self.monitor.name]
@@ -302,6 +328,74 @@ class ScopedInstallerTests(unittest.TestCase):
         self.assertEqual(self.unit.read_bytes(), b'previous native unit')
         self.assertEqual(self.monitor_commands(), [])
         self.assertIn(('systemctl', 'start', self.unit.name), self.calls)
+
+    def test_manual_snapshot_blocks_rollback_to_verified_automatic_only_runtime(self):
+        self.enroll_manual_group()
+        target, backup = self.rollback_target()
+        self.assertTrue(self.installer.supports_visual_groups(target))
+        self.assertFalse(self.installer.supports_manual_groups(target))
+        with self.assertRaisesRegex(RuntimeError, '^legacy_manual_grouping_rollback_blocked$'):
+            self.installer.execute({'mode': 'rollback', 'expectedDigest': 'prior-digest'})
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.unit.read_bytes(), b'previous native unit')
+
+    def test_manual_snapshot_rollback_requires_manifest_verified_explicit_capability(self):
+        self.enroll_manual_group()
+        target, backup = self.rollback_target(manual=True)
+        self.assertTrue(self.installer.supports_manual_groups(target))
+        self.installer.guard_rollback(backup)
+        module = Path(target['release']) / 'reolink_protect_events' / 'visual_groups.py'
+        module.write_bytes(module.read_bytes() + b'# changed after release verification\n')
+        self.assertFalse(self.installer.supports_manual_groups(target))
+        with self.assertRaisesRegex(RuntimeError, '^legacy_manual_grouping_rollback_blocked$'):
+            self.installer.guard_rollback(backup)
+
+    def test_install_cannot_replace_manual_runtime_with_automatic_only_package(self):
+        self.enroll_manual_group()
+        with self.assertRaisesRegex(RuntimeError, '^manual_grouping_runtime_missing$'):
+            self.installer.execute(self.request())
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.unit.read_bytes(), b'previous native unit')
+
+    def test_failure_after_manual_snapshot_retains_manual_compatible_runtime(self):
+        self.set_package_manual_capability()
+        starts = []
+        def fail_first_start(args):
+            if args == ['systemctl', 'start', self.unit.name]:
+                starts.append(args)
+                if len(starts) == 1:
+                    self.enroll_manual_group()
+                    raise RuntimeError('synthetic_start_failure')
+        self.run_hook = fail_first_start
+        result = self.installer.execute(self.request(eventGrouping={'enabled': True, 'maxSpanSeconds': 90}))
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['errorCode'], 'legacy_manual_grouping_rollback_blocked')
+        self.assertTrue(result['recovery']['compatibleRuntimeRetained'])
+        self.assertTrue(result['recovery']['healthy'])
+        deployed = json.loads((self.root / 'deployment.json').read_text())
+        self.assertEqual(deployed['recoveryReason'], 'legacy_manual_grouping_rollback_blocked')
+        self.assertTrue(self.installer.supports_manual_groups(deployed))
+        self.assertFalse(json.loads((self.root / 'config.json').read_text())['eventGrouping']['enabled'])
+        self.assertEqual(self.monitor_commands(), [])
+
+    def test_manual_capability_is_a_single_explicit_module_integer(self):
+        self.assertTrue(self.installer.manual_group_module(b'MANUAL_GROUP_SCHEMA_VERSION = 1\n'))
+        for content in (b'# MANUAL_GROUP_SCHEMA_VERSION = 1\n',
+                        b'MANUAL_GROUP_SCHEMA_VERSION = True\n',
+                        b'MANUAL_GROUP_SCHEMA_VERSION = 1\nMANUAL_GROUP_SCHEMA_VERSION = 0\n',
+                        b'def fixture():\n    MANUAL_GROUP_SCHEMA_VERSION = 1\n'):
+            with self.subTest(content=content):
+                self.assertFalse(self.installer.manual_group_module(content))
+
+    def test_recovery_never_claims_automatic_only_runtime_can_service_manual_rows(self):
+        def fail_after_new_manual_row(args):
+            if args == ['systemctl', 'start', self.unit.name]:
+                self.enroll_manual_group()
+                raise RuntimeError('synthetic_start_failure')
+        self.run_hook = fail_after_new_manual_row
+        with self.assertRaisesRegex(RuntimeError, '^compatible_manual_recovery_runtime_missing$'):
+            self.installer.execute(self.request())
+        self.assertEqual(self.monitor_commands(), [])
 
     def test_events_only_requests_and_grouping_bounds_are_validated_before_staging(self):
         invalid = [self.request(eventsOnly='true'), self.request(eventsOnly=True, mode='capture'),

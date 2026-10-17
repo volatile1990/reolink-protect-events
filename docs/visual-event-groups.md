@@ -69,6 +69,36 @@ the compatible runtime and set `eventGrouping.enabled` to false. Existing
 enrolled groups still finish and deliver their pending revisions. Do not restore
 an old journal or remove enrollment rows as a routine rollback.
 
+## Explicit historical merge
+
+Version 1.5.1 also supports immutable, explicitly requested historical groups.
+They have an operation ID, exact source IDs and digest in `visual_group_manual`
+and are excluded from automatic reprocessing. This does not lower the global
+activation boundary or reset original source acknowledgments.
+
+The guarded historical-pair writer retains the vehicle event ID and its real
+preview, object and track IDs. It accepts only a complete snapshot of two closed,
+unlocked, unfavorited, owned events with genuinely overlapping person/vehicle
+intervals. It locks and checks the event and graph snapshots again, changes the
+retained event to the validated multi-type contract, writes the complete graph,
+then removes only the replaced person event within the same PostgreSQL
+transaction. No video or recording table is modified. Private graph/image and
+consistent journal backups are required before applying an operation.
+
+The coordinating operator tool pauses only Events while adding the explicit
+manual journal membership and performing that bounded native transaction. It
+keeps the current journal, source rows, cursor tables, selected pixels and global
+configuration. The group starts with a nonzero notification revision so its
+delivery is a historical update, not a new event-start alarm. Resume decisions
+use the durable operation receipt and actual native state after uncertain
+responses; the guarded pair transaction itself must not be blindly replayed.
+
+After manual groups exist, rollback and direct installation also require the
+verified manual-group schema capability. An older automatic-only 1.5.0 runtime
+is not a compatible target. Normal automatic grouping and retention continue for
+other events; original manual-member data is retained until the whole group can
+be safely pruned.
+
 Meaningful release checks include the actual delivery replay, live type
 expansion, two independent SQLite connections, media/acknowledgment/retry routes,
 class times, long-track partitions, late history, retention and favorite guards,

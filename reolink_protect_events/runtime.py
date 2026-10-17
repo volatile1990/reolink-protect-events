@@ -410,9 +410,9 @@ class Journal:
         self.visual_groups.prune(cutoff)
         with self.db:
             self.db.execute("DELETE FROM sources WHERE at<?", (cutoff,))
-            self.db.execute("DELETE FROM intervals WHERE end<? AND delivered_revision=revision AND notified_revision=revision", (cutoff,))
-            self.db.execute("DELETE FROM media WHERE event_id NOT IN (SELECT id FROM publication_intervals)")
-            self.db.execute("DELETE FROM delivery_failures WHERE event_id NOT IN (SELECT id FROM publication_intervals)")
+            self.db.execute("DELETE FROM intervals WHERE end<? AND delivered_revision=revision AND notified_revision=revision AND id NOT IN (SELECT interval_id FROM visual_group_members)", (cutoff,))
+            self.db.execute("DELETE FROM media WHERE event_id NOT IN (SELECT id FROM intervals UNION ALL SELECT id FROM visual_groups)")
+            self.db.execute("DELETE FROM delivery_failures WHERE event_id NOT IN (SELECT id FROM intervals UNION ALL SELECT id FROM visual_groups)")
         if self.fusion is not None:
             self.fusion.prune(cutoff)
         self.db.execute("PRAGMA wal_checkpoint(PASSIVE)")

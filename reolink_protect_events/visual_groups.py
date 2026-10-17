@@ -10,6 +10,17 @@ import time
 
 
 VISUAL_CLASSES = frozenset(("person", "vehicle", "animal"))
+MANUAL_GROUP_SCHEMA_VERSION = 1
+
+# Explicit historical snapshots are owned by their bounded administrative
+# operation. A source shared with an ordinary group remains in the ordinary
+# lifecycle; an exclusively manual source must never be clipped by activation
+# or reconsidered by the automatic grouper.
+_AUTOMATIC_MEMBER = """NOT (
+  EXISTS(SELECT 1 FROM visual_group_segments s JOIN visual_group_manual m ON m.group_id=s.group_id
+         WHERE s.interval_id=i.id)
+  AND NOT EXISTS(SELECT 1 FROM visual_group_segments s LEFT JOIN visual_group_manual m ON m.group_id=s.group_id
+                 WHERE s.interval_id=i.id AND m.group_id IS NULL))"""
 
 
 def _json(value):
@@ -57,6 +68,8 @@ class VisualGroups:
         CREATE TABLE IF NOT EXISTS visual_group_members(interval_id TEXT PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS visual_group_segments(group_id TEXT NOT NULL,interval_id TEXT NOT NULL,
           PRIMARY KEY(group_id,interval_id));
+        CREATE TABLE IF NOT EXISTS visual_group_manual(group_id TEXT PRIMARY KEY,operation_id TEXT UNIQUE,
+          source_ids TEXT,digest TEXT);
         CREATE INDEX IF NOT EXISTS visual_groups_camera ON visual_groups(camera,start);
         CREATE INDEX IF NOT EXISTS visual_group_segments_interval ON visual_group_segments(interval_id);
         CREATE VIEW IF NOT EXISTS publication_intervals AS
@@ -145,7 +158,8 @@ class VisualGroups:
                     self.db.execute("INSERT OR IGNORE INTO visual_group_members VALUES(?)", (identifier,))
         signatures = {}
         for row in self.db.execute("SELECT i.id,i.camera,i.class,i.start,i.end,i.last_seen,i.revision "
-                                   "FROM intervals i JOIN visual_group_members m ON m.interval_id=i.id ORDER BY i.id"):
+                                   "FROM intervals i JOIN visual_group_members m ON m.interval_id=i.id "
+                                   "WHERE " + _AUTOMATIC_MEMBER + " ORDER BY i.id"):
             signatures.setdefault(row[1], []).append(row)
         signatures = {camera: tuple(values) for camera, values in signatures.items()}
         dirty = {camera for camera in set(signatures) | set(self._camera_signatures)
@@ -158,19 +172,21 @@ class VisualGroups:
         parameters = tuple(sorted(dirty))
         rows = self.db.execute("SELECT i.id,i.camera,i.class,i.start,i.end,i.last_seen,i.provenance "
                                "FROM intervals i JOIN visual_group_members m ON m.interval_id=i.id "
-                               "WHERE i.camera IN (" + marks + ") ORDER BY i.start,i.id", parameters).fetchall()
+                               "WHERE i.camera IN (" + marks + ") AND " + _AUTOMATIC_MEMBER + " ORDER BY i.start,i.id", parameters).fetchall()
         sources = {}
         for row in rows:
             meta = json.loads(row[6])
             ranges = self._ranges(row, meta)
             sources[row[0]] = {"row": row, "meta": meta,
                                "ranges": _clip(ranges, self.activation_ms, None)}
-        old_rows = self.db.execute("SELECT id,camera,start,end,last_seen,provenance,classes FROM visual_groups "
-                                   "WHERE camera IN (" + marks + ") ORDER BY start,id", parameters).fetchall()
+        old_rows = self.db.execute("SELECT g.id,g.camera,g.start,g.end,g.last_seen,g.provenance,g.classes FROM visual_groups g "
+                                   "WHERE g.camera IN (" + marks + ") AND NOT EXISTS "
+                                   "(SELECT 1 FROM visual_group_manual m WHERE m.group_id=g.id) ORDER BY g.start,g.id", parameters).fetchall()
         old = {row[0]: {"row": row, "meta": json.loads(row[5])} for row in old_rows}
         links = {}
         for group, identifier in self.db.execute("SELECT s.group_id,s.interval_id FROM visual_group_segments s "
-                                                 "JOIN visual_groups g ON g.id=s.group_id WHERE g.camera IN (" + marks + ")", parameters):
+                                                 "JOIN visual_groups g ON g.id=s.group_id WHERE g.camera IN (" + marks + ") "
+                                                 "AND NOT EXISTS(SELECT 1 FROM visual_group_manual m WHERE m.group_id=g.id)", parameters):
             links.setdefault(group, set()).add(identifier)
         groups_by_source = {}
         for group, identifiers in links.items():
@@ -252,7 +268,8 @@ class VisualGroups:
         for camera in dirty:
             due = [source["row"][3] for source in sources.values()
                    if source["row"][1] == camera and source["row"][3] > now]
-            for start, raw in self.db.execute("SELECT start,provenance FROM visual_groups WHERE camera=? AND end IS NULL", (camera,)):
+            for start, raw in self.db.execute("SELECT g.start,g.provenance FROM visual_groups g WHERE g.camera=? AND g.end IS NULL "
+                                              "AND NOT EXISTS(SELECT 1 FROM visual_group_manual m WHERE m.group_id=g.id)", (camera,)):
                 due.append(start + json.loads(raw)["groupMaxSpanMs"])
             if due:
                 self._next_due[camera] = min(due)
@@ -379,6 +396,7 @@ class VisualGroups:
                     break
                 candidates = safe_groups
             for group in candidates:
+                self.db.execute("DELETE FROM visual_group_manual WHERE group_id=?", (group,))
                 self.db.execute("DELETE FROM visual_groups WHERE id=?", (group,))
                 self.db.execute("DELETE FROM media WHERE event_id=?", (group,))
                 self.db.execute("DELETE FROM visual_group_segments WHERE group_id=?", (group,))

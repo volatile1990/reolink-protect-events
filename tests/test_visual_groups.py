@@ -1,4 +1,5 @@
 """Real SQLite contracts for additive, bounded visual publication groups."""
+import hashlib
 import json
 from pathlib import Path
 import tempfile
@@ -50,6 +51,33 @@ class VisualGroupTests(unittest.TestCase):
 
     def publication(self):
         return self.j.db.execute("SELECT id,class,classes FROM publication_intervals ORDER BY start,id").fetchall()
+
+    def manual_snapshot(self):
+        """Simulate the exact, separately authorized historical-operation write."""
+        self.add("old-vehicle", "vehicle", -120000, -50000, delivered=1, notified=1)
+        self.add("old-person", "person", -116000, -60000, delivered=1, notified=1,
+                 meta={"sourceTypes": ["frigate", "reolink"]})
+        members = ["old-person", "old-vehicle"]
+        meta = {"sourceUnionVersion": 1, "visualGroupVersion": 1,
+                "identityStart": START - 120000, "groupIdentityStart": START - 120000,
+                "activationMs": START - 120000, "groupMaxSpanMs": 120000,
+                "sourceTypes": ["frigate", "reolink"], "classIntervalsComplete": True,
+                "classIntervals": {"person": [{"start": START - 116000, "end": START - 60000}],
+                                   "vehicle": [{"start": START - 120000, "end": START - 50000}]},
+                "manualHistoricalMerge": {"operationId": "fixture-explicit-two-event-merge",
+                                          "memberIntervalIds": members},
+                "thumbnailSelection": {"selectedAtMs": START - 119000, "policy": "fixture"}}
+        encoded = json.dumps(meta, indent=1)
+        digest = hashlib.sha256(encoded.encode()).hexdigest()
+        with self.j.db:
+            self.j.db.execute("INSERT INTO visual_groups(id,camera,start,end,last_seen,provenance,classes,revision,delivered_revision,notified_revision) "
+                              "VALUES(?,?,?,?,?,?,?,2,1,1)", ("old-vehicle", CAMERA, START - 120000, START - 50000,
+                                                           START - 49000, encoded, '["person","vehicle"]'))
+            self.j.db.executemany("INSERT INTO visual_group_members(interval_id) VALUES(?)", [(member,) for member in members])
+            self.j.db.executemany("INSERT INTO visual_group_segments VALUES(?,?)", [("old-vehicle", member) for member in members])
+            self.j.db.execute("INSERT INTO visual_group_manual VALUES(?,?,?,?)",
+                              ("old-vehicle", "fixture-explicit-two-event-merge", json.dumps(members), digest))
+        return "old-vehicle"
 
     def test_parcel_person_car_one_group_with_exact_class_times_and_originals(self):
         self.add("car", "vehicle", 14445, 81785)
@@ -354,6 +382,48 @@ class VisualGroupTests(unittest.TestCase):
                         {"enabled": True, "maxSpanSeconds": 301}, {"enabled": True, "maxSpanSeconds": True}):
             with self.assertRaises(ValueError):
                 VisualGroups(self.j, (CAMERA,), options)
+
+    def test_explicit_manual_history_is_immutable_across_ack_restart_and_automatic_sync(self):
+        identifier = self.manual_snapshot()
+        original_sources = self.j.db.execute("SELECT * FROM intervals ORDER BY id").fetchall()
+        original_media = self.j.db.execute("SELECT * FROM media ORDER BY event_id").fetchall()
+        self.j.acknowledge(identifier, 2, "delivered")
+        self.j.acknowledge(identifier, 2, "notified")
+        snapshot = self.j.db.execute("SELECT * FROM visual_groups WHERE id=?", (identifier,)).fetchone()
+        manual = self.j.db.execute("SELECT * FROM visual_group_manual WHERE group_id=?", (identifier,)).fetchone()
+        self.sync()
+        self.assertEqual(self.groups._camera_signatures, {})
+        self.assertEqual(self.j.db.execute("SELECT * FROM visual_groups WHERE id=?", (identifier,)).fetchone(), snapshot)
+        self.j.close()
+        self.j = Journal(self.path)
+        self.groups = self.open_groups(cameras=(CAMERA, OTHER))
+        self.sync(40000)
+        self.assertEqual(self.groups.activation_ms, START)
+        self.assertEqual(self.j.db.execute("SELECT * FROM visual_groups WHERE id=?", (identifier,)).fetchone(), snapshot)
+        self.assertEqual(self.j.db.execute("SELECT * FROM visual_group_manual WHERE group_id=?", (identifier,)).fetchone(), manual)
+        self.assertEqual(self.j.db.execute("SELECT * FROM intervals ORDER BY id").fetchall(), original_sources)
+        self.assertEqual(self.j.db.execute("SELECT * FROM media ORDER BY event_id").fetchall(), original_media)
+        self.assertEqual(self.publication(), [(identifier, "visual", '["person","vehicle"]')])
+        self.add("fresh-other-camera", "person", 1000, 5000, camera=OTHER)
+        self.sync(50000)
+        self.assertEqual(self.j.db.execute("SELECT * FROM visual_groups WHERE id=?", (identifier,)).fetchone(), snapshot)
+        self.assertEqual(len(self.publication()), 2)
+        self.assertEqual(self.j.db.execute("SELECT COUNT(*) FROM visual_groups WHERE camera=?", (OTHER,)).fetchone()[0], 1)
+
+    def test_manual_snapshot_prunes_its_marker_only_after_safe_group_and_media_completion(self):
+        identifier = self.manual_snapshot()
+        self.groups.prune(START + 10000)
+        self.assertEqual(self.j.db.execute("SELECT COUNT(*) FROM visual_group_manual").fetchone()[0], 1)
+        self.assertEqual(self.j.db.execute("SELECT COUNT(*) FROM intervals").fetchone()[0], 2)
+        self.j.acknowledge(identifier, 2, "delivered")
+        self.j.acknowledge(identifier, 2, "notified")
+        self.groups.prune(START + 10000)
+        self.assertEqual(self.j.db.execute("SELECT COUNT(*) FROM visual_group_manual").fetchone()[0], 1)
+        with self.j.db:
+            self.j.db.execute("UPDATE media SET done=1 WHERE event_id=?", (identifier,))
+        self.groups.prune(START + 10000)
+        for table in ("visual_groups", "visual_group_manual", "visual_group_members", "visual_group_segments", "intervals", "media"):
+            self.assertEqual(self.j.db.execute("SELECT COUNT(*) FROM " + table).fetchone()[0], 0, table)
 
 
 if __name__ == "__main__":

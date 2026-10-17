@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 from reolink_protect_events.native import NativeAdapter, NativeError, RetiredEventError, SchemaError, Thumbnail, native_id
 from reolink_protect_events.features import CameraFeatures, INTEGRATION_ZONE
+from reolink_protect_events.historical_merge import build_pair_merge_sql
 
 EXECUTOR = None  # Set only by tools/test_postgres.py, or use explicit JSON argv.
 MARKER = "reolink-protect-events isolated integration fixture"
@@ -87,6 +88,81 @@ class PostgreSqlIntegrationTests(unittest.TestCase):
         return value('SELECT json_build_object(\'events\',(SELECT count(*) FROM events),\'objects\',(SELECT count(*) FROM "smartDetectObjects"),'
                      '\'tracks\',(SELECT count(*) FROM "smartDetectTracks"),\'detectionLabels\',(SELECT count(*) FROM "detectionLabels"),'
                      '\'thumbnails\',(SELECT count(*) FROM thumbnails),\'labels\',(SELECT count(*) FROM labels));')
+
+    def historical_pair_fixture(self):
+        execute('CREATE TABLE "favoriteEvents" ("eventId" varchar REFERENCES events(id) ON DELETE CASCADE);')
+        car = interval(1, classes=["vehicle"], end=START + 20000)
+        person = interval(2, classes=["person"], end=START + 16000)
+        self.db.upsert_interval(car, Thumbnail(JPEG, car["start"]))
+        self.db.upsert_interval(person, Thumbnail(JPEG, person["start"]))
+        graph = value('BEGIN READ ONLY; SELECT json_build_object(\'readOnly\',current_setting(\'transaction_read_only\'),'
+            '\'favoriteCount\',(SELECT count(*) FROM "favoriteEvents"),'
+            '\'events\',(SELECT json_agg(json_build_object(\'id\',id,\'camera\',"cameraId",\'start\',start,\'end\',"end",'
+            '\'types\',"smartDetectTypes",\'locked\',locked,\'deleted\',"deletedAt" IS NOT NULL,\'thumbnailId\',"thumbnailId",'
+            '\'thumbnailFullfovId\',"thumbnailFullfovId",\'metadataMd5\',md5(metadata::text))) FROM events),'
+            '\'thumbnails\',(SELECT json_agg(json_build_object(\'id\',id,\'eventId\',"eventId",\'timestamp\',timestamp,'
+            '\'fullfov\',"isFullfov",\'locked\',locked,\'bytes\',octet_length(content),\'md5\',md5(content))) FROM thumbnails),'
+            '\'objects\',(SELECT json_agg(json_build_object(\'id\',id,\'eventId\',"eventId",\'type\',type,'
+            '\'detectedAt\',"detectedAt",\'thumbnailId\',"thumbnailId")) FROM "smartDetectObjects"),'
+            '\'tracks\',(SELECT json_agg(json_build_object(\'id\',id,\'eventId\',"eventId",\'samples\',json_array_length(payload))) '
+            'FROM "smartDetectTracks")); ROLLBACK;')
+        group = copy.deepcopy(car)
+        group.update(classes=["person", "vehicle"], deliveredRevision=1)
+        group["provenance"] = {"sourceUnionVersion": 1, "identityStart": car["start"],
+            "sourceTypes": ["reolink"], "visualGroupVersion": 1, "groupIdentityStart": car["start"],
+            "activationMs": car["start"], "groupMaxSpanMs": 120000, "classIntervalsComplete": True,
+            "mergePolicy": "camera_visual_positive_overlap", "objectIdentityMatched": False,
+            "classIntervals": {kind: [{"start": row["start"], "end": row["end"]}]
+                               for kind, row in (("vehicle", car), ("person", person))}}
+        return car, person, group, graph
+
+    def test_historical_pair_merge_is_atomic_and_retains_original_car_graph_and_pixels(self):
+        car, person, group, graph = self.historical_pair_fixture()
+        result = value(build_pair_merge_sql(self.db, group, graph))
+        self.assertEqual(result["id"], car["eventId"])
+        self.assertEqual(result["removed"], person["eventId"])
+        self.assertEqual(result["classes"], ["person", "vehicle"])
+        self.assertEqual(self.counts()["events"], 1)
+        self.assertEqual(self.counts()["objects"], 2)
+        self.assertEqual(self.counts()["tracks"], 1)
+        self.assertEqual(self.counts()["thumbnails"], 2)
+        after = value('SELECT json_build_object(\'objects\',(SELECT json_agg(id) FROM "smartDetectObjects"),'
+            '\'tracks\',(SELECT json_agg(id) FROM "smartDetectTracks"),'
+            '\'images\',(SELECT json_agg(json_build_object(\'id\',id,\'md5\',md5(content),\'locked\',locked)) FROM thumbnails),'
+            '\'personTime\',(SELECT "detectedAt" FROM "smartDetectObjects" WHERE type=\'person\'));')
+        self.assertIn(next(o["id"] for o in graph["objects"] if o["eventId"] == car["eventId"]), after["objects"])
+        self.assertEqual(after["tracks"], [next(t["id"] for t in graph["tracks"] if t["eventId"] == car["eventId"])])
+        self.assertEqual({t["id"]: (t["md5"], t["locked"]) for t in after["images"]},
+            {t["id"]: (t["md5"], t["locked"]) for t in graph["thumbnails"] if t["eventId"] == car["eventId"]})
+        self.assertEqual(after["personTime"], person["start"])
+        native = self.db.upsert_interval(group)
+        self.assertEqual(native["smartDetectTypes"], ["person", "vehicle"])
+        self.assertEqual([t["type"] for t in native["metadata"]["detectedThumbnails"]], ["vehicle"])
+
+    def test_historical_pair_merge_refuses_new_favorite_without_modifying_anything(self):
+        car, person, group, graph = self.historical_pair_fixture()
+        sql = build_pair_merge_sql(self.db, group, graph)
+        execute('INSERT INTO "favoriteEvents" ("eventId") VALUES (\'' + person["eventId"] + '\');')
+        before = value('SELECT json_build_object(\'events\',(SELECT json_agg(row_to_json(e) ORDER BY id) FROM events e),'
+            '\'thumbnails\',(SELECT json_agg(row_to_json(t) ORDER BY id) FROM thumbnails t));')
+        with self.assertRaises(NativeError):
+            execute(sql)
+        after = value('SELECT json_build_object(\'events\',(SELECT json_agg(row_to_json(e) ORDER BY id) FROM events e),'
+            '\'thumbnails\',(SELECT json_agg(row_to_json(t) ORDER BY id) FROM thumbnails t));')
+        self.assertEqual(after, before)
+        self.assertEqual(value('SELECT to_json(count(*)) FROM "favoriteEvents";'), 1)
+
+    def test_historical_pair_merge_refuses_changed_pixel_snapshot_and_rolls_back(self):
+        car, person, group, graph = self.historical_pair_fixture()
+        sql = build_pair_merge_sql(self.db, group, graph)
+        execute('UPDATE thumbnails SET content=content || decode(\'00\',\'hex\') WHERE "eventId"=\'' + car["eventId"] + '\';')
+        before = value('SELECT json_build_object(\'events\',(SELECT json_agg(row_to_json(e) ORDER BY id) FROM events e),'
+            '\'thumbnails\',(SELECT json_agg(row_to_json(t) ORDER BY id) FROM thumbnails t));')
+        with self.assertRaises(NativeError):
+            execute(sql)
+        after = value('SELECT json_build_object(\'events\',(SELECT json_agg(row_to_json(e) ORDER BY id) FROM events e),'
+            '\'thumbnails\',(SELECT json_agg(row_to_json(t) ORDER BY id) FROM thumbnails t));')
+        self.assertEqual(after, before)
 
     def test_real_schema_graph_and_duplicate_retry(self):
         self.assertTrue(self.db.guard_schema()["schemaVerified"])

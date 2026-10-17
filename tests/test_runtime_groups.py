@@ -1,5 +1,6 @@
 """Exercise multi-type delivery and media through the actual durable runtime."""
 import copy
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -101,6 +102,31 @@ class GroupedRuntimeTests(unittest.TestCase):
         self.ingest(1, 0, ('vehicle', 'person', 'speak'))
         values = self.runtime.journal.pending()
         self.assertEqual(sorted(row['classes'] for row in values), [['person', 'vehicle'], ['speak']])
+
+    def test_manual_old_sources_and_media_survive_until_group_is_acknowledged(self):
+        journal = self.runtime.journal
+        past = START - 40 * 86400000
+        ids = ['1' * 24, '2' * 24]
+        with journal.db:
+            for identifier, kind in zip(ids, ('vehicle', 'person')):
+                journal.db.execute('INSERT INTO intervals(id,camera,class,start,end,last_seen,provenance,delivered_revision,notified_revision) VALUES(?,?,?,?,?,?,?,1,1)',
+                    (identifier, CAMERA, kind, past, past + 10000, past + 10000, '{}'))
+                journal.db.execute('INSERT INTO media(event_id,done) VALUES(?,1)', (identifier,))
+            journal.db.execute('INSERT INTO visual_groups(id,camera,start,end,last_seen,provenance,classes,revision,delivered_revision,notified_revision) VALUES(?,?,?,?,?,?,?,2,1,1)',
+                (ids[0], CAMERA, past, past + 10000, past + 10000, '{}', '["person","vehicle"]'))
+            journal.db.execute('INSERT INTO visual_group_manual VALUES(?,?,?,?)',
+                (ids[0], 'fixture-operation', json.dumps(ids), 'a' * 64))
+            for identifier in ids:
+                journal.db.execute('INSERT INTO visual_group_members VALUES(?)', (identifier,))
+                journal.db.execute('INSERT INTO visual_group_segments VALUES(?,?)', (ids[0], identifier))
+        journal.prune(START)
+        self.assertEqual(journal.db.execute('SELECT COUNT(*) FROM intervals').fetchone()[0], 2)
+        self.assertEqual(journal.db.execute('SELECT COUNT(*) FROM media').fetchone()[0], 2)
+        journal.acknowledge(ids[0], 2, 'delivered')
+        journal.acknowledge(ids[0], 2, 'notified')
+        journal.prune(START)
+        for table in ('intervals', 'media', 'visual_groups', 'visual_group_manual', 'visual_group_members'):
+            self.assertEqual(journal.db.execute('SELECT COUNT(*) FROM ' + table).fetchone()[0], 0, table)
 
 
 class GroupingConfigTests(unittest.TestCase):

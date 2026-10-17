@@ -1,4 +1,5 @@
 """Private release installation on the Protect console; never replace its database."""
+import ast
 import base64
 from contextlib import closing
 import hashlib
@@ -118,6 +119,30 @@ def visual_groups_exist():
         return database.execute('SELECT 1 FROM visual_group_members LIMIT 1').fetchone() is not None
 
 
+def manual_visual_groups_exist():
+    journal = root / 'journal.sqlite3'
+    if not journal.exists():
+        return False
+    secure(journal)
+    with closing(sqlite3.connect('file:' + str(journal) + '?mode=ro', uri=True, timeout=10)) as database:
+        if not database.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='visual_group_manual'").fetchone():
+            return False
+        return database.execute('SELECT 1 FROM visual_group_manual LIMIT 1').fetchone() is not None
+
+
+def manual_group_module(content):
+    # Inspect an explicit module-level capability without executing release code.
+    try:
+        tree = ast.parse(content)
+    except (SyntaxError, ValueError, TypeError):
+        return False
+    values = [node.value.value if isinstance(node.value, ast.Constant) else None
+              for node in tree.body if isinstance(node, ast.Assign)
+              and any(isinstance(target, ast.Name) and target.id == 'MANUAL_GROUP_SCHEMA_VERSION'
+                      for target in node.targets)]
+    return len(values) == 1 and type(values[0]) is int and values[0] == 1
+
+
 def supports_visual_groups(deployed):
     # A version label alone does not prove the projection-capable runtime exists.
     release = pathlib.Path(deployed.get('release', ''))
@@ -136,11 +161,21 @@ def supports_visual_groups(deployed):
     return len(expected) == 1 and expected[0].get('sha256') == hashlib.sha256(module.read_bytes()).hexdigest()
 
 
+def supports_manual_groups(deployed):
+    if not supports_visual_groups(deployed):
+        return False
+    module = pathlib.Path(deployed['release']) / 'reolink_protect_events' / 'visual_groups.py'
+    return manual_group_module(module.read_bytes())
+
+
 def guard_rollback(backup):
-    if not visual_groups_exist():
+    manual = manual_visual_groups_exist()
+    if not manual and not visual_groups_exist():
         return
     previous = backup / 'deployment.json'
     target = json.loads(previous.read_text()) if previous.exists() else {}
+    if manual and not supports_manual_groups(target):
+        raise RuntimeError('legacy_manual_grouping_rollback_blocked')
     if not supports_visual_groups(target):
         raise RuntimeError('legacy_grouping_rollback_blocked')
 
@@ -199,12 +234,14 @@ def restore(backup):
     # journal.sqlite remains current, including genuine events received during rollout.
 
 
-def retain_compatible_runtime(backup, release):
+def retain_compatible_runtime(backup, release, reason='legacy_grouping_rollback_blocked'):
     """Disable new enrollment when restoring an old binary would lose projection."""
     deployed_path = root / 'deployment.json'
     deployed = json.loads(deployed_path.read_text())
     if not supports_visual_groups(deployed) or deployed.get('release') != str(release):
         raise RuntimeError('compatible_recovery_runtime_missing')
+    if manual_visual_groups_exist() and not supports_manual_groups(deployed):
+        raise RuntimeError('compatible_manual_recovery_runtime_missing')
     state = backup_state(backup)
     previous_config = backup / 'config.json'
     secure(previous_config)
@@ -229,7 +266,7 @@ def retain_compatible_runtime(backup, release):
         if prior_monitor['active']:
             run(['systemctl', 'start', monitor_unit.name])
     deployed['groupEnrollmentDisabled'] = True
-    deployed['recoveryReason'] = 'legacy_grouping_rollback_blocked'
+    deployed['recoveryReason'] = reason
     write(deployed_path, json.dumps(deployed).encode())
     restarted_at = int(time.time() * 1000)
     if state['active']:
@@ -367,6 +404,8 @@ def execute(request):
     digest = request['digest']
     members, manifest = verified_members(data, digest)
     group_compatible = 'reolink_protect_events/visual_groups.py' in members
+    if manual_visual_groups_exist() and not manual_group_module(members.get('reolink_protect_events/visual_groups.py', b'')):
+        raise RuntimeError('manual_grouping_runtime_missing')
     if grouping is not None and not group_compatible:
         raise RuntimeError('event_grouping_runtime_missing')
     deployed = root / 'deployment.json'
@@ -478,8 +517,9 @@ def execute(request):
         try:
             restore(backup)
         except RuntimeError as rollback_error:
-            if str(rollback_error) != 'legacy_grouping_rollback_blocked':
+            reason = str(rollback_error)
+            if reason not in ('legacy_grouping_rollback_blocked', 'legacy_manual_grouping_rollback_blocked'):
                 raise
-            recovery = retain_compatible_runtime(backup, release)
-            return {'ok': False, 'errorCode': 'legacy_grouping_rollback_blocked', 'recovery': recovery}
+            recovery = retain_compatible_runtime(backup, release, reason)
+            return {'ok': False, 'errorCode': reason, 'recovery': recovery}
         raise
