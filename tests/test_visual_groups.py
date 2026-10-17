@@ -425,6 +425,188 @@ class VisualGroupTests(unittest.TestCase):
         for table in ("visual_groups", "visual_group_manual", "visual_group_members", "visual_group_segments", "intervals", "media"):
             self.assertEqual(self.j.db.execute("SELECT COUNT(*) FROM " + table).fetchone()[0], 0, table)
 
+    def test_published_members_remain_one_group_after_finalization_reveals_real_gap(self):
+        self.add("animal", "animal", 0, None, meta={"classificationDetails": {"animalType": ["cat"]}})
+        first, = self.sync(1000)
+        self.j.acknowledge(first["id"], first["revision"], "delivered")
+        self.j.acknowledge(first["id"], first["revision"], "notified")
+        self.add("person", "person", 32130, None)
+        expanded, = self.sync(32130)
+        self.j.acknowledge(expanded["id"], expanded["revision"], "delivered")
+        self.j.acknowledge(expanded["id"], expanded["revision"], "notified")
+        selection = {"mode": "recorded", "timestamp": START}
+        self.j.media_selection(first["id"], selection)
+        with self.j.db:
+            self.j.db.execute("UPDATE intervals SET end=?,last_seen=? WHERE id='animal'", (START + 29553, START + 40000))
+            self.j.db.execute("UPDATE intervals SET end=?,last_seen=? WHERE id='person'", (START + 37247, START + 40000))
+        genuine_sources = self.j.db.execute("SELECT * FROM intervals ORDER BY id").fetchall()
+        finalized, = self.sync(50000)
+        self.assertEqual(finalized["id"], first["id"])
+        self.assertEqual(finalized["classes"], ["animal", "person"])
+        self.assertEqual((finalized["start"], finalized["end"]), (START, START + 37247))
+        self.assertEqual(finalized["provenance"]["classIntervals"], {
+            "animal": [{"start": START, "end": START + 29553}],
+            "person": [{"start": START + 32130, "end": START + 37247}]})
+        self.assertTrue(finalized["provenance"]["publishedGroupSticky"])
+        self.assertEqual(finalized["provenance"]["stickyGroupingReason"], "source_finalization_gap")
+        self.assertEqual(finalized["provenance"]["thumbnailSelection"], selection)
+        self.assertEqual(self.j.db.execute("SELECT * FROM intervals ORDER BY id").fetchall(), genuine_sources)
+        self.assertEqual(self.j.db.execute("SELECT COUNT(*) FROM visual_group_segments").fetchone()[0], 2)
+        from reolink_protect_events.native import NativeAdapter, Thumbnail
+        from test_runtime_delivery import JPEG
+        projected = {"eventId": finalized["id"], "cameraId": CAMERA, "classes": finalized["classes"],
+                     "start": finalized["start"], "end": finalized["end"], "provenance": finalized["provenance"],
+                     "deliveredRevision": finalized["delivered"]}
+        _, native_event = NativeAdapter().build_interval_sql(projected, Thumbnail(JPEG, START))
+        self.assertEqual([item["type"] for item in native_event["metadata"]["detectedThumbnails"]], ["animal"])
+        self.j.close()
+        self.j = Journal(self.path)
+        self.groups = self.open_groups()
+        self.assertEqual(self.sync(90000), [finalized])
+
+    def test_unpublished_provisional_members_still_split_on_genuine_gap(self):
+        self.add("animal", "animal", 0, None)
+        self.sync(1000)
+        self.add("person", "person", 32130, None)
+        self.sync(32130)
+        with self.j.db:
+            self.j.db.execute("UPDATE intervals SET end=? WHERE id='animal'", (START + 29553,))
+            self.j.db.execute("UPDATE intervals SET end=? WHERE id='person'", (START + 37247,))
+        finalized = self.sync(50000)
+        self.assertEqual([row["classes"] for row in finalized], [["animal"], ["person"]])
+        self.assertFalse(any(row["provenance"].get("publishedGroupSticky") for row in finalized))
+
+    def test_published_finalization_gap_stays_within_its_120_second_partition(self):
+        self.add("animal", "animal", 0, None)
+        self.sync(1000)
+        self.add("person", "person", 119000, None)
+        published, = self.sync(119000)
+        self.j.acknowledge(published["id"], published["revision"], "delivered")
+        with self.j.db:
+            self.j.db.execute("UPDATE intervals SET end=? WHERE id='animal'", (START + 117000,))
+        bounded, = self.sync(121000)
+        self.assertEqual(bounded["id"], published["id"])
+        self.assertEqual(bounded["end"], START + 120000)
+        self.assertEqual(bounded["classes"], ["animal", "person"])
+        self.assertEqual(bounded["provenance"]["classIntervals"], {
+            "animal": [{"start": START, "end": START + 117000}],
+            "person": [{"start": START + 119000, "end": START + 120000}]})
+        self.assertEqual(self.sync(240000), [bounded])
+        with self.j.db:
+            self.j.db.execute("UPDATE intervals SET end=? WHERE id='person'", (START + 250000,))
+        partitions = self.sync(300000)
+        self.assertEqual([(row["start"] - START, row["end"] - START) for row in partitions],
+                         [(0, 120000), (120000, 240000), (240000, 250000)])
+        for row in partitions:
+            self.j.acknowledge(row["id"], row["revision"], "delivered")
+            self.j.acknowledge(row["id"], row["revision"], "notified")
+        identifiers = [row["id"] for row in partitions]
+        self.j.close()
+        self.j = Journal(self.path)
+        self.groups = self.open_groups()
+        restarted = self.sync(400000)
+        self.assertEqual([row["id"] for row in restarted], identifiers)
+        self.assertEqual([row["classes"] for row in restarted], [["animal", "person"], ["person"], ["person"]])
+        self.assertTrue(all(row["end"] - row["start"] <= 120000 for row in restarted))
+
+    def test_new_third_source_inside_finalization_gap_stays_separate(self):
+        self.add("animal", "animal", 0, None)
+        self.sync(1000)
+        self.add("person", "person", 32130, None)
+        published, = self.sync(32130)
+        self.j.acknowledge(published["id"], published["revision"], "delivered")
+        with self.j.db:
+            self.j.db.execute("UPDATE intervals SET end=? WHERE id='animal'", (START + 29553,))
+            self.j.db.execute("UPDATE intervals SET end=? WHERE id='person'", (START + 37247,))
+        self.sync(50000)
+        self.add("gap-source", "vehicle", 30500, 31000)
+        values = self.sync(60000)
+        self.assertEqual(len(values), 2)
+        self.assertEqual(values[0]["id"], published["id"])
+        self.assertEqual(values[0]["classes"], ["animal", "person"])
+        self.assertEqual(values[1]["classes"], ["vehicle"])
+        self.assertEqual(self.j.db.execute("SELECT COUNT(*) FROM visual_group_segments WHERE group_id=? AND interval_id='gap-source'",
+                                           (published["id"],)).fetchone()[0], 0)
+
+    def test_explicit_repair_snapshot_keeps_both_previously_published_ids(self):
+        # Model the old broken splitter's already-published post-state. Repair
+        # uses the existing explicit snapshot contract; it does not delete the
+        # newer, separately published person event.
+        self.add("animal", "animal", 0, 29553)
+        self.add("person", "person", 32130, 37247)
+        split = self.sync(50000)
+        old, second = split
+        old_meta = old["provenance"]
+        old_meta.update(manualRepairSnapshot="fixture-exact-published-finalization",
+                        memberIntervalIds=["animal", "person"],
+                        classIntervals={"animal": [{"start": START, "end": START + 29553}],
+                                        "person": [{"start": START + 32130, "end": START + 37247}]})
+        with self.j.db:
+            self.j.db.execute("UPDATE visual_groups SET delivered_revision=revision,notified_revision=revision")
+            self.j.db.execute("UPDATE visual_groups SET end=?,classes=?,provenance=?,revision=revision+1 WHERE id=?",
+                              (START + 37247, '["animal","person"]', json.dumps(old_meta), old["id"]))
+            self.j.db.execute("INSERT INTO visual_group_segments VALUES(?,?)", (old["id"], "person"))
+            self.j.db.execute("INSERT INTO visual_group_manual VALUES(?,?,?,?)",
+                              (old["id"], "fixture-exact-published-finalization", '["animal","person"]', 'a' * 64))
+        before = self.j.db.execute("SELECT * FROM visual_groups WHERE id=?", (old["id"],)).fetchone()
+        original = self.j.db.execute("SELECT * FROM intervals ORDER BY id").fetchall()
+        self.j.close()
+        self.j = Journal(self.path)
+        self.groups = self.open_groups()
+        values = self.sync(60000)
+        self.assertEqual([row["id"] for row in values], [old["id"], second["id"]])
+        self.assertEqual([row["classes"] for row in values], [["animal", "person"], ["person"]])
+        self.assertEqual(self.j.db.execute("SELECT * FROM visual_groups WHERE id=?", (old["id"],)).fetchone(), before)
+        self.assertEqual(self.j.db.execute("SELECT * FROM intervals ORDER BY id").fetchall(), original)
+        self.assertEqual(self.groups.activation_ms, START)
+
+
+class PublishedFinalizationRuntimeTests(unittest.TestCase):
+    def test_real_fusion_late_end_keeps_native_classes_and_settles_outbox(self):
+        from reolink_protect_events.native import NativeError
+        from reolink_protect_events.runtime import Runtime
+        from test_frigate import batch, item
+        from test_runtime_delivery import CAMERA as F_CAMERA, START as F_START, FakeClient, FakeNative, config
+
+        class MonotonicNative(FakeNative):
+            def upsert_interval(self, interval, thumbnail=None):
+                previous = self.rows.get(interval["eventId"])
+                if previous and not set(previous["smartDetectTypes"]) <= set(interval["classes"]):
+                    raise NativeError("Integration event identity collision")
+                return super().upsert_interval(interval, thumbnail)
+
+        with tempfile.TemporaryDirectory() as folder:
+            now = [F_START]
+            cfg = config()
+            cfg["eventGrouping"] = {"enabled": True, "maxSpanSeconds": 120}
+            cfg["frigate"] = {"url": "http://192.0.2.1:18799", "bearerToken": "fixture-never-a-real-token-12345",
+                              "cameraMap": {"front": F_CAMERA}}
+            with patch("reolink_protect_events.runtime.time.time", side_effect=lambda: now[0] / 1000):
+                runtime = Runtime(cfg, folder, background_native=False)
+                native, client = MonotonicNative(), FakeClient()
+                runtime.native, runtime.clients, runtime.native_ready = native, {F_CAMERA: client}, True
+                try:
+                    for offset, events in (
+                            (1000, [item("cat", label="cat")]),
+                            (32130, [item("cat", label="cat"), item("person", start=32130)]),
+                            (50000, [item("cat", label="cat", end=29553), item("person", start=32130, end=37247)])):
+                        now[0] = F_START + offset
+                        runtime.journal.fusion.frigate(F_CAMERA, batch(events, at=offset))
+                        runtime.journal.fusion.sync(now[0])
+                        runtime.deliver()
+                    self.assertEqual(len(native.rows), 1)
+                    published = next(iter(native.rows.values()))
+                    self.assertEqual(published["smartDetectTypes"], ["animal", "person"])
+                    self.assertEqual(published["end"], F_START + 37247)
+                    self.assertEqual(runtime.journal.health()["pending"], 0)
+                    self.assertEqual(runtime.import_errors, 0)
+                    self.assertEqual(runtime.journal.db.execute("SELECT COUNT(*) FROM intervals").fetchone()[0], 2)
+                    actual = native.calls[-1][0]["provenance"]["classIntervals"]
+                    self.assertEqual(actual["animal"], [{"start": F_START, "end": F_START + 29553}])
+                    self.assertEqual(actual["person"], [{"start": F_START + 32130, "end": F_START + 37247}])
+                finally:
+                    runtime.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,6 +3,9 @@
 The per-class source intervals remain the authoritative journal. Enrollment is
 permanent, starts only at activation, and never adopts a published legacy row.
 Administrative span partitions are publication boundaries, never camera clears.
+Once published, a group's bounded member association survives later genuine
+source finalization. Its class coverage may contain honest gaps; those gaps are
+never filled with invented camera activity.
 """
 import hashlib
 import json
@@ -179,7 +182,7 @@ class VisualGroups:
             ranges = self._ranges(row, meta)
             sources[row[0]] = {"row": row, "meta": meta,
                                "ranges": _clip(ranges, self.activation_ms, None)}
-        old_rows = self.db.execute("SELECT g.id,g.camera,g.start,g.end,g.last_seen,g.provenance,g.classes FROM visual_groups g "
+        old_rows = self.db.execute("SELECT g.id,g.camera,g.start,g.end,g.last_seen,g.provenance,g.classes,g.delivered_revision,g.notified_revision FROM visual_groups g "
                                    "WHERE g.camera IN (" + marks + ") AND NOT EXISTS "
                                    "(SELECT 1 FROM visual_group_manual m WHERE m.group_id=g.id) ORDER BY g.start,g.id", parameters).fetchall()
         old = {row[0]: {"row": row, "meta": json.loads(row[5])} for row in old_rows}
@@ -200,6 +203,7 @@ class VisualGroups:
         # Published evidence is monotonic even if a later upstream correction
         # retracts its class or bounds. Preserve it explicitly, without inventing
         # activity in newly uncovered time.
+        sticky_by_camera = {}
         for identifier, group in old.items():
             for label, ranges in group["meta"].get("classIntervals", {}).items():
                 for value in ranges:
@@ -216,6 +220,34 @@ class VisualGroups:
                         # already observed, never the old unbounded state.
                         end = max(value["start"] + 1, group["row"][4])
                         by_camera.setdefault(group["row"][1], []).append((value["start"], end, "@" + identifier, label))
+        for identifier, group in old.items():
+            if not (group["row"][7] or group["row"][8]):
+                continue
+            left = group["row"][2]
+            right = left + group["meta"]["groupMaxSpanMs"]
+            coverage, open_member = [], False
+            for member in links.get(identifier, ()):
+                source = sources.get(member)
+                if source is None:
+                    continue
+                for start, end in source["ranges"]:
+                    if end is None and start < left:
+                        continue
+                    clipped = _clip([(start, end)], left, right)
+                    if clipped:
+                        coverage.extend(clipped)
+                        open_member = open_member or end is None
+            if len(_merge(coverage)) > 1:
+                # This is a connectivity constraint for an already published
+                # presentation, not a class interval. A delayed real clear can
+                # reveal that two members never overlapped. Re-splitting that
+                # publication would withdraw a native class and collide with
+                # its monotonic class contract. Retain its bounded identity and
+                # member association while keeping each real class time exact.
+                sticky_by_camera.setdefault(group["row"][1], []).append((
+                    identifier, links.get(identifier, set()) | {"@" + identifier},
+                    (min(value[0] for value in coverage), None if open_member else max(value[1] for value in coverage),
+                     "!published-gap:" + identifier, None)))
         for camera, spans in by_camera.items():
             components = []
             for span in sorted(spans, key=lambda value: (value[0], value[2], value[3])):
@@ -228,6 +260,31 @@ class VisualGroups:
                 else:
                     components[-1][1] = max(components[-1][1], observed_end)
                     components[-1][2].append(span)
+            # Join only components containing already-pinned members. A broad
+            # synthetic time envelope would wrongly absorb a new third source
+            # located solely in the newly revealed gap.
+            parents = list(range(len(components)))
+            def representative(index):
+                while parents[index] != index:
+                    parents[index] = parents[parents[index]]
+                    index = parents[index]
+                return index
+            component_members = [{value[2] for value in component[2]} for component in components]
+            sticky_indexes = []
+            for group_id, pinned, marker in sticky_by_camera.get(camera, ()):
+                indexes = [index for index, identifiers in enumerate(component_members) if identifiers & pinned]
+                if indexes:
+                    for index in indexes[1:]:
+                        parents[representative(index)] = representative(indexes[0])
+                    sticky_indexes.append((indexes[0], marker))
+            combined = {}
+            for index, component in enumerate(components):
+                target = combined.setdefault(representative(index), [component[0], component[1], []])
+                target[0], target[1] = min(target[0], component[0]), max(target[1], component[1])
+                target[2].extend(component[2])
+            for index, marker in sticky_indexes:
+                combined[representative(index)][2].append(marker)
+            components = sorted(combined.values(), key=lambda value: value[0])
             for start, observed_end, members in components:
                 existing_ids = {value[2][1:] for value in members if value[2].startswith("@")}
                 member_ids = {value[2] for value in members if not value[2].startswith("@")}
@@ -280,6 +337,8 @@ class VisualGroups:
         coverage, identifiers, prior_groups = {}, set(), set()
         included_open = False
         for start, end, identifier, label in spans:
+            if label is None:
+                continue
             # An old still-open object does not prove a new continuation after
             # the presentation cap. A real end, or a newly starting source,
             # supplies that evidence. This avoids phantom continuation events
@@ -358,6 +417,9 @@ class VisualGroups:
                 meta["classificationDetails"] = filtered
         if partition:
             meta.update(administrativePartitionReason=partition, closureReason="administrative_partition")
+        if any(label is None and marker_id == "!published-gap:" + identifier
+               and _clip([(start, end)], left, right) for start, end, marker_id, label in spans):
+            meta.update(publishedGroupSticky=True, stickyGroupingReason="source_finalization_gap")
         if isinstance(previous.get("thumbnailSelection"), dict):
             meta["thumbnailSelection"] = previous["thumbnailSelection"]
         encoded, encoded_classes = _json(meta), _json(classes)

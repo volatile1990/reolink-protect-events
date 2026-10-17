@@ -57,6 +57,20 @@ promise two visible icons in every timeline layout.
 
 ## Operation and rollback
 
+Once a group has been published, later source finalization preserves its bounded
+member association. For example, an initially open person source can later clear
+to a time range separated from an animal source by a genuine short gap. The
+published event keeps both types, while `classIntervals` records each exact range
+and the uncovered gap remains uncovered. `publishedGroupSticky` and
+`stickyGroupingReason=source_finalization_gap` explain this case. A new source
+located solely inside that gap does not join the group. Unpublished groups still
+require positive overlap, and the 120-second publication boundaries remain.
+
+This prevents an already published native type from being withdrawn by a delayed
+clear. The native writer still rejects class removal. An older persisted split
+that has already produced two native IDs requires an explicit scoped journal
+repair; it must not silently delete the second published ID or rewrite sources.
+
 The Events-only path preserves the existing media-monitor service, thumbnail
 settings, cameras, bridges and Protect process. The installer backs up the
 private configuration and a consistent journal before activation. Monitor and

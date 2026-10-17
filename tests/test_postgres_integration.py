@@ -289,6 +289,87 @@ class PostgreSqlIntegrationTests(unittest.TestCase):
             self.assertEqual(matches, 2)  # Event search and the genuine class object.
         self.assertEqual(event, self.db.upsert_interval(cleared))
 
+    def test_published_group_late_finalization_gap_preserves_native_graph_and_class_guard(self):
+        from contextlib import closing
+        from reolink_protect_events.runtime import Journal
+        from reolink_protect_events.visual_groups import VisualGroups
+
+        with tempfile.TemporaryDirectory() as folder, closing(Journal(Path(folder) / "journal.sqlite3")) as journal:
+            with patch("reolink_protect_events.visual_groups.time.time", return_value=START / 1000):
+                groups = VisualGroups(journal, (CAMERA,), {"enabled": True, "maxSpanSeconds": 120})
+
+            def add_source(identifier, kind, offset):
+                provenance = {"sourceUnionVersion": 1, "identityStart": START + offset,
+                              "sourceTypes": ["frigate"], "source": "frigate-object-detection"}
+                with journal.db:
+                    journal.db.execute("INSERT INTO intervals(id,camera,class,start,end,last_seen,instance,epoch,provenance) "
+                        "VALUES(?,?,?,?,?,?,?,?,?)", (identifier, CAMERA, kind, START + offset, None,
+                                                    START + offset, "fixture", 0, json.dumps(provenance)))
+                    journal.db.execute("INSERT INTO media(event_id) VALUES(?)", (identifier,))
+
+            def projected(offset):
+                groups.sync(START + offset)
+                rows = journal.db.execute("SELECT id,start,end,classes,provenance,revision,delivered_revision "
+                                          "FROM visual_groups ORDER BY start,id").fetchall()
+                self.assertEqual(len(rows), 1)
+                identifier, start, end, classes, provenance, revision, delivered = rows[0]
+                return {"eventId": identifier, "cameraId": CAMERA, "start": start, "end": end,
+                        "classes": json.loads(classes), "provenance": json.loads(provenance),
+                        "deliveredRevision": delivered}, revision
+
+            def publish(offset, thumbnail=None):
+                row, revision = projected(offset)
+                event = self.db.upsert_interval(row, thumbnail)
+                journal.acknowledge(row["eventId"], revision, "delivered")
+                journal.acknowledge(row["eventId"], revision, "notified")
+                return row, event
+
+            add_source("animal-source", "animal", 0)
+            initial, _ = publish(1000, Thumbnail(JPEG, START + 100))
+            add_source("person-source", "person", 32130)
+            expanded, _ = publish(32130)
+            self.assertEqual(expanded["eventId"], initial["eventId"])
+            self.assertEqual(expanded["classes"], ["animal", "person"])
+            execute("UPDATE events SET locked=true; UPDATE thumbnails SET locked=true;")
+            graph_sql = ('SELECT json_build_object(\'event\',(SELECT json_build_object(\'id\',id,\'locked\',locked,'
+                '\'preview\',"thumbnailId",\'full\',"thumbnailFullfovId") FROM events),'
+                '\'objects\',(SELECT json_agg(json_build_object(\'id\',id,\'type\',type,\'time\',"detectedAt") '
+                'ORDER BY type) FROM "smartDetectObjects"),'
+                '\'tracks\',(SELECT json_agg(id ORDER BY id) FROM "smartDetectTracks"),'
+                '\'images\',(SELECT json_agg(json_build_object(\'id\',id,\'time\',timestamp,\'md5\',md5(content),'
+                '\'locked\',locked) ORDER BY id) FROM thumbnails));')
+            before = value(graph_sql)
+            with journal.db:
+                for identifier, end in (("animal-source", 29553), ("person-source", 37247)):
+                    journal.db.execute("UPDATE intervals SET end=?,last_seen=?,revision=revision+1 WHERE id=?",
+                                       (START + end, START + 50000, identifier))
+            finalized, _ = projected(50000)
+            expected = {"animal": [{"start": START, "end": START + 29553}],
+                        "person": [{"start": START + 32130, "end": START + 37247}]}
+            self.assertEqual(finalized["eventId"], initial["eventId"])
+            self.assertEqual(finalized["provenance"]["classIntervals"], expected)
+            self.assertTrue(finalized["provenance"]["publishedGroupSticky"])
+
+            # The old class-removal guard must keep rejecting the bad split.
+            removal = copy.deepcopy(finalized)
+            removal.update(classes=["animal"], end=START + 29553)
+            del removal["provenance"]["classIntervals"]["person"]
+            with self.assertRaises(NativeError):
+                self.db.upsert_interval(removal)
+            self.assertEqual(value(graph_sql), before)
+
+            _, event = publish(50000)
+            self.assertEqual(event["smartDetectTypes"], ["animal", "person"])
+            self.assertEqual(event["end"], START + 37247)
+            self.assertEqual(event["metadata"]["reolinkProtectEvents"]["provenance"]["classIntervals"], expected)
+            self.assertEqual(value(graph_sql), before)
+            self.assertEqual(journal.health()["pending"], 0)
+            for kind in ("animal", "person"):
+                matches = value('SELECT to_json(count(*)) FROM "detectionLabels" dl JOIN labels l '
+                    'ON l.lid=ANY(dl.labels) WHERE l.name=\'smartDetectType:' + kind + '\';')
+                self.assertEqual(matches, 2)
+            self.assertEqual(self.db.upsert_interval(finalized), event)
+
     def test_visual_group_retired_expansion_and_later_thumbnail_do_not_resurrect(self):
         row = visual_group()
         self.db.upsert_interval(row)
