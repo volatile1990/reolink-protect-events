@@ -201,8 +201,28 @@ def validate_packaged_config(release, cfg):
         raise RuntimeError('packaged_configuration_invalid')
 
 
-def restore(backup):
+def require_owned_maintenance(owner):
+    marker = monitor_root / 'maintenance.json'
+    secure(marker)
+    if not isinstance(owner, str) or len(owner) != 32 or any(c not in '0123456789abcdef' for c in owner) \
+            or not marker.exists() or json.loads(marker.read_text()).get('owner') != owner:
+        raise RuntimeError('installer_requires_owned_maintenance')
+
+
+def check_owned_files(expected, owner, code):
+    require_owned_maintenance(owner)
+    for path, content in expected.items():
+        secure(path)
+        if (path.read_bytes() if path.exists() else None) != content:
+            raise RuntimeError(code)
+
+
+def restore(backup, *, expected_files=None, maintenance_owner=None):
     secure(backup)
+    def check():
+        if expected_files is not None:
+            check_owned_files(expected_files, maintenance_owner, 'events_only_owned_files_rollback_drift')
+    check()
     guard_rollback(backup)
     state = backup_state(backup)
     events_only = state.get('eventsOnly', False)
@@ -214,9 +234,11 @@ def restore(backup):
     for name in states:
         path = unit if name == service else monitor_unit
         if path.exists() or current_states[name]['active']:
+            check()
             run(['systemctl', 'stop', name])
     # Enrollment can race the first read while the current worker is running.
     # With that worker stopped, verify again before changing any owned files.
+    check()
     try:
         guard_rollback(backup)
     except Exception:
@@ -226,21 +248,31 @@ def restore(backup):
         raise
     for name, previous in states.items():
         if not previous['enabled']:
+            check()
             subprocess.run(['systemctl', 'disable', name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
     paths = (unit, root / 'config.json', root / 'deployment.json')
     if not events_only or update_monitor:
         paths += (monitor_unit,)
     for p in paths:
+        check()
         saved = backup / p.name
         if saved.exists():
-            write(p, saved.read_bytes())
+            restored = saved.read_bytes()
+            write(p, restored)
+            if expected_files is not None:
+                expected_files[p] = restored
         elif p.exists():
             p.unlink()
+            if expected_files is not None:
+                expected_files[p] = None
+    check()
     run(['systemctl', 'daemon-reload'])
     for name, previous in states.items():
         if previous['enabled'] and (backup / name).exists():
+            check()
             run(['systemctl', 'enable', name])
         if previous['active'] and (backup / name).exists():
+            check()
             run(['systemctl', 'start', name])
     # journal.sqlite remains current, including genuine events received during rollout.
 
@@ -399,7 +431,15 @@ def execute(request):
         backup = pathlib.Path(meta['backup'])
         if backup.parent != root / 'backups' or not backup.is_dir():
             raise RuntimeError('unsafe_backup_path')
-        restore(backup)
+        if meta.get('existingFrigateFailure') is not None:
+            require_owned_maintenance(request.get('owner'))
+            expected = {}
+            for path in (unit, root / 'config.json', root / 'deployment.json'):
+                secure(path)
+                expected[path] = path.read_bytes() if path.exists() else None
+            restore(backup, expected_files=expected, maintenance_owner=request.get('owner'))
+        else:
+            restore(backup)
         return {'ok': True, 'restoredBackup': str(backup), 'journalPreserved': True}
     if mode not in ('install', 'capture'):
         raise RuntimeError('installer_mode_invalid')
@@ -422,6 +462,18 @@ def execute(request):
             or set(grouping) != {'enabled', 'maxSpanSeconds'} or grouping.get('enabled') is not True
             or type(grouping.get('maxSpanSeconds')) is not int or not 30 <= grouping['maxSpanSeconds'] <= 300):
         raise RuntimeError('event_grouping_request_invalid')
+    dependency_requested = 'existingFrigateFailure' in request
+    dependency_contract = request.get('existingFrigateFailure')
+    if dependency_requested and (not events_only or update_monitor or mode != 'install'
+            or grouping is not None or startup_options is not None):
+        raise RuntimeError('existing_frigate_request_scope_invalid')
+    dependency_baseline = None
+    cfg = None
+    if dependency_requested:
+        from .deployment_health import prepare_baseline, accept, validate_contract
+        validate_contract(dependency_contract)
+        require_owned_maintenance(request.get('owner'))
+        cfg = get_config()
     data = base64.b64decode(request['package'], validate=True)
     digest = request['digest']
     members, manifest = verified_members(data, digest)
@@ -439,13 +491,25 @@ def execute(request):
                 and previous.get('eventsOnly', False) == events_only and same_grouping and same_startup \
                 and previous.get('updateMonitor', False) == update_monitor:
             h = health()
+            if dependency_requested:
+                from .deployment_health import _digest
+                recorded = previous.get('existingFrigateFailureBaseline')
+                if previous.get('existingFrigateFailure') != dependency_contract or not isinstance(recorded, dict) \
+                        or _digest(recorded) != dependency_contract.get('expectedFailureSha256') \
+                        or hashlib.sha256((root / 'config.json').read_bytes()).hexdigest() != dependency_contract.get('expectedConfigSha256'):
+                    raise RuntimeError('existing_frigate_resume_contract_changed')
+                accepted = accept(cfg, h['health'], recorded,
+                                  started_ms=previous['activatedAtMs'], now_ms=int(time.time() * 1000))
+                return {'ok': True, 'deployment': {k: previous[k] for k in ('sha256', 'mode', 'release', 'version', 'activatedAtMs')},
+                        'deploymentAcceptance': accepted, 'resumedExistingDeployment': True, **h}
             if h['health']['healthy'] and (events_only and not update_monitor or all(h['monitor'].values())):
                 if startup_options is not None:
                     from .fmp4 import configuration, verify_configuration
                     verify_configuration(configuration(json.loads((root / 'config.json').read_text())))
                 return {'ok': True, 'deployment': {k: previous[k] for k in ('sha256', 'mode', 'release', 'version', 'activatedAtMs')},
                         'resumedExistingDeployment': True, **h}
-    cfg = get_config()
+    if cfg is None:
+        cfg = get_config()
     if update_monitor:
         if not deployed.exists() or hashlib.sha256(deployed.read_bytes()).hexdigest() != request['expectedDeploymentSha256']:
             raise RuntimeError('monitor_metadata_CAS_mismatch')
@@ -461,6 +525,11 @@ def execute(request):
         for path in guarded_paths:
             secure(path)
             original_files[path] = path.read_bytes() if path.exists() else None
+        if dependency_requested:
+            dependency_baseline = prepare_baseline(cfg, health()['health'], dependency_contract,
+                config_sha256=hashlib.sha256(original_files[current_config]).hexdigest(),
+                deployment_sha256=hashlib.sha256(original_files[deployed]).hexdigest(),
+                now_ms=int(time.time() * 1000))
     else:
         cfg['thumbnailSelection'] = {'mode': 'automatic', 'maxCandidates': 4, 'windowSeconds': 6,
                                     'settleSeconds': 3, 'recordingLagMs': 1500, 'historyDays': 30, 'budgetSeconds': 8}
@@ -475,9 +544,7 @@ def execute(request):
         cfg['eventGrouping'] = dict(grouping)
     secure(monitor_root)
     monitor_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    marker = monitor_root / 'maintenance.json'
-    if not marker.exists() or json.loads(marker.read_text()).get('owner') != request.get('owner'):
-        raise RuntimeError('installer_requires_owned_maintenance')
+    require_owned_maintenance(request.get('owner'))
     release = root / 'releases' / digest[:16]
     secure(release)
     release.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -526,16 +593,21 @@ def execute(request):
     if events_only and any((path.read_bytes() if path.exists() else None) != previous
                            for path, previous in original_files.items()):
         raise RuntimeError('events_only_deployment_drift')
+    if dependency_requested:
+        dependency_baseline = prepare_baseline(cfg, health()['health'], dependency_contract,
+            config_sha256=hashlib.sha256((root / 'config.json').read_bytes()).hexdigest(),
+            deployment_sha256=hashlib.sha256(deployed.read_bytes()).hexdigest(),
+            now_ms=int(time.time() * 1000))
     if startup_options is not None:
         verify_configuration(configuration(cfg))
     started = int(time.time() * 1000)
     owned_writes = {}
+    def check_install_owned(code='events_only_owned_files_write_drift'):
+        if events_only:
+            check_owned_files({p: owned_writes.get(p, original) for p, original in original_files.items()},
+                              request.get('owner'), code)
     def install_owned(path, content):
-        if update_monitor:
-            secure(path)
-            current = path.read_bytes() if path.exists() else None
-            if current != owned_writes.get(path, original_files[path]):
-                raise RuntimeError('monitor_owned_files_write_drift')
+        check_install_owned('monitor_owned_files_write_drift' if update_monitor else 'events_only_owned_files_write_drift')
         owned_writes[path] = content
         write(path, content)
     try:
@@ -543,43 +615,65 @@ def execute(request):
         for name in services:
             path = unit if name == service else monitor_unit
             if path.exists() or (state if name == service else state['monitor'])['active']:
+                if events_only:
+                    check_owned_files(original_files, request.get('owner'), 'events_only_deployment_drift')
                 run(['systemctl', 'stop', name])
         if not events_only or grouping is not None or startup_options is not None:
             install_owned(root / 'config.json', json.dumps(cfg).encode())
         install_owned(unit, unit_text(release, capture=mode == 'capture').encode())
         if not events_only or update_monitor:
             install_owned(monitor_unit, unit_text(release, monitoring=True).encode())
-        install_owned(root / 'deployment.json', json.dumps({'sha256': digest, 'mode': mode, 'release': str(release),
+        deployment = {'sha256': digest, 'mode': mode, 'release': str(release),
               'backup': str(backup), 'sourceRevision': manifest['sourceRevision'], 'sourceSha256': manifest['sourceSha256'],
               'version': manifest['version'], 'activatedAtMs': started, 'eventsOnly': events_only,
               'updateMonitor': update_monitor,
-              'visualGroupCompatible': group_compatible}).encode())
+              'visualGroupCompatible': group_compatible}
+        if dependency_requested:
+            deployment.update(existingFrigateFailure=dependency_contract,
+                              existingFrigateFailureBaseline=dependency_baseline)
+        install_owned(root / 'deployment.json', json.dumps(deployment).encode())
+        check_install_owned()
         run(['systemctl', 'daemon-reload'])
         for name in services:
+            check_install_owned()
             run(['systemctl', 'enable', name])
+            check_install_owned()
             run(['systemctl', 'start', name])
         deadline = time.monotonic() + 35
         while time.monotonic() < deadline:
+            check_install_owned()
             try:
                 h = health()
+                accepted = None
+                if dependency_requested:
+                    accepted = accept(cfg, h['health'], dependency_baseline,
+                                      started_ms=started, now_ms=int(time.time() * 1000))
                 if h['health']['atMs'] > started and h['health']['mode'] == ('capture' if mode == 'capture' else 'native') \
-                        and h['health']['healthy'] and (events_only and not update_monitor or all(h['monitor'].values())):
+                        and (accepted is not None or h['health']['healthy']) and (events_only and not update_monitor or all(h['monitor'].values())):
                     return {'ok': True, 'deployment': {'sha256': digest, 'mode': mode, 'release': str(release),
                             'version': manifest['version'], 'activatedAtMs': started, 'eventsOnly': events_only,
                             'updateMonitor': update_monitor,
-                            'visualGroupCompatible': group_compatible}, 'journalBackedUp': journal.exists(), **h}
+                            'visualGroupCompatible': group_compatible}, 'journalBackedUp': journal.exists(),
+                            **({'deploymentAcceptance': accepted} if accepted is not None else {}), **h}
             except (FileNotFoundError, ValueError, RuntimeError):
                 pass
             time.sleep(1)
         raise RuntimeError('deployment_health_timeout')
     except Exception:
         try:
-            if update_monitor:
+            rollback_expected = None
+            if events_only:
+                require_owned_maintenance(request.get('owner'))
+                rollback_expected = {}
                 for path, original in original_files.items():
                     current = path.read_bytes() if path.exists() else None
                     if current not in (original, owned_writes.get(path, original)):
-                        raise RuntimeError('monitor_owned_files_rollback_drift')
-            restore(backup)
+                        raise RuntimeError('monitor_owned_files_rollback_drift' if update_monitor else 'events_only_owned_files_rollback_drift')
+                    rollback_expected[path] = current
+            if events_only:
+                restore(backup, expected_files=rollback_expected, maintenance_owner=request.get('owner'))
+            else:
+                restore(backup)
         except RuntimeError as rollback_error:
             reason = str(rollback_error)
             if reason not in ('legacy_grouping_rollback_blocked', 'legacy_manual_grouping_rollback_blocked'):

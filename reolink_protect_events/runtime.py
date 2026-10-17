@@ -347,6 +347,29 @@ class Journal:
             retry = now_ms + min(300000, 1000 * 2 ** min(attempts, 8))
             self.db.execute("INSERT INTO delivery_failures VALUES(?,?,?) ON CONFLICT(event_id) DO UPDATE SET attempts=excluded.attempts,next_attempt=excluded.next_attempt", (event_id, attempts, retry))
 
+    @staticmethod
+    def _media_publications_sql(columns, predicate, *, include_classes=False):
+        """Join media to each publication branch without materializing its view.
+
+        CROSS JOIN keeps filtered media as the driver on the console's SQLite.
+        Keep the view's UNION ALL and membership predicate exactly: hidden
+        sources are excluded, while every group (including manual ones) stays.
+        All SQL fragments are fixed internal strings, never external values.
+        """
+        branches = []
+        for table in ("intervals", "visual_groups"):
+            selected = columns
+            if include_classes:
+                selected += "," + ("NULL" if table == "intervals" else "i.classes") + " AS classes"
+            membership = " AND NOT EXISTS(SELECT 1 FROM visual_group_members member WHERE member.interval_id=i.id)" if table == "intervals" else ""
+            branches.append("SELECT " + selected + " FROM media m CROSS JOIN " + table +
+                            " i ON i.id=m.event_id WHERE " + predicate + membership)
+        return " UNION ALL ".join(branches)
+
+    def _media_publication_count(self, predicate):
+        query = self._media_publications_sql("COUNT(*) AS n", predicate)
+        return self.db.execute("SELECT SUM(n) FROM (" + query + ")").fetchone()[0]
+
     def health(self):
         counters = dict(self.db.execute("SELECT name,value FROM counters"))
         oldest = self.db.execute("SELECT MIN(start) FROM publication_intervals WHERE delivered_revision<revision OR notified_revision<revision").fetchone()[0]
@@ -356,16 +379,21 @@ class Journal:
                 "oldestPendingAgeMs": max(0, int(time.time() * 1000) - oldest) if oldest is not None else 0,
                 "pending": self.db.execute("SELECT COUNT(*) FROM publication_intervals WHERE delivered_revision<revision OR notified_revision<revision").fetchone()[0],
                 "openIntervals": self.db.execute("SELECT COUNT(*) FROM publication_intervals WHERE end IS NULL").fetchone()[0],
-                "pendingThumbnails": self.db.execute("SELECT COUNT(*) FROM media m JOIN publication_intervals i ON i.id=m.event_id WHERE m.done=0 AND m.attempts<20").fetchone()[0],
-                "failedThumbnails": self.db.execute("SELECT COUNT(*) FROM media m JOIN publication_intervals i ON i.id=m.event_id WHERE m.done=0 AND m.attempts>=20").fetchone()[0],
+                "pendingThumbnails": self._media_publication_count("m.done=0 AND m.attempts<20"),
+                "failedThumbnails": self._media_publication_count("m.done=0 AND m.attempts>=20"),
                 "retryIntervals": self.db.execute("SELECT COUNT(*) FROM delivery_failures").fetchone()[0],
                 "sourceRows": self.db.execute("SELECT COUNT(*) FROM sources").fetchone()[0],
-                "thumbnailErrorReasons": dict(self.db.execute("SELECT COALESCE(m.error_reason,'unknown'),COUNT(*) FROM media m JOIN publication_intervals i ON i.id=m.event_id WHERE m.done=0 AND m.error_reason IS NOT NULL GROUP BY m.error_reason")),
+                "thumbnailErrorReasons": dict(self.db.execute("SELECT COALESCE(error_reason,'unknown'),COUNT(*) FROM (" +
+                    self._media_publications_sql("m.error_reason AS error_reason", "m.done=0 AND m.error_reason IS NOT NULL") +
+                    ") GROUP BY error_reason")),
                 "visualGroups": self.db.execute("SELECT COUNT(*) FROM visual_groups").fetchone()[0]}
 
     def pending_media(self, now_ms):
-        rows = self.db.execute("SELECT i.id,i.camera,i.class,i.start,i.end,i.provenance,i.delivered_revision,i.classes FROM media m JOIN publication_intervals i ON i.id=m.event_id WHERE m.done=0 AND m.attempts<20 AND m.next_attempt<=? AND m.last_attempt<? AND i.start<? AND i.delivered_revision=i.revision ORDER BY i.start LIMIT 1",
-                               (now_ms, now_ms - 15000, now_ms - 1500)).fetchall()
+        query = self._media_publications_sql("i.id,i.camera,i.class,i.start,i.end,i.provenance,i.delivered_revision",
+            "m.done=0 AND m.attempts<20 AND m.next_attempt<=? AND m.last_attempt<? AND i.start<? AND i.delivered_revision=i.revision",
+            include_classes=True)
+        rows = self.db.execute(query + " ORDER BY start LIMIT 1",
+                               (now_ms, now_ms - 15000, now_ms - 1500) * 2).fetchall()
         return [{"eventId": r[0], "cameraId": r[1], "classes": json.loads(r[7]) if r[7] else [r[2]], "start": r[3], "end": r[4], "provenance": json.loads(r[5]), "deliveredRevision": r[6]} for r in rows]
 
     def media_attempt(self, event_id, now_ms, success, error_reason=None):
