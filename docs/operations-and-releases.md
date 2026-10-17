@@ -90,7 +90,8 @@ python tools/deploy.py install --events-only --update-monitor --fmp4-startup-con
 The JSON contains `enabled: true`, `fullGopCameraIds` and `nginxFilePins` (path/SHA256
 pairs). The full-GOP allowlist is limited to the reviewed Eingang
 `6ac8ae7001ab6d03e4006410`, Garage `6ac83fed00bd6d03e4001b81`, Garten
-`6ac844bf02026d03e4001f5f` and Vor dem Haus `6ac8ae7102b76d03e4006447` IDs.
+`6ac844bf02026d03e4001f5f`, Vor dem Haus `6ac8ae7102b76d03e4006447`, Neubau Eingang
+`6ac83993001a6d03e4001690` and Hintertür `6ac844bd01096d03e4001f22` IDs.
 Enable an exception only when its actual frontend scope has been reviewed and
 freshly pinned. It requires exact current hashes for
 `/etc/nginx/nginx.conf`, `/ssd1/.data/unifi-core/config/http/shared-runnable-protect.conf`
@@ -239,6 +240,9 @@ every counted sample has positive size. Metadata parsing has a global track/samp
 work limit as well as a byte limit. Unsupported padding stays unverified;
 the first audio/video clock starts may differ by up to five seconds for a four-second
 full GOP, with at least two seconds of shared timeline. This is not a lip-sync check;
+with `allowPartialGOP=false`, fragment freshness allows its observed complete-GOP
+duration plus one second, bounded to at most five seconds. Partial-GOP freshness
+retains the three-second limit. All continuity, payload and progress gates remain;
 no warmup hides a startup timestamp jump. Browser flags are wall clock, progressive,
 extended metadata, 100-ms fragments and no zero rebasing. The probe uses native
 loopback EMS TCP, with `allowPartialGOP=false` only for the pinned frontend

@@ -13,14 +13,14 @@ EPOCH=1792230000*1000
 
 def box(kind, data):return struct.pack('!I4s',len(data)+8,kind)+data
 
-def initialization(audio=True,video_size=1):
+def initialization(audio=True,video_size=1,duration=100):
     tracks=[];defaults=[]
     for tid,kind in ((1,b'vide'),(2,b'soun')) if audio else ((1,b'vide'),):
         tkhd=box(b'tkhd',struct.pack('!IIII',0,0,0,tid))
         mdhd=box(b'mdhd',struct.pack('!IIII',0,0,0,1000))
         hdlr=box(b'hdlr',struct.pack('!II4s',0,0,kind))
         tracks.append(box(b'trak',tkhd+box(b'mdia',mdhd+hdlr)))
-        defaults.append(box(b'trex',struct.pack('!IIIIII',0,tid,1,100,video_size if tid==1 else 1,0)))
+        defaults.append(box(b'trex',struct.pack('!IIIIII',0,tid,1,duration,video_size if tid==1 else 1,0)))
     return box(b'moov',b''.join(tracks)+box(b'mvex',b''.join(defaults)))
 
 def fragment(index,*,audio=True,first_relative=False,backward=False,audio_offset=0,payload_size=None):
@@ -147,6 +147,21 @@ class StartupProbeTests(unittest.TestCase):
             result,_,_=self.check(values)
             self.assertFalse(result['ok']);self.assertEqual(result['errorCode'],'missing_sample_size')
 
+    def test_full_gop_freshness_uses_observed_duration_with_hard_five_second_cap(self):
+        for full_gop in (True,False):
+            collector=fmp4.StartupClock(0,full_gop=full_gop)
+            collector.on_box(b'moov',initialization(duration=400)[8:],0)
+            for index,arrival in ((0,2),(4,6)):
+                moof,_=fragment(index)
+                collector.on_box(b'moof',moof[8:],arrival)
+                collector.on_box(b'mdat',b'',arrival,body_bytes=20)
+            rows,checks=collector.result(9.2,True)
+            self.assertTrue(checks['continuousFromFirstFragment']);self.assertTrue(checks['samplePayloadSizes'])
+            self.assertEqual(checks['freshProgress'],full_gop)
+            self.assertTrue(all(row['freshnessBudgetSeconds']==(5 if full_gop else 3)for row in rows))
+            _,checks=collector.result(11.01,True)
+            self.assertFalse(checks['freshProgress'])
+
     def test_full_gop_exceptions_require_current_explicit_nginx_pins(self):
         cid='6ac8ae7001ab6d03e4006410'
         config={'bridges':[{'cameraId':cid}], 'fmp4Startup':{'enabled':True,'fullGopCameraIds':[cid]}}
@@ -156,7 +171,8 @@ class StartupProbeTests(unittest.TestCase):
             '/ssd1/.data/unifi-core/config/http/upstream-protect_api_backend.conf')]
         options=fmp4.configuration(config)
         self.assertFalse(fmp4.browser_flags(options,cid)['allowPartialGOP'])
-        reviewed=[cid,'6ac83fed00bd6d03e4001b81','6ac844bf02026d03e4001f5f','6ac8ae7102b76d03e4006447']
+        reviewed=[cid,'6ac83fed00bd6d03e4001b81','6ac844bf02026d03e4001f5f','6ac8ae7102b76d03e4006447',
+                  '6ac83993001a6d03e4001690','6ac844bd01096d03e4001f22']
         config['bridges']=[{'cameraId':value}for value in reviewed]+[{'cameraId':CID}]
         config['fmp4Startup']['fullGopCameraIds']=reviewed
         options=fmp4.configuration(config)

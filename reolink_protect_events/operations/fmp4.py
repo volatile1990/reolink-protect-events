@@ -420,7 +420,8 @@ def configuration(config):
     # These are the reviewed frontend exceptions, not a general way to suppress
     # a failed browser flag on a different camera.
     need(set(ids) <= {'6ac8ae7001ab6d03e4006410', '6ac83fed00bd6d03e4001b81',
-                     '6ac844bf02026d03e4001f5f', '6ac8ae7102b76d03e4006447'}, 'fmp4_configuration_invalid')
+                     '6ac844bf02026d03e4001f5f', '6ac8ae7102b76d03e4006447',
+                     '6ac83993001a6d03e4001690', '6ac844bd01096d03e4001f22'}, 'fmp4_configuration_invalid')
     need(isinstance(pins, list) and len(pins) <= 8 and (not ids or bool(pins)), 'fmp4_configuration_invalid')
     seen = set()
     for pin in pins:
@@ -465,8 +466,9 @@ def browser_flags(options, camera_id):
 
 class StartupClock:
     """Include the very first fragment; no warmup can hide a startup discontinuity."""
-    def __init__(self, started):
+    def __init__(self, started, *, full_gop=False):
         self.started = started
+        self.full_gop = full_gop
         self.tracks, self.defaults, self.stats, self.pending = {}, {}, {}, None
         self.payload_fragments = self.payload_bytes = self.sample_bytes = 0
         self.payload_sizes_valid = True
@@ -497,7 +499,7 @@ class StartupClock:
                 state = self.stats.setdefault(tid, {'trackId': tid, 'kind': 'video' if info['video'] else 'audio',
                     'timescale': scale, 'fragments': 0, 'samples': 0, 'first': fragment['decodeStart'],
                     'end': fragment['decodeStart'], 'duration': 0, 'firstWall': now, 'lastWall': now,
-                    'clockGaps': 0, 'clockOverlaps': 0})
+                    'clockGaps': 0, 'clockOverlaps': 0, 'maximumFragmentDurationSeconds': 0})
                 if state['fragments']:
                     delta = fragment['decodeStart'] - state['end']
                     state['clockGaps'] += int(delta > 0)
@@ -505,6 +507,7 @@ class StartupClock:
                 state['fragments'] += 1; state['samples'] += fragment['samples']
                 state['end'] = fragment['decodeEnd']; state['duration'] += fragment['duration']
                 state['lastWall'] = now
+                state['maximumFragmentDurationSeconds'] = max(state['maximumFragmentDurationSeconds'],fragment['duration']/scale)
             self.pending = None
 
     def result(self, ended, expected_audio):
@@ -512,12 +515,13 @@ class StartupClock:
         for state in self.stats.values():
             scale = state['timescale']; span = (state['end'] - state['first']) / scale
             rows.append({k: state[k] for k in ('trackId', 'kind', 'timescale', 'fragments', 'samples',
-                                               'clockGaps', 'clockOverlaps')})
+                                               'clockGaps', 'clockOverlaps', 'maximumFragmentDurationSeconds')})
             rows[-1].update(initialClockOrigin='epoch' if state['first'] / scale >= 1_000_000_000 else 'relative',
                 firstDecodeSeconds=state['first'] / scale, mediaSpanSeconds=span,
                 summedDurationSeconds=state['duration'] / scale,
                 observedSpanSeconds=state['lastWall'] - state['firstWall'],
-                lastFragmentAgeSeconds=max(0, ended - state['lastWall']))
+                lastFragmentAgeSeconds=max(0, ended - state['lastWall']),
+                freshnessBudgetSeconds=max(3,min(5,state['maximumFragmentDurationSeconds']+1))if self.full_gop else 3)
         video = [s for s in rows if s['kind'] == 'video']; audio = [s for s in rows if s['kind'] == 'audio']
         # A full GOP can delay the first video fragment by four seconds while
         # audio already advances. Compare their overlapping clock windows; this
@@ -536,7 +540,7 @@ class StartupClock:
                 and 2 <= s['mediaSpanSeconds'] <= 20
                 and abs(s['mediaSpanSeconds'] - s['summedDurationSeconds']) <= 1 / s['timescale'] + 1e-6
                 for s in rows),
-            'freshProgress': bool(rows) and all(s['observedSpanSeconds'] >= 2 and s['lastFragmentAgeSeconds'] <= 3
+            'freshProgress': bool(rows) and all(s['observedSpanSeconds'] >= 2 and s['lastFragmentAgeSeconds'] <= s['freshnessBudgetSeconds']
                                                for s in rows),
             'overlappingTrackClocks': not expected_audio or bool(video and audio) and
                 abs(start_skew) <= 5 and overlap >= 2}
@@ -579,7 +583,7 @@ def probe_fmp4(config, camera, channel, *, seconds=12, api=None, connector=None,
             ('127.0.0.1', endpoint.port), timeout=remaining)
         need(clock() < deadline, 'fmp4_setup_timeout')
         connection.settimeout(max(0.01, deadline - clock())); connection.sendall(leading)
-        started = clock(); deadline = started + seconds; collector = StartupClock(started)
+        started = clock(); deadline = started + seconds; collector = StartupClock(started,full_gop=flags['allowPartialGOP']is False)
         parser = BoxStream(collector.on_box); framed = ProtectFrameStream(parser)
         prelude = bytearray(); wire = None
         while clock() < deadline:
