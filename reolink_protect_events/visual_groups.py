@@ -15,6 +15,12 @@ import time
 VISUAL_CLASSES = frozenset(("person", "vehicle", "animal"))
 MANUAL_GROUP_SCHEMA_VERSION = 1
 
+# Track grouping-relevant changes through every SQLite connection, including
+# administrative tools. Cursor/counter/media-only commits do not alter grouping.
+# fusion_inputs is optional and can appear after this object.
+_GROUP_INPUT_TABLES = ("intervals", "visual_groups", "visual_group_members",
+                       "visual_group_segments", "visual_group_manual", "fusion_inputs")
+
 # Explicit historical snapshots are owned by their bounded administrative
 # operation. A source shared with an ordinary group remains in the ordinary
 # lifecycle; an exclusively manual source must never be clipped by activation
@@ -95,8 +101,68 @@ class VisualGroups:
         """Forget optimization state after a surrounding transaction rolls back."""
         self._camera_signatures = {}
         self._next_due = {}
-        self._data_version = None
-        self._total_changes = None
+        self._input_token = None
+        self._tracking_signature = None
+
+    def _schema_signature(self):
+        # The schema cookie can be reused after transaction/savepoint rollback.
+        # Check definitions as well: a dropped/replaced trigger must not leave
+        # grouping silently stale even when that cookie matches an old cache.
+        return (self.db.execute("PRAGMA schema_version").fetchone()[0], tuple(self.db.execute(
+            "SELECT type,name,sql FROM sqlite_master WHERE type IN ('table','trigger') ORDER BY type,name")))
+
+    def _track_inputs(self, signature):
+        """Install transactional invalidation under the caller's writer lock.
+
+        A random token rather than a counter prevents rollback/savepoint ABA:
+        a reverted write followed by another write must never reuse a cached
+        generation. Old runtimes safely ignore this additive table and triggers.
+        A schema change rechecks exact trigger definitions and forces grouping,
+        including a writer that removed/replaced a trigger before changing data.
+        """
+        if signature == self._tracking_signature:
+            return
+        self.db.execute("CREATE TABLE IF NOT EXISTS visual_group_changes("
+                        "id INTEGER PRIMARY KEY CHECK(id=1), token BLOB NOT NULL CHECK(length(token)=16))")
+        self.db.execute("INSERT OR IGNORE INTO visual_group_changes VALUES(1,randomblob(16))")
+        tables = {row[0] for row in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        actual = dict(self.db.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger'"))
+        for table in _GROUP_INPUT_TABLES:
+            if table not in tables:
+                continue
+            for action in ("INSERT", "UPDATE", "DELETE"):
+                name = "visual_group_change_" + table + "_" + action.lower()
+                condition = ""
+                if action == "UPDATE" and table in ("visual_groups", "fusion_inputs"):
+                    # Delivery acknowledgements do not change a group's shape;
+                    # the next genuine input change reads their latest values.
+                    # _ranges reads only these four raw fusion input columns.
+                    columns = (("id", "camera", "class", "start", "end", "last_seen", "provenance", "revision", "classes")
+                               if table == "visual_groups" else ("camera", "class", "start", "end"))
+                    condition = " WHEN " + " OR ".join("OLD." + col + " IS NOT NEW." + col for col in columns)
+                sql = ("CREATE TRIGGER " + name + " AFTER " + action + " ON " + table +
+                       condition + " BEGIN UPDATE visual_group_changes SET token=randomblob(16) WHERE id=1; END")
+                if actual.get(name) != sql:
+                    self.db.execute("DROP TRIGGER IF EXISTS " + name)
+                    self.db.execute(sql)
+
+    def _change_token(self):
+        row = self.db.execute("SELECT token FROM visual_group_changes WHERE id=1").fetchone()
+        return row[0] if row else None
+
+    def _sync_tracked(self, now):
+        signature = self._schema_signature()
+        self._track_inputs(signature)
+        # A direct administrative delete invalidates the cache as well. Restore
+        # its token only inside the writer transaction, never on the fast read.
+        self.db.execute("INSERT OR IGNORE INTO visual_group_changes VALUES(1,randomblob(16))")
+        force = signature != self._tracking_signature or self._change_token() != self._input_token
+        # Recompute affected history even when only provenance, raw fusion
+        # bounds, manual membership or a rolled-back output changed. The prior
+        # row-signature shortcut alone cannot distinguish those mutations.
+        self._sync(now, force=force)
+        self._input_token = self._change_token()
+        self._tracking_signature = self._schema_signature()
 
     def _ranges(self, row, meta):
         """Use full fusion inputs, rather than its bounded diagnostic list.
@@ -127,26 +193,24 @@ class VisualGroups:
         BEGIN IMMEDIATE serializes the poller and native worker's independent
         SQLite connections before either decides which rows are still legacy.
         """
-        data_version = self.db.execute("PRAGMA data_version").fetchone()[0]
-        if (data_version == self._data_version and self.db.total_changes == self._total_changes
-                and all(now < due for due in self._next_due.values())):
-            return
         try:
+            signature = self._schema_signature()
+            if (signature == self._tracking_signature and self._change_token() == self._input_token
+                    and all(now < due for due in self._next_due.values())):
+                return
             if self.db.in_transaction:
                 # Journal.pending owns an atomic claim spanning grouping and
                 # its view SELECT. Never commit the caller's transaction.
-                self._sync(now)
+                self._sync_tracked(now)
             else:
                 with self.db:
                     self.db.execute("BEGIN IMMEDIATE")
-                    self._sync(now)
+                    self._sync_tracked(now)
         except BaseException:
             self.invalidate()
             raise
-        self._data_version = data_version
-        self._total_changes = self.db.total_changes
 
-    def _sync(self, now):
+    def _sync(self, now, force=False):
         if not self.enabled and not self.db.execute("SELECT 1 FROM visual_group_members LIMIT 1").fetchone():
             return
         if self.enabled and self.activation_ms is not None:
@@ -167,6 +231,9 @@ class VisualGroups:
         signatures = {camera: tuple(values) for camera, values in signatures.items()}
         dirty = {camera for camera in set(signatures) | set(self._camera_signatures)
                  if signatures.get(camera) != self._camera_signatures.get(camera)}
+        if force:
+            dirty.update(signatures)
+            dirty.update(self._camera_signatures)
         dirty.update(camera for camera, due in self._next_due.items() if now >= due)
         self._camera_signatures = signatures
         if not dirty:

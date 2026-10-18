@@ -119,3 +119,23 @@ class times, long-track partitions, late history, retention and favorite guards,
 and the real PostgreSQL transaction and search-label contracts in the isolated
 test database. Production verification uses genuine events and GET/read-only
 database checks; it never creates synthetic detections in the home timeline.
+
+## Grouping change tracking
+
+Version 1.5.5 skips historical grouping scans for commits that only update source
+cursors, counters, media attempts or Frigate poll state. A private, additive
+`visual_group_changes` row and SQLite triggers track actual grouping inputs,
+including writes by another connection or an administrative operation. A random
+transactional token avoids reusing a cached generation after rollback or
+savepoint replay. Relevant input changes force recomputation even when only
+provenance, raw fusion bounds or manual membership changed. Delivery-only group
+acknowledgments do not change group shape; subsequent input changes read their
+latest publication state.
+
+Each pass checks the schema cookie and exact table/trigger definitions, so a
+deleted or replaced tracking trigger is repaired under the existing writer lock.
+Definitions are checked even when a rolled-back schema cookie is reused. Source
+collection, native delivery, Frigate polling, health publication, retry deadlines
+and group time boundaries retain their existing cadence. No journal rows, media
+or history are removed. The previous 1.5.4 runtime safely ignores the additive
+tracking objects; its existing group/manual compatibility rules still apply.
