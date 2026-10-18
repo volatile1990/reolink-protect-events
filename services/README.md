@@ -9,7 +9,7 @@ dem Events-Package aus **diesem Repository** gebaut:
 
 Die Dateien wurden beim Zusammenführen byteidentisch aus
 `reolink-protect-controls/worker.py` beziehungsweise dessen `archive/` übernommen.
-Weitere Änderungen an diesen Diensten erfolgen hier. Das frühere Repository
+Weitere Änderungen an diesen Diensten erfolgen hier. Der frühere lose Projektordner ohne eigenes Git-Repository
 bleibt als historische Quelle und für seine separaten Diagnose-/UI-Werkzeuge
 erhalten; der Server-Build liest es nicht.
 

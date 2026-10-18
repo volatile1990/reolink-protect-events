@@ -125,4 +125,3 @@ def verify(config, bootstrap):
             'mainOnlyCameraCount': 1, 'recordingProfileCount': 11,
             'audioEnabled': True, 'sourceIdentityAndProfilePinsVerified': True,
             'recordingChannelsBasis': 'audited-7.3.70-enabled-profile-contract'}
-
