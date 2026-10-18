@@ -1,2 +1,2 @@
 """Native import of camera-originated Reolink classifications into Protect."""
-__version__ = "1.5.5"
+__version__ = "1.5.6"

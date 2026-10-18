@@ -171,6 +171,160 @@ class GroupChangeTrackingTests(unittest.TestCase):
         self.g.sync(NOW + 121000)
         self.assertEqual(self.j.db.execute("SELECT end FROM visual_groups").fetchone()[0], NOW + 120001)
 
+    def test_one_camera_update_never_rebuilds_an_unrelated_camera_history(self):
+        other_camera = "2" * 24
+        self.g.cameras.add(other_camera)
+        self.add("second", "person")
+        with self.j.db:
+            self.j.db.execute("UPDATE intervals SET camera=? WHERE id='second'", (other_camera,))
+        self.g.sync(NOW + 20000)
+        with self.j.db:
+            self.j.db.execute("UPDATE intervals SET last_seen=last_seen+1,revision=revision+1 WHERE id='first'")
+        with patch.object(self.g, "_ranges", wraps=self.g._ranges) as ranges:
+            self.g.sync(NOW + 20000)
+        self.assertGreater(ranges.call_count, 0)
+        self.assertEqual({call.args[0][1] for call in ranges.call_args_list}, {CAMERA})
+
+    def test_noop_interval_and_nonmember_audio_updates_skip_grouping(self):
+        self.add("audio", "sound")
+        self.g.sync(NOW + 20000)
+        with patch.object(self.g, "_sync", wraps=self.g._sync) as sync:
+            with self.j.db:
+                self.j.db.execute("UPDATE intervals SET last_seen=last_seen WHERE id='first'")
+                self.j.db.execute("UPDATE intervals SET last_seen=last_seen+100,revision=revision+1 WHERE id='audio'")
+            self.g.sync(NOW + 20000)
+            self.assertEqual(sync.call_count, 0)
+
+    def test_member_reclassified_as_audio_still_invalidates_its_camera(self):
+        token = self.g._camera_tokens[CAMERA]
+        with self.j.db:
+            self.j.db.execute("UPDATE intervals SET class='sound' WHERE id='first'")
+        self.g.sync(NOW + 20000)
+        self.assertNotEqual(token, self.g._camera_tokens[CAMERA])
+
+    def test_interval_move_invalidates_both_old_and_new_camera(self):
+        other_camera = "2" * 24
+        before = dict(self.g._camera_tokens)
+        with self.j.db:
+            self.j.db.execute("UPDATE intervals SET camera=? WHERE id='first'", (other_camera,))
+        actual = dict(self.j.db.execute("SELECT camera,token FROM visual_group_camera_changes"))
+        self.assertNotEqual(actual[CAMERA], before[CAMERA])
+        self.assertIn(other_camera, actual)
+
+    def test_orphan_manual_marker_resolves_camera_through_member_segments(self):
+        with self.j.db:
+            self.j.db.execute("INSERT INTO visual_group_segments VALUES('orphan','first')")
+        self.g.sync(NOW + 20000)
+        before = dict(self.g._camera_tokens)
+        with self.j.db:
+            self.j.db.execute("INSERT INTO visual_group_manual VALUES('orphan','operation','[]','fixture')")
+        actual = dict(self.j.db.execute("SELECT camera,token FROM visual_group_camera_changes"))
+        self.assertNotEqual(actual[CAMERA], before[CAMERA])
+        self.assertEqual(actual.get('*'), before.get('*'))
+
+    def test_unresolvable_manual_reference_uses_full_recompute_fallback(self):
+        with self.j.db:
+            self.j.db.execute("INSERT INTO visual_group_manual VALUES('unknown','operation','[]','fixture')")
+        with patch.object(self.g, "_sync", wraps=self.g._sync) as sync:
+            self.g.sync(NOW + 20000)
+        self.assertTrue(sync.call_args.kwargs['force'])
+
+    def test_camera_tracking_table_drop_repairs_before_next_projection(self):
+        with self.j.db:
+            self.j.db.execute("DROP TABLE visual_group_camera_changes")
+        self.g.sync(NOW + 20000)
+        with self.j.db:
+            self.j.db.execute("UPDATE intervals SET last_seen=last_seen+1 WHERE id='first'")
+        self.g.sync(NOW + 20000)
+        self.assertIn(CAMERA, self.g._camera_tokens)
+
+    def test_source_upsert_and_replace_conflict_policies_preserve_tracking(self):
+        for statement in (
+            "INSERT INTO intervals(id,camera,class,start,end,last_seen,provenance) VALUES('first',?,'vehicle',?,?,?,'{}') ON CONFLICT(id) DO UPDATE SET last_seen=excluded.last_seen",
+            "INSERT OR REPLACE INTO intervals(id,camera,class,start,end,last_seen,provenance) VALUES('first',?,'vehicle',?,?,?,'{}')",
+        ):
+            with self.subTest(statement=statement):
+                previous = self.g._camera_tokens[CAMERA]
+                with self.j.db:
+                    self.j.db.execute(statement, (CAMERA, NOW + 1, NOW + 10000, NOW + 10001))
+                self.g.sync(NOW + 20000)
+                self.assertNotEqual(previous, self.g._camera_tokens[CAMERA])
+        previous = self.g._camera_tokens[CAMERA]
+        with self.j.db:
+            self.j.db.execute("INSERT OR IGNORE INTO intervals(id,camera,class) VALUES('first',?,'person')", (CAMERA,))
+        self.g.sync(NOW + 20000)
+        self.assertEqual(previous, self.g._camera_tokens[CAMERA])
+
+    def test_exact_trigger_restore_after_ddl_rollback_cannot_hide_source_change(self):
+        name = 'visual_group_change_intervals_update'
+        original = self.j.db.execute('SELECT sql FROM sqlite_master WHERE name=?', (name,)).fetchone()[0]
+        self.j.db.execute('BEGIN IMMEDIATE')
+        self.j.db.execute('DROP TRIGGER ' + name)
+        self.g.sync(NOW + 20000)
+        cached = self.g._tracking_signature
+        repaired_marker = self.g._camera_tokens['*']
+        self.j.db.rollback()
+        with self.j.db:
+            self.j.db.execute('DROP TRIGGER ' + name)
+            self.j.db.execute("UPDATE intervals SET class='animal' WHERE id='first'")
+            self.j.db.execute(original)
+        self.assertEqual(cached, self.g._schema_signature())
+        self.g.sync(NOW + 20000)
+        self.assertIn('animal', json.loads(self.rows()[0][1]))
+        self.assertNotEqual(repaired_marker, self.g._camera_tokens['*'])
+
+    def test_foreign_exact_trigger_restore_after_ddl_rollback_cannot_hide_change(self):
+        name = 'visual_group_change_intervals_update'
+        original = self.j.db.execute('SELECT sql FROM sqlite_master WHERE name=?', (name,)).fetchone()[0]
+        self.j.db.execute('BEGIN IMMEDIATE')
+        self.j.db.execute('DROP TRIGGER ' + name)
+        self.g.sync(NOW + 20000)
+        cached = self.g._tracking_signature
+        self.j.db.rollback()
+        other = sqlite3.connect(self.path)
+        self.addCleanup(other.close)
+        with other:
+            other.execute('DROP TRIGGER ' + name)
+            other.execute("UPDATE intervals SET class='animal' WHERE id='first'")
+            other.execute(original)
+        self.assertEqual(cached, self.g._schema_signature())
+        self.g.sync(NOW + 20000)
+        self.assertIn('animal', json.loads(self.rows()[0][1]))
+
+    def test_committed_schema_repair_keeps_unrelated_commit_fast_path(self):
+        with self.j.db:
+            self.j.db.execute('DROP TRIGGER visual_group_change_intervals_update')
+        self.j.pending()
+        self.assertIn('*', self.g._camera_tokens)
+        with patch.object(self.g, '_sync', wraps=self.g._sync) as sync:
+            with self.j.db:
+                self.j.count('unrelated_after_confirmed_commit')
+            self.j.pending()
+        self.assertEqual(sync.call_count, 0)
+
+    def test_schema_rollback_with_other_camera_tracked_write_still_repairs_first_camera(self):
+        other_camera = '2' * 24
+        self.g.cameras.add(other_camera)
+        self.add('second')
+        with self.j.db:
+            self.j.db.execute("UPDATE intervals SET camera=? WHERE id='second'", (other_camera,))
+        self.g.sync(NOW + 20000)
+        name = 'visual_group_change_intervals_update'
+        original = self.j.db.execute('SELECT sql FROM sqlite_master WHERE name=?', (name,)).fetchone()[0]
+        self.j.db.execute('BEGIN IMMEDIATE')
+        self.j.db.execute('DROP TRIGGER ' + name)
+        self.g.sync(NOW + 20000)
+        cached = self.g._tracking_signature
+        self.j.db.rollback()
+        with self.j.db:
+            self.j.db.execute('DROP TRIGGER ' + name)
+            self.j.db.execute("UPDATE intervals SET class='animal' WHERE id='first'")
+            self.j.db.execute(original)
+            self.j.db.execute("UPDATE intervals SET last_seen=last_seen+1,revision=revision+1 WHERE id='second'")
+        self.assertEqual(cached, self.g._schema_signature())
+        self.g.sync(NOW + 20000)
+        self.assertIn('animal', json.loads(self.j.db.execute('SELECT classes FROM visual_groups WHERE camera=?', (CAMERA,)).fetchone()[0]))
+
 
 if __name__ == "__main__":
     unittest.main()

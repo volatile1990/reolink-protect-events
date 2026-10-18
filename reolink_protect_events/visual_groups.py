@@ -80,6 +80,8 @@ class VisualGroups:
         CREATE TABLE IF NOT EXISTS visual_group_manual(group_id TEXT PRIMARY KEY,operation_id TEXT UNIQUE,
           source_ids TEXT,digest TEXT);
         CREATE INDEX IF NOT EXISTS visual_groups_camera ON visual_groups(camera,start);
+        CREATE INDEX IF NOT EXISTS visual_groups_pending ON visual_groups(start)
+          WHERE delivered_revision<revision OR notified_revision<revision;
         CREATE INDEX IF NOT EXISTS visual_group_segments_interval ON visual_group_segments(interval_id);
         CREATE VIEW IF NOT EXISTS publication_intervals AS
           SELECT i.id,i.camera,i.class,i.start,i.end,i.last_seen,i.provenance,i.revision,
@@ -102,6 +104,7 @@ class VisualGroups:
         self._camera_signatures = {}
         self._next_due = {}
         self._input_token = None
+        self._camera_tokens = {}
         self._tracking_signature = None
 
     def _schema_signature(self):
@@ -125,6 +128,8 @@ class VisualGroups:
         self.db.execute("CREATE TABLE IF NOT EXISTS visual_group_changes("
                         "id INTEGER PRIMARY KEY CHECK(id=1), token BLOB NOT NULL CHECK(length(token)=16))")
         self.db.execute("INSERT OR IGNORE INTO visual_group_changes VALUES(1,randomblob(16))")
+        self.db.execute("CREATE TABLE IF NOT EXISTS visual_group_camera_changes("
+                        "camera TEXT PRIMARY KEY, token BLOB NOT NULL CHECK(length(token)=16))")
         tables = {row[0] for row in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         actual = dict(self.db.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger'"))
         for table in _GROUP_INPUT_TABLES:
@@ -133,18 +138,52 @@ class VisualGroups:
             for action in ("INSERT", "UPDATE", "DELETE"):
                 name = "visual_group_change_" + table + "_" + action.lower()
                 condition = ""
-                if action == "UPDATE" and table in ("visual_groups", "fusion_inputs"):
+                versions = (("NEW",) if action == "INSERT" else ("OLD",) if action == "DELETE" else ("OLD", "NEW"))
+                if action == "UPDATE" and table in ("visual_groups", "fusion_inputs", "intervals"):
                     # Delivery acknowledgements do not change a group's shape;
                     # the next genuine input change reads their latest values.
                     # _ranges reads only these four raw fusion input columns.
                     columns = (("id", "camera", "class", "start", "end", "last_seen", "provenance", "revision", "classes")
-                               if table == "visual_groups" else ("camera", "class", "start", "end"))
+                               if table == "visual_groups" else ("camera", "class", "start", "end")
+                               if table == "fusion_inputs" else ("id", "camera", "class", "start", "end", "last_seen", "provenance", "revision", "delivered_revision", "notified_revision"))
                     condition = " WHEN " + " OR ".join("OLD." + col + " IS NOT NEW." + col for col in columns)
+                if table == "intervals":
+                    # Audio/nonmember rows cannot enroll in visual grouping.
+                    # Existing membership remains authoritative even if an
+                    # administrative correction changes a member's class.
+                    relevant = " OR ".join(version + ".class IN ('person','vehicle','animal') OR EXISTS(SELECT 1 FROM visual_group_members WHERE interval_id=" + version + ".id)" for version in versions)
+                    condition = (" WHEN (" + condition[6:] + ") AND (" + relevant + ")") if condition else " WHEN " + relevant
+                references = []
+                for version in versions:
+                    if table in ("intervals", "visual_groups", "fusion_inputs"):
+                        references.append("SELECT " + version + ".camera AS camera")
+                    elif table == "visual_group_members":
+                        references.append("SELECT camera FROM intervals WHERE id=" + version + ".interval_id")
+                    else:
+                        references.append("SELECT camera FROM visual_groups WHERE id=" + version + ".group_id")
+                        if table == "visual_group_segments":
+                            references.append("SELECT camera FROM intervals WHERE id=" + version + ".interval_id")
+                        else:
+                            references.append("SELECT i.camera FROM intervals i JOIN visual_group_segments s ON s.interval_id=i.id WHERE s.group_id=" + version + ".group_id")
+                lookup = " UNION ".join(references)
+                # Explicit UPSERT is required here. An outer source UPSERT can
+                # override INSERT OR REPLACE's conflict policy inside triggers.
+                changes = (" INSERT INTO visual_group_camera_changes SELECT camera,randomblob(16) FROM (" + lookup + ") WHERE camera IS NOT NULL ON CONFLICT(camera) DO UPDATE SET token=excluded.token;"
+                           " INSERT INTO visual_group_camera_changes SELECT '*',randomblob(16) WHERE NOT EXISTS(SELECT 1 FROM (" + lookup + ") WHERE camera IS NOT NULL) ON CONFLICT(camera) DO UPDATE SET token=excluded.token;")
                 sql = ("CREATE TRIGGER " + name + " AFTER " + action + " ON " + table +
-                       condition + " BEGIN UPDATE visual_group_changes SET token=randomblob(16) WHERE id=1; END")
+                       condition + " BEGIN UPDATE visual_group_changes SET token=randomblob(16) WHERE id=1;" + changes + " END")
                 if actual.get(name) != sql:
                     self.db.execute("DROP TRIGGER IF EXISTS " + name)
                     self.db.execute(sql)
+        # Schema cookies and exact definitions can both be restored after DDL
+        # rollback. Persist a fresh schema-revalidation nonce in the SAME
+        # transaction. Rollback then changes the observed markers even when an
+        # untracked write is surrounded by byte-identical trigger replacement.
+        # The wildcard also forces all cameras if another camera had a genuine
+        # tracked mutation while the first camera's trigger was absent.
+        self.db.execute("UPDATE visual_group_changes SET token=randomblob(16) WHERE id=1")
+        self.db.execute("INSERT INTO visual_group_camera_changes VALUES('*',randomblob(16)) "
+                        "ON CONFLICT(camera) DO UPDATE SET token=excluded.token")
 
     def _change_token(self):
         row = self.db.execute("SELECT token FROM visual_group_changes WHERE id=1").fetchone()
@@ -156,12 +195,17 @@ class VisualGroups:
         # A direct administrative delete invalidates the cache as well. Restore
         # its token only inside the writer transaction, never on the fast read.
         self.db.execute("INSERT OR IGNORE INTO visual_group_changes VALUES(1,randomblob(16))")
-        force = signature != self._tracking_signature or self._change_token() != self._input_token
+        tokens = dict(self.db.execute("SELECT camera,token FROM visual_group_camera_changes"))
+        changed = {camera for camera in set(tokens) | set(self._camera_tokens)
+                   if tokens.get(camera) != self._camera_tokens.get(camera)}
+        force = (signature != self._tracking_signature or '*' in changed or
+                 self._change_token() != self._input_token and not changed)
         # Recompute affected history even when only provenance, raw fusion
         # bounds, manual membership or a rolled-back output changed. The prior
         # row-signature shortcut alone cannot distinguish those mutations.
-        self._sync(now, force=force)
+        self._sync(now, force=force, force_cameras=None if force else changed)
         self._input_token = self._change_token()
+        self._camera_tokens = dict(self.db.execute("SELECT camera,token FROM visual_group_camera_changes"))
         self._tracking_signature = self._schema_signature()
 
     def _ranges(self, row, meta):
@@ -210,32 +254,46 @@ class VisualGroups:
             self.invalidate()
             raise
 
-    def _sync(self, now, force=False):
+    def _sync(self, now, force=False, force_cameras=None):
         if not self.enabled and not self.db.execute("SELECT 1 FROM visual_group_members LIMIT 1").fetchone():
             return
+        targets = None if force_cameras is None else set(force_cameras) | {
+            camera for camera, due in self._next_due.items() if now >= due}
+        enrollment = self.cameras if targets is None else self.cameras & targets
         if self.enabled and self.activation_ms is not None:
             rows = self.db.execute("SELECT id,camera,class,start,provenance FROM intervals "
                                    "WHERE delivered_revision=0 AND notified_revision=0 AND class IN ('person','vehicle','animal') "
-                                   "AND (end IS NULL OR end>=?) AND camera IN (" + ",".join("?" for _ in self.cameras) + ") "
+                                   "AND (end IS NULL OR end>=?) AND camera IN (" + ",".join("?" for _ in enrollment) + ") "
                                    "AND id NOT IN (SELECT interval_id FROM visual_group_members)",
-                                   (self.activation_ms, *sorted(self.cameras))).fetchall() if self.cameras else []
+                                   (self.activation_ms, *sorted(enrollment))).fetchall() if enrollment else []
             for identifier, camera, label, start, raw in rows:
                 identity = json.loads(raw).get("identityStart", start)
                 if camera in self.cameras and type(identity) is int and identity >= self.activation_ms:
                     self.db.execute("INSERT OR IGNORE INTO visual_group_members VALUES(?)", (identifier,))
         signatures = {}
+        scope = "" if targets is None else " AND i.camera IN (" + ",".join("?" for _ in targets) + ")"
         for row in self.db.execute("SELECT i.id,i.camera,i.class,i.start,i.end,i.last_seen,i.revision "
                                    "FROM intervals i JOIN visual_group_members m ON m.interval_id=i.id "
-                                   "WHERE " + _AUTOMATIC_MEMBER + " ORDER BY i.id"):
+                                   "WHERE " + _AUTOMATIC_MEMBER + scope + " ORDER BY i.id", tuple(sorted(targets)) if targets is not None else ()):
             signatures.setdefault(row[1], []).append(row)
         signatures = {camera: tuple(values) for camera, values in signatures.items()}
-        dirty = {camera for camera in set(signatures) | set(self._camera_signatures)
+        compared = set(signatures) | set(self._camera_signatures) if targets is None else targets
+        dirty = {camera for camera in compared
                  if signatures.get(camera) != self._camera_signatures.get(camera)}
         if force:
             dirty.update(signatures)
             dirty.update(self._camera_signatures)
+        if force_cameras is not None:
+            dirty.update(force_cameras)
         dirty.update(camera for camera, due in self._next_due.items() if now >= due)
-        self._camera_signatures = signatures
+        if targets is None:
+            self._camera_signatures = signatures
+        else:
+            for camera in targets:
+                if camera in signatures:
+                    self._camera_signatures[camera] = signatures[camera]
+                else:
+                    self._camera_signatures.pop(camera, None)
         if not dirty:
             return
         marks = ",".join("?" for _ in dirty)

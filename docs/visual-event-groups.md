@@ -139,3 +139,18 @@ collection, native delivery, Frigate polling, health publication, retry deadline
 and group time boundaries retain their existing cadence. No journal rows, media
 or history are removed. The previous 1.5.4 runtime safely ignores the additive
 tracking objects; its existing group/manual compatibility rules still apply.
+
+Version 1.5.6 records transactional random tokens per camera as well, so a
+changed camera rebuilds only its own history. Old and new camera IDs are tracked
+for moved rows; manual and segment references resolve through both group and
+source identities. Unresolvable graph references and schema changes use a
+wildcard to force the full safe check. Schema revalidation rotates both the
+global and wildcard tokens, covering even rollback followed by byte-identical
+trigger restoration around an otherwise untracked write. No-op interval updates
+and audio rows outside permanent visual membership do not trigger visual work.
+All existing grouping, delivery, media, health and retry cadences remain intact.
+
+A partial pending index on visual groups reduces idle outbox scans. The media
+membership lookup uses the equal driving media key to filter hidden source rows
+before fetching their interval. Publication SQL, retry boundaries, ordering and
+the media/outbox limits retain the same semantics.

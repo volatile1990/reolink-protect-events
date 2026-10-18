@@ -361,7 +361,9 @@ class Journal:
             selected = columns
             if include_classes:
                 selected += "," + ("NULL" if table == "intervals" else "i.classes") + " AS classes"
-            membership = " AND NOT EXISTS(SELECT 1 FROM visual_group_members member WHERE member.interval_id=i.id)" if table == "intervals" else ""
+            # i.id=m.event_id below. Use the driving media key so SQLite can
+            # reject hidden members before its interval primary-key lookup.
+            membership = " AND NOT EXISTS(SELECT 1 FROM visual_group_members member WHERE member.interval_id=m.event_id)" if table == "intervals" else ""
             branches.append("SELECT " + selected + " FROM media m CROSS JOIN " + table +
                             " i ON i.id=m.event_id WHERE " + predicate + membership)
         return " UNION ALL ".join(branches)
