@@ -90,6 +90,8 @@ def validate_config(config):
     from .frigate import settings as frigate_settings
     frigate_settings(config)
     grouping_settings(config)
+    from .remote import settings as remote_settings
+    remote_settings(config)
     return config
 
 
@@ -116,11 +118,15 @@ def recording_thumbnail(config, interval):
     """Select genuine recorded snapshots; preserve the original event timestamp."""
     from .native import Thumbnail
     from .thumbnails import settings, select_recorded
+    from .remote import settings as remote_settings
+    remote = remote_settings(config)
+    snapshot_port = remote["snapshotPort"] if remote is not None else 7080
     headers = {"X-UserId": config["protectUserId"], "X-UserRole": "owner", "X-UserPermissionMask": "64",
                "X-UserPermissions": "65535", "X-Internal-Use": "true"}
     def recorded(timestamp, timeout):
         path = "/api/cameras/" + interval["cameraId"] + "/snapshot?ts=" + str(timestamp)
-        status, content = get_bytes("http://127.0.0.1:7080" + path, headers, timeout=timeout, limit=2097152)
+        status, content = get_bytes("http://127.0.0.1:" + str(snapshot_port) + path,
+                                    headers, timeout=timeout, limit=2097152)
         if status != 200:
             raise ValueError("recording_http_" + str(status))
         thumbnail = Thumbnail(content, timestamp)
@@ -494,17 +500,20 @@ class Runtime:
         self._closed = False
 
     def initialize_native(self):
-        from .native import NativeAdapter
+        from .native import adapter_for_config
+        from .remote import settings as remote_settings
         from .updates import DsUpdateClient
         for client in self.clients.values():
             client.close()
         self.clients = {}
-        self.native = NativeAdapter(protect_version=self.config.get("protectVersion", "7.3.70"))
+        self.native = adapter_for_config(self.config)
         self.native.guard_schema()
+        remote = remote_settings(self.config)
+        ds_port = remote["dsPort"] if remote is not None else self.config["dsProxyPort"]
         for bridge in self.config["bridges"]:
             if self._stop.is_set():
                 return
-            self.clients[bridge["cameraId"]] = DsUpdateClient(bridge["mac"], port=self.config["dsProxyPort"])
+            self.clients[bridge["cameraId"]] = DsUpdateClient(bridge["mac"], port=ds_port)
             self.clients[bridge["cameraId"]].connect()
         self.native_ready = True
 

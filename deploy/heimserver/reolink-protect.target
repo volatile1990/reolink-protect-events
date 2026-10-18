@@ -1,0 +1,7 @@
+[Unit]
+Description=Camera integration services on the dedicated home server
+Wants=reolink-protect-ssh.service reolink-protect-events.service reolink-protect-media-monitor.service reolink-protect-controls.service reolink-protect-archive.service
+After=network-online.target
+
+[Install]
+WantedBy=multi-user.target

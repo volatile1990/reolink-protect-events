@@ -1,0 +1,18 @@
+[Unit]
+Description=Private camera services connection to UniFi Protect
+PartOf=reolink-protect.target
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+RuntimeDirectory=reolink-protect-ssh
+RuntimeDirectoryMode=0700
+ExecStart=/usr/bin/ssh -N -M -oControlPersist=no -oExitOnForwardFailure=yes -L 127.0.0.1:17448:127.0.0.1:7448 -L 127.0.0.1:17080:127.0.0.1:7080 -L 127.0.0.1:17443:127.0.0.1:7443 -L 127.0.0.1:17702:127.0.0.1:7702 -R 127.0.0.1:7712:127.0.0.1:7712 -R /run/reolink-protect-controls/controls.sock:/run/reolink-protect-controls/controls.sock udm-protect
+Restart=always
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=reolink-protect.target

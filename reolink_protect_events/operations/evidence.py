@@ -4,12 +4,15 @@ from contextlib import closing
 from pathlib import Path
 import sqlite3
 from ..http_deadline import get_bytes
-from ..native import _jpeg_size, sql_text
+from ..native import _jpeg_size
+from ..remote import settings as remote_settings
 from .http import protect_json
 from .safety import private_path, read_json
 
 
 def inspect(config, root='/data/reolink-protect-events'):
+    remote = remote_settings(config)
+    api_port = remote['apiPort'] if remote is not None else 7443
     root = Path(root)
     health = read_json(private_path(root / 'health.json'))
     path = private_path(root / 'journal.sqlite3')
@@ -29,7 +32,7 @@ def inspect(config, root='/data/reolink-protect-events'):
                 genuine = own.get('owner') == 'reolink-protect-events' and event.get('camera') == camera
                 headers = {'X-UserId': config['protectUserId'], 'X-UserRole': 'owner', 'X-UserPermissionMask': '64',
                            'X-UserPermissions': '65535', 'X-Internal-Use': 'true'}
-                code, image = get_bytes('https://127.0.0.1:7443/api/events/' + eid + '/thumbnail?isFullfov=true',
+                code, image = get_bytes('https://127.0.0.1:' + str(api_port) + '/api/events/' + eid + '/thumbnail?isFullfov=true',
                                         headers, timeout=10, limit=2097152)
                 dimensions = _jpeg_size(image) if code == 200 else None
                 selections.append({'eventId': eid, 'cameraId': camera, 'class': cls, 'startMs': start, 'endMs': end,

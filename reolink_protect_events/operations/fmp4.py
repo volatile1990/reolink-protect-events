@@ -11,6 +11,7 @@ import socket
 import struct
 import time
 import urllib.parse
+from ..remote import RemoteError, open_socket as remote_open_socket, rpc as remote_rpc, settings as remote_settings
 from .http import protect_json
 from .safety import OperationError, error_code, need
 
@@ -440,8 +441,20 @@ def configuration(config):
     return {'enabled': enabled, 'fullGopCameraIds': ids, 'nginxFilePins': pins}
 
 
-def verify_configuration(options):
+def verify_configuration(options, config=None, *, timeout=8):
     """Read public nginx files only; never interpret a changed exception as valid."""
+    if config is not None and remote_settings(config) is not None:
+        pins = options['nginxFilePins']
+        if not pins:
+            return True
+        try:
+            hashes = remote_rpc(config, 'hashes', {'paths': [pin['path'] for pin in pins]}, timeout=timeout)
+            need(isinstance(hashes, dict) and set(hashes) == {pin['path'] for pin in pins}
+                 and all(hashes.get(pin['path']) == pin['sha256'] for pin in pins),
+                 'fmp4_configuration_drift')
+        except RemoteError:
+            raise OperationError('fmp4_configuration_drift') from None
+        return True
     for pin in options['nginxFilePins']:
         path = Path(pin['path'])
         try:
@@ -556,12 +569,15 @@ def probe_fmp4(config, camera, channel, *, seconds=12, api=None, connector=None,
          if c.get('enabled') is True}, 'fmp4_channel_invalid')
     flags = browser_flags(options, camera['id']); clock = clock or time.monotonic; api = api or protect_json
     began = clock(); deadline = began + 8; connection = None; started = None; received = 0
-    collector = None; parser = None; first = None; failure = None; returned = None
+    collector = None; parser = None; first = None; failure = None; returned = None; observed_ended = None
     try:
-        verify_configuration(options)
+        verify_configuration(options, config, timeout=max(0.01, deadline - clock()))
+        need(clock() < deadline, 'fmp4_setup_timeout')
         query = {'camera': camera['id'], 'channel': channel, 'lens': 0, 'type': 'fmp4', **flags}
         query = {k: str(v).lower() if type(v) is bool else v for k, v in query.items()}
-        metadata = api(config, '/api/tcp/livestream?' + urllib.parse.urlencode(query), timeout=5, limit=65536)
+        metadata = api(config, '/api/tcp/livestream?' + urllib.parse.urlencode(query),
+                       timeout=min(5, max(0.01, deadline - clock())), limit=65536)
+        need(clock() < deadline, 'fmp4_setup_timeout')
         endpoint = urllib.parse.urlsplit(metadata.get('uri', ''))
         need(endpoint.scheme == 'tcp' and endpoint.hostname in ('127.0.0.1', 'localhost')
              and not endpoint.username and not endpoint.password and not endpoint.fragment
@@ -578,9 +594,14 @@ def probe_fmp4(config, camera, channel, *, seconds=12, api=None, connector=None,
         returned = {k: params.get(k) for k in flags}
         need(params.get('type') == 'fmp4' and params.get('channel') == channel and returned == flags,
              'fmp4_effective_flags_mismatch')
+        need(clock() < deadline, 'fmp4_setup_timeout')
         remaining = max(0.01, deadline - clock())
-        connection = connector(endpoint.port, remaining) if connector else socket.create_connection(
-            ('127.0.0.1', endpoint.port), timeout=remaining)
+        if connector:
+            connection = connector(endpoint.port, remaining)
+        elif remote_settings(config) is not None:
+            connection = remote_open_socket(config, endpoint.port, remaining)
+        else:
+            connection = socket.create_connection(('127.0.0.1', endpoint.port), timeout=remaining)
         need(clock() < deadline, 'fmp4_setup_timeout')
         connection.settimeout(max(0.01, deadline - clock())); connection.sendall(leading)
         started = clock(); deadline = started + seconds; collector = StartupClock(started,full_gop=flags['allowPartialGOP']is False)
@@ -599,14 +620,18 @@ def probe_fmp4(config, camera, channel, *, seconds=12, api=None, connector=None,
                 wire = framed if prelude[0] in framed.NAMES else parser
                 chunk = bytes(prelude); prelude.clear()
             wire.feed(chunk, now)
-        verify_configuration(options)
+        # End the bounded viewer session before a remote pin read. Its latency
+        # must neither keep the viewer open nor age already observed samples.
+        observed_ended = clock()
+        connection.close(); connection = None
+        verify_configuration(options, config)
     except ProbeError as error:
         failure = str(error)  # Parser errors have a fixed vocabulary.
     except Exception as error:
         failure = error_code(error, 'fmp4_transport_failed')
     finally:
         if connection is not None: connection.close()
-    ended = clock()
+    ended = observed_ended if observed_ended is not None else clock()
     tracks, checks = collector.result(ended, camera.get('thirdPartyCameraInfo', {}).get('enableRtspAudio') is True) \
         if collector else ([], {'video': False, 'audio': False, 'samplePayloadSizes': False, 'continuousFromFirstFragment': False,
                               'freshProgress': False, 'overlappingTrackClocks': False})

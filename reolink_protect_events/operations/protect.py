@@ -15,7 +15,7 @@ OBSERVED_THIRD = frozenset(('availableProfiles','mediaVersion','errors'))
 
 
 def selected_cameras(config, bootstrap, *, require_version=True):
-    validate_config(config)
+    validate_config(config, require_credentials=False)
     need(isinstance(bootstrap, dict), 'bootstrap_invalid')
     if require_version:
         need(bootstrap.get('nvr', {}).get('version') == VERSION, 'unsupported_protect_version')

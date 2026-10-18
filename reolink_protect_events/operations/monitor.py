@@ -52,7 +52,7 @@ def run_once(config,root,*,allow_repair=False,now_ms=None,startup_at_ms=None,api
         startup_options=fmp4_configuration(config)
         startup_configuration_ok=True
         if startup_options['enabled']:
-            try:verify_fmp4_configuration(startup_options)
+            try:verify_fmp4_configuration(startup_options, config)
             except OperationError:startup_configuration_ok=False
         need(set(state['cameras'])<={b['cameraId']for b in config['bridges']},'monitor_state_scope_changed')
         marker=maintenance(root);api=api or protect_json;probe=probe or probe_ubv

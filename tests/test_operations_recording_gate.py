@@ -154,6 +154,7 @@ class VerificationSourcesTests(unittest.TestCase):
         backend.events_repo = self.root / 'events'
         backend.host = 'unifi-dream-machine'
         backend.connector = 'external-protected-connector'
+        backend.bridge_settings = {}
         backend.progress = Mock()
         backend.operation_sources = 'current-mutation-source'
         backend.verification_sources = 'current-readonly-verifier'

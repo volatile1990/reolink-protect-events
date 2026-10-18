@@ -26,6 +26,21 @@ class CompatibilityTests(unittest.TestCase):
                 'rtspClient':'gstreamer','recordingSettings':{'mode':'always'},
                 'channels':[{'id':0,'enabled':True}],
                 'thirdPartyCameraInfo':{'forceTcp':None,'enableRtspAudio':True}})
+        self.auto_scope=[]
+        for index,camera in enumerate(self.boot['cameras']):
+            dual=index<5
+            camera['channels']=[{'id':cid,'enabled':True}for cid in((0,1,2)if dual else(0,))]
+            third=camera['thirdPartyCameraInfo']
+            third.update(rtspUrl='rtsp://'+camera['host']+':8554/main',profileToken='main')
+            if dual:
+                third.update(rtspUrlLQ='rtsp://'+camera['host']+':8554/sub',profileTokenLQ='sub')
+            pin={key:camera[key]for key in('id','host','mac')}
+            if dual:
+                pin.update({field+'Sha256':sha(third[field].encode())for field in('rtspUrl','rtspUrlLQ','profileToken','profileTokenLQ')})
+                self.auto_scope.append(pin)
+            else:
+                pin.update({field+'Sha256':sha(third[field].encode())for field in('rtspUrl','profileToken')})
+                self.main_only=pin
         service=compatibility.SERVICE_PATH
         self.old=b'synthetic-reviewed-predecessor';self.new=b'synthetic-reviewed-automatic-layer'
         self.old_files={path:(self.old if path==service else ('synthetic:'+path).encode())
@@ -71,6 +86,8 @@ class CompatibilityTests(unittest.TestCase):
              patch.object(compatibility,'AUTOMATIC_FILES',self.auto_expected), \
              patch.object(compatibility,'AUTOMATIC_ADDITIONAL_FILES',self.additional_expected), \
              patch.object(compatibility,'AUTOMATIC_WATCH_FILES',self.watch_expected), \
+             patch.object(compatibility.automatic_profiles,'SCOPE',self.auto_scope), \
+             patch.object(compatibility.automatic_profiles,'MAIN_ONLY',self.main_only), \
              patch.object(compatibility,'private_path',side_effect=private), \
              patch.object(compatibility,'read_json',side_effect=read):
             return compatibility.assess(self.config,api=lambda *_:copy.deepcopy(self.boot if boot is None else boot),
@@ -101,10 +118,22 @@ class CompatibilityTests(unittest.TestCase):
         self.assertTrue(report['certified'],report);self.assertTrue(report['nativeWritesAllowed'])
         self.assertTrue(report['checks']['serviceAndAacLayers'])
         self.assertTrue(report['checks']['automaticInputLayerOwnership'])
-        self.assertTrue(report['automaticInputLayer']['allCameraSettingsVerified'])
+        self.assertTrue(report['automaticInputLayer']['currentProfileContractVerified'])
+        self.assertTrue(report['automaticInputLayer']['historicalSettingsBaselineMatches'])
         self.assertTrue(report['automaticInputLayer']['nginxRegenerationGuardVerified'])
         self.assertTrue(report['automaticInputLayer']['nginxEventWatchFilesVerified'])
         self.assertEqual(self.reads,['fixed-private-receipt'])
+
+    def test_metadata_only_scope_needs_no_dummy_or_real_bridge_credentials(self):
+        from reolink_protect_events.operations.safety import validate_config
+        for bridge in self.config['bridges']:
+            bridge.pop('username'); bridge.pop('password')
+        self.assertIs(validate_config(self.config, require_credentials=False), self.config)
+        with self.assertRaisesRegex(OperationError, 'monitor_bridge_credentials_invalid'):
+            validate_config(self.config)
+        report = self.assess()
+        self.assertTrue(report['ok'], report)
+        self.assertTrue(report['automaticInputLayer']['currentProfileContractVerified'])
 
     def test_unknown_service_cannot_be_authorized_by_a_forged_matching_receipt(self):
         unknown=b'synthetic-unknown-service';self.data[compatibility.SERVICE_PATH]=unknown
@@ -179,11 +208,54 @@ class CompatibilityTests(unittest.TestCase):
         report=self.assess();self.assert_drift(report)
         self.assertFalse(report['checks']['uiLayerOwnership'])
 
-    def test_other_camera_settings_change_invalidates_owned_layer(self):
+    def test_normal_user_or_motion_capability_changes_do_not_repin_historical_receipt(self):
         changed=copy.deepcopy(self.boot)
         changed['cameras'][-1]['recordingSettings']['mode']='motion'
-        report=self.assess(boot=changed);self.assert_drift(report)
-        self.assertEqual(report['errorCode'],'compatibility_auto_camera_settings_changed')
+        changed['cameras'][-1]['featureFlags']={'hasMotionDetection':False}
+        changed['cameras'][-1]['thirdPartyCameraInfo']['motionDetection']='unavailable'
+        changed['cameras'][0]['osdSettings']={'isNameEnabled':False}
+        changed['cameras'][1]['micVolume']=25
+        before=copy.deepcopy(self.receipt)
+        report=self.assess(boot=changed)
+        self.assertTrue(report['ok'],report)
+        self.assertFalse(report['automaticInputLayer']['historicalSettingsBaselineMatches'])
+        self.assertFalse(report['automaticInputLayer']['historicalSettingsBaselineEnforced'])
+        self.assertNotEqual(report['currentSettingsSha256'],self.receipt['baseline']['settingsSha256'])
+        self.assertEqual(self.receipt,before)
+
+    def test_actual_automatic_identity_source_profile_channel_and_audio_drift_fail(self):
+        mutations=[lambda c:c.update(mac='000000000000'),lambda c:c.update(rtspClient='different'),
+            lambda c:c.update(isPairedWithAiPort=True),
+            lambda c:c['channels'][1].update(enabled=False),
+            lambda c:c['channels'].append({'id':2,'enabled':True}),
+            lambda c:c.update(recordingChannels=[0,1,2]),
+            lambda c:c['thirdPartyCameraInfo'].update(profileTokenLQ='different'),
+            lambda c:c['thirdPartyCameraInfo'].update(rtspUrlLQ='rtsp://unrelated.invalid/sub'),
+            lambda c:c['thirdPartyCameraInfo'].update(enableRtspAudio=False)]
+        for mutate in mutations:
+            with self.subTest(mutation=mutate):
+                changed=copy.deepcopy(self.boot);mutate(changed['cameras'][0])
+                self.assert_drift(self.assess(boot=changed))
+        for mutation in ('channels','source'):
+            changed=copy.deepcopy(self.boot);camera=changed['cameras'][-1]
+            if mutation=='channels':camera['channels'].append({'id':2,'enabled':True})
+            else:camera['thirdPartyCameraInfo']['rtspUrl']='rtsp://unrelated.invalid:8554/main'
+            self.assert_drift(self.assess(boot=changed))
+
+    def test_hq_only_accepts_exact_approved_native_uri_not_a_guessed_path(self):
+        changed=copy.deepcopy(self.boot)
+        uri='rtsp://'+changed['cameras'][-1]['host']+':8554/approved-native-onvif-profile'
+        changed['cameras'][-1]['thirdPartyCameraInfo']['rtspUrl']=uri
+        self.main_only['rtspUrlSha256']=sha(uri.encode())
+        self.assertTrue(self.assess(boot=changed)['ok'])
+        for field,value in(('rtspUrl',uri+'-foreign'),('profileToken','foreign-profile'),
+                           ('rtspUrlLQ',uri),('profileTokenLQ','sub')):
+            with self.subTest(field=field):
+                mismatch=copy.deepcopy(changed)
+                mismatch['cameras'][-1]['thirdPartyCameraInfo'][field]=value
+                report=self.assess(boot=mismatch)
+                self.assert_drift(report)
+                self.assertEqual(report['errorCode'],'compatibility_auto_main_only_source_changed')
 
     def test_receipt_is_root_private_regular_and_single_link(self):
         for field,value in (('st_uid',1000),('st_mode',stat.S_IFREG|0o644),

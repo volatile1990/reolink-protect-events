@@ -34,7 +34,10 @@ try:
   result=execute(request['request'])
  else:
   path=pathlib.Path(request.get('configPath','/data/reolink-protect-events/config.json'))
-  if str(path)!='/data/reolink-protect-events/config.json':raise RuntimeError('config_scope_invalid')
+  if path.as_posix()!='/data/reolink-protect-events/config.json':raise RuntimeError('config_scope_invalid')
+  marker=pathlib.Path('/data/reolink-protect-connector/server-architecture.json')
+  if action=='compatibility' and (marker.exists() or marker.is_symlink()):
+   path=pathlib.Path('/data/reolink-protect-connector/compatibility.json')
   config=read_json(private_path(path))
   if action=='compatibility':
    from reolink_protect_events.operations.compatibility import assess
@@ -59,6 +62,47 @@ try:
  print(json.dumps(result))
 except Exception as error:
  print(json.dumps({'ok':False,'errorCode':getattr(error,'code','remote_operation_failed'),'errorType':type(error).__name__}))
+'''
+
+
+# Keep the new host paths in a separate dispatcher. A caller cannot select a
+# config/state path, install an old UDM package, or fall back to the retired UDM
+# journal when the server profile is selected.
+SERVER_BOOTSTRAP = BOOTSTRAP[:BOOTSTRAP.index('try:\n from reolink_protect_events.operations.safety')] + r'''
+try:
+ from reolink_protect_events.operations.safety import private_path,read_json,ensure_root
+ from reolink_protect_events.remote import settings
+ request=bundle['request'];action=request['action']
+ if 'configPath' in request:raise RuntimeError('server_config_override_forbidden')
+ root=pathlib.Path('/srv/cameras/protect')
+ config=read_json(private_path(root/'config/events.json'))
+ remote=settings(config)
+ if remote is None or remote['sshAlias']!='udm-protect':raise RuntimeError('server_remote_profile_required')
+ if action=='health':
+  from reolink_protect_events.operations.media_health import run_once
+  result=run_once(config,mode=request.get('mode','quick'),prior=request.get('prior'),camera_ids=request.get('cameraIds'))
+ elif action=='recover':
+  from reolink_protect_events.operations.recovery import rebuild
+  result=rebuild(config,ensure_root(root/'state/monitor'),request['cameraId'],maintenance_owner=request.get('owner'))
+ elif action=='monitor-status':
+  from reolink_protect_events.operations.installer import state_of
+  result={'ok':True,'service':state_of('reolink-protect-media-monitor.service')}
+  for name in ('health','state'):
+   path=root/'state/monitor'/(name+'.json')
+   if path.exists():result[name]=read_json(private_path(path))
+ elif action=='event-evidence':
+  from reolink_protect_events.operations.evidence import inspect
+  result=inspect(config,root=root/'state/events')
+ elif action=='installer' and request.get('request',{}).get('mode')=='maintenance':
+  from reolink_protect_events.operations import installer
+  installer.monitor_root=ensure_root(root/'state/monitor')
+  value=request['request']
+  if type(value.get('enable'))is not bool:raise RuntimeError('server_maintenance_enable_invalid')
+  result=installer.maintenance(value['owner'],value['enable'])
+ else:raise RuntimeError('server_operation_action_invalid')
+ print(json.dumps(result))
+except Exception as error:
+ print(json.dumps({'ok':False,'errorCode':getattr(error,'code','server_operation_failed'),'errorType':type(error).__name__}))
 '''
 
 
@@ -89,3 +133,23 @@ def invoke(repo, host, request, timeout=150, sources=None):
     if response.returncode != 0 or not isinstance(result, dict) or type(result.get('ok')) is not bool:
         raise RuntimeError('operation_transport_failed')
     return result
+
+
+def invoke_server(repo, host, request, timeout=180, sources=None):
+    if host != 'heimserver':
+        raise ValueError('heimserver_ssh_alias_required')
+    payload = json.dumps({'sources': sources if sources is not None else source_bundle(repo), 'request': request})
+    command = 'sudo -n python3 -B -c ' + shlex.quote(SERVER_BOOTSTRAP)
+    try:
+        response = subprocess.run(['ssh', '-T', '-oBatchMode=yes', '-oConnectTimeout=10',
+                                   '-oStrictHostKeyChecking=yes', host, command],
+                                  input=payload, text=True, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, timeout=timeout)
+        if response.returncode != 0 or len(response.stdout) > 8 * 1024 * 1024:
+            raise RuntimeError('server_operation_transport_failed')
+        result = json.loads(response.stdout)
+        if not isinstance(result, dict) or type(result.get('ok')) is not bool:
+            raise RuntimeError('server_operation_transport_failed')
+        return result
+    except (OSError, subprocess.TimeoutExpired, ValueError, TypeError):
+        raise RuntimeError('server_operation_transport_failed') from None

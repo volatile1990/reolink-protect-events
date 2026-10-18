@@ -7,6 +7,7 @@ import stat
 from ..native import NativeAdapter
 from .http import protect_json
 from .protect import selected_cameras, settings_digest
+from . import automatic_profiles
 from .safety import VERSION, OperationError, error_code, need, private_path, read_json, validate_config
 
 ACTIVE_FILES={
@@ -77,12 +78,16 @@ def _automatic_input_layer(config,bootstrap,file_reader):
         need(hashlib.sha256(file_reader(name)).hexdigest()==expected,
              'compatibility_auto_nginx_watch_changed')
     baseline=receipt.get('baseline')
-    need(isinstance(baseline,dict)and baseline.get('settingsSha256')==settings_digest(config,bootstrap),
-         'compatibility_auto_camera_settings_changed')
+    need(isinstance(baseline,dict)and isinstance(baseline.get('settingsSha256'),str)
+         and re.fullmatch('[a-f0-9]{64}',baseline['settingsSha256']),
+         'compatibility_auto_historical_baseline_invalid')
+    profiles=automatic_profiles.verify(config,bootstrap)
     return {'operation':operation,'ownedAppliedLayer':True,'startupFilesVerified':True,
             'nginxRegenerationGuardVerified':True,
             'nginxEventWatchFilesVerified':True,
-            'allCameraSettingsVerified':True,'serviceSha256':AUTOMATIC_SERVICE_SHA256}
+            'currentProfileContract':profiles,'currentProfileContractVerified':True,
+            'historicalSettingsBaselineMatches':baseline['settingsSha256']==settings_digest(config,bootstrap),
+            'historicalSettingsBaselineEnforced':False,'serviceSha256':AUTOMATIC_SERVICE_SHA256}
 
 
 def _layers(events_root,ids,file_reader):
@@ -125,7 +130,7 @@ def _layers(events_root,ids,file_reader):
 
 def assess(config,events_root='/data/reolink-protect-events',*,api=None,file_reader=None,schema_reader=None,
            layer_reader=None):
-    validate_config(config);api=api or protect_json
+    validate_config(config, require_credentials=False);api=api or protect_json
     result={'schemaVersion':1,'readOnly':True,'certified':False,'nativeWritesAllowed':False,
             'autoUpgradeAllowed':False,'fullDatabaseRollbackAllowed':False,'checks':{}}
     try:
@@ -136,6 +141,7 @@ def assess(config,events_root='/data/reolink-protect-events',*,api=None,file_rea
                           nextAction='inspect_and_test_new_release_contracts');return result
         cameras=selected_cameras(config,bootstrap);ids=[c['id']for c in cameras]
         result['checks']['cameraScope']=True
+        result['currentSettingsSha256']=settings_digest(config,bootstrap)
         schema=(schema_reader or (lambda:NativeAdapter().guard_schema()))()
         result['checks']['databaseContract']=schema.get('schemaVerified')is True
         file_reader=file_reader or (lambda path:Path(path).read_bytes())

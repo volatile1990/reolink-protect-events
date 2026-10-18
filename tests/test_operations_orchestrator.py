@@ -69,7 +69,8 @@ class FakeBackend:
     def udm(self,request,timeout=None):
         self.calls.append(('udm',copy.deepcopy(request),self.marker))
         action=request['action']
-        if action=='compatibility':return {'ok':not self.unknown_compat,'state':'unsupported'if self.unknown_compat else'compatible'}
+        if action=='compatibility':return {'ok':not self.unknown_compat,'state':'unsupported'if self.unknown_compat else'compatible',
+                                           'currentSettingsSha256':'f'*64}
         if action=='health':
             ids=request.get('cameraIds');rows=[]
             for ip in IPS:
@@ -486,6 +487,23 @@ class BackendFreezeTests(unittest.TestCase):
     def tearDown(self):self.temp.cleanup()
     def construct(self):
         return Backend(self.root/'bridge',self.root/'events','external-protected-connector.py',progress=lambda _:None)
+    def test_target_settings_are_copied_to_every_worker_request_without_payload_override(self):
+        settings={'scope':'/srv/cameras/bridges','runtimeUid':1026,'renderGroup':992,
+                  'restartPolicy':'unless-stopped','maintenanceMode':'deployment-lock'}
+        with patch.object(orchestrator,'load_module',side_effect=[self.bridge,self.nas]), \
+             patch.object(orchestrator,'source_bundle',return_value='synthetic-events'):
+            backend=Backend(self.root/'bridge',self.root/'events','strict-heimserver-connector',
+                            progress=lambda _:None,bridge_settings=settings)
+            settings['scope']='/unwanted-later-change'
+            payload={'mode':'inventory'}
+            backend.nas(payload)
+            self.assertEqual(payload,{'mode':'inventory'})
+            sent=self.nas.invoke.call_args.args[0]
+            self.assertEqual(sent['settings']['scope'],'/srv/cameras/bridges')
+            self.assertEqual(sent['settings']['renderGroup'],992)
+            self.assertEqual(self.nas.invoke.call_args.args[1],'strict-heimserver-connector')
+            with self.assertRaisesRegex(orchestrator.UpdateError,'bridge_settings_override_rejected'):
+                backend.nas({'mode':'inventory','settings':{'scope':'/volume1/docker/old'}})
     def test_actual_backend_keeps_captured_worker_sources_after_checkout_changes(self):
         with patch.object(orchestrator,'load_module',side_effect=[self.bridge,self.nas]),\
              patch.object(orchestrator,'source_bundle',return_value='original-owned-events')as bundle,\

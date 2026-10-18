@@ -1,0 +1,25 @@
+[Unit]
+Description=Reolink camera controls worker
+PartOf=reolink-protect.target
+Requires=camera-host-access.service
+After=camera-host-access.service
+
+[Service]
+Type=simple
+RuntimeDirectory=reolink-protect-controls
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=REOLINK_CONTROLS_CONFIG=/srv/cameras/protect/config/controls.json
+Environment=REOLINK_CONTROLS_SOCKET=/run/reolink-protect-controls/controls.sock
+Environment=REOLINK_CONTROLS_SOCKET_UID=0
+Environment=REOLINK_CONTROLS_SOCKET_GID=0
+Environment=REOLINK_CONTROLS_SOCKET_DIR_MODE=0750
+Environment=REOLINK_CONTROLS_SOCKET_MODE=0660
+ExecStart=/usr/bin/python3 -B /srv/cameras/protect/current/controls/worker.py
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=reolink-protect.target

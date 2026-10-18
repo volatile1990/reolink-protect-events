@@ -23,20 +23,71 @@ retry deadlines, notification rules and polling intervals remain unchanged.
 
 This implementation is pinned to **Protect 7.3.70** and its shipped UI **7.3.26**. It uses private console internals because Protect's published integration API does not provide Smart Detection ingestion. A version/schema mismatch stops native delivery while the source journal keeps collecting; applying the frontend patch additionally requires the exact known UI hashes. Supporting another Protect release requires inspecting and testing that release.
 
+## Remote operation on the Debian server
+
+For the canonical four-component builder, CAS updates and separately installed
+Events/Bridge push hooks, see [server releases](docs/server-release.md).
+
+The remote transport runs Events collection, the SQLite journal/outbox, source
+fusion, visual groups, thumbnail selection and the media monitor on the Debian
+camera server. Protect keeps its recordings, native PostgreSQL database and
+existing UI/feature adaptations on the console. The console connector is a
+stateless SSH forced command: it installs no listener, journal or resident Events
+service. This is a code/deployment mode; completion of a live migration still
+requires its separate state-transfer and acceptance checks.
+
+Presence of this public configuration selects the remote mode:
+
+```json
+{
+  "protectRemote": {
+    "sshAlias": "udm-protect",
+    "rpcCommand": "python3 /usr/local/lib/reolink-protect-connector.py",
+    "snapshotPort": 17080,
+    "dsPort": 17448,
+    "apiPort": 17443
+  }
+}
+```
+
+The trusted alias is provisioned separately. The server's persistent SSH service
+binds these three forwards only to `127.0.0.1`, reaching console ports 7080, 7448
+and 7443 respectively. RPC requests carry SQL and version/API/hash operations on
+SSH stdin, never in command arguments. Bounded `stream:<port>` SSH sessions also
+carry native media; UBV TLS and media parsing terminate on the server. Nothing
+opens Protect's PostgreSQL or internal DS/API ports to the LAN.
+
+Native event IDs, schema/version guards, journal revisions, deletion protection
+and the existing at-least-once notification boundary remain unchanged. Move one
+consistent journal, including any WAL and all cursor/outbox/group/media state;
+never run old and new publishers concurrently. Preserve the monitor's repair
+budgets and pending restoration receipts too. A transport timeout does not
+acknowledge an event or trigger an immediate blind retry. The Debian release
+needs a matching Python/Pillow dependency rather than the legacy ARM64 bundle.
+
+The [server unit definitions](deploy/heimserver) describe the remote services.
+Without `protectRemote`, the Python runtime retains its existing console-local
+behavior. The console installer and legacy deployment examples below continue
+to target that older local mode; changing their SSH destination alone does not
+install the remote server layout.
+
 ## Data flow
 
 ```mermaid
 flowchart LR
-    C[Reolink camera AI] --> B[reolink-bridge on Synology]
-    B -->|authenticated /events replay| J[Durable SQLite journal on console]
-    J --> P[Atomic Protect PostgreSQL event + object + search labels]
+    C[Reolink camera AI] --> B[reolink-bridge on camera server]
+    B -->|authenticated /events replay| J[Durable SQLite journal on camera server]
+    J -->|trusted SSH connector| P[Atomic Protect PostgreSQL event + object + search labels]
     P --> D[Loopback updates-ds native event lifecycle]
     D --> U[Protect timeline, Find Anything and native alarm processing]
-    V[Existing Protect recording] -->|historical snapshot at source time| T[Native preview and full-frame thumbnails]
+    V[Existing Protect recording] -->|SSH snapshot forward at source time| T[Server selects native preview and full-frame thumbnails]
     T --> P
 ```
 
-The collector runs on the Protect console to keep PostgreSQL and the DS WebSocket on loopback. The video bridges remain on Synology. No database port is exposed and no camera is re-adopted.
+In remote mode, the collector and video bridges run on the camera server while
+the SSH connection keeps PostgreSQL, DS and Protect API access private to
+loopback. The original console-local collector mode remains supported. Neither
+mode exposes a database port or re-adopts cameras.
 
 For outdoor cameras configure the bridge's `onvif.motion_event_policy` as `none`: source AI detections still arrive in `/events`, while generic ONVIF motion stays closed. For the indoor camera keep `all`. `classified` is a useful intermediate rollout setting, but it still generates generic motion for classified outdoor detections.
 

@@ -1,6 +1,6 @@
 """Local real video/audio decodes of existing bridge and Protect recordings.
 
-The UDM only reads private configuration and exports recorded bytes. Private
+The selected host reads private configuration and exports recorded bytes. Private
 SSH output, media, SDP and decoder logs stay in RAM; reports contain projections.
 All subprocesses, streams, HTTP bodies and concurrent viewers are bounded.
 """
@@ -33,6 +33,7 @@ SUBPROCESS_CLEANUP_RESERVE_SECONDS = 2
 EXPORT_RETRY_ERRORS = frozenset(('decode_export_timeout','decode_export_http_500',
                                   'decode_export_http_503','decode_recording_audio_missing'))
 DEFAULT_CONFIG = '/data/reolink-protect-events/config.json'
+SERVER_CONFIG = '/srv/cameras/protect/config/events.json'
 
 
 def _creation_options():
@@ -109,11 +110,12 @@ async def _run_bytes(command, *, input_data=None, timeout, stdout_limit, stderr_
             await asyncio.gather(*tasks, return_exceptions=True)
 
 
-def _ssh_command(alias):
+def _ssh_command(alias, *, server=False):
     need(isinstance(alias, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,79}', alias),
          'ssh_alias_invalid')
+    need(not server or alias == 'heimserver', 'heimserver_ssh_alias_required')
     return ['ssh', '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o',
-            'StrictHostKeyChecking=yes', alias, 'python3 -']
+            'StrictHostKeyChecking=yes', alias, 'sudo -n python3 -B -' if server else 'python3 -']
 
 
 # Public helper sources are carried through stdin. This works before upgrading
@@ -132,13 +134,18 @@ from reolink_protect_events.http_deadline import get_bytes,_DeadlineSocket
 from reolink_protect_events.operations.safety import need,read_json,private_path,validate_config,OperationError
 from reolink_protect_events.operations.http import owner_headers,protect_json,bridge_metrics
 from reolink_protect_events.operations.protect import selected_cameras,qualities
+from reolink_protect_events.remote import settings as remote_settings
 
 def context():
- path=payload['configPath'];need(path in ('/data/reolink-protect-events/config.json','/data/reolink-bridge-events/config.json'),'decode_config_path_invalid')
+ architecture=payload.get('architecture','udm');need(architecture in ('udm','heimserver'),'decode_architecture_invalid')
+ path=payload['configPath'];allowed=('/srv/cameras/protect/config/events.json',)if architecture=='heimserver'else('/data/reolink-protect-events/config.json','/data/reolink-bridge-events/config.json')
+ need(path in allowed,'decode_config_path_invalid')
  config=read_json(path,limit=262144);validate_config(config)
+ if architecture=='heimserver':
+  remote=remote_settings(config);need(remote is not None and remote['sshAlias']=='udm-protect','decode_remote_profile_required')
  release=payload.get('remoteRelease')
  if release is not None:
-  need(isinstance(release,str)and re.fullmatch('/data/reolink-protect-events/releases/[a-f0-9]{16,64}',release),'decode_release_path_invalid')
+  need(architecture=='udm'and isinstance(release,str)and re.fullmatch('/data/reolink-protect-events/releases/[a-f0-9]{16,64}',release),'decode_release_path_invalid')
   path=private_path(release,directory=True);need(path.is_dir(),'decode_release_unavailable')
  bootstrap=protect_json(config,'/api/bootstrap');cameras=selected_cameras(config,bootstrap)
  need(bootstrap['nvr'].get('isRecordingDisabled')is False,'decode_global_recording_disabled')
@@ -211,7 +218,9 @@ def export():
  need(type(recording_start)is int and recording_start<=start and end<=recording_end,'decode_recording_range_unavailable')
  if payload.get('notBeforeMs')is not None:need(start>=payload['notBeforeMs'],'decode_new_recording_pending')
  path='/api/video/export?'+urllib.parse.urlencode({'camera':camera['id'],'start':start,'end':end,'channel':p['channel']})
- try:status,content=get_bytes('http://127.0.0.1:7080'+path,owner_headers(config),timeout=35,limit=67108864)
+ port=7080
+ if payload.get('architecture','udm')=='heimserver':port=remote_settings(config)['snapshotPort']
+ try:status,content=get_bytes('http://127.0.0.1:'+str(port)+path,owner_headers(config),timeout=35,limit=67108864)
  except TimeoutError:raise OperationError('decode_export_timeout')from None
  if status in(500,503):raise OperationError('decode_export_http_'+str(status))
  need(status==200,'decode_export_rejected')
@@ -235,7 +244,8 @@ def _remote_source(payload):
     need(type(payload.get('exportWindowMs')) is int and payload['exportWindowMs'] == EXPORT_WINDOW_MS,
          'decode_export_window_invalid')
     package = Path(__file__).resolve().parents[1]
-    helpers = [('reolink_protect_events.http_deadline', package / 'http_deadline.py')]
+    helpers = [('reolink_protect_events.remote', package / 'remote.py'),
+               ('reolink_protect_events.http_deadline', package / 'http_deadline.py')]
     helpers += [('reolink_protect_events.operations.' + name, package / 'operations' / (name + '.py'))
                 for name in ('safety', 'http', 'protect')]
     value = dict(payload, helpers=[(name, path.read_text(encoding='utf-8')) for name, path in helpers])
@@ -614,7 +624,8 @@ def _coverage(profiles,rows):
 
 
 def run_full_decodes(ssh_alias='unifi-dream-machine', *, config_path=DEFAULT_CONFIG, remote_release=None,
-                     ips=None, ffmpeg=None, ffprobe=None, duration=5, recording_lag_seconds=30, not_before_ms=None):
+                     ips=None, ffmpeg=None, ffprobe=None, duration=5, recording_lag_seconds=30, not_before_ms=None,
+                     architecture='udm'):
     """Return a projected read-only real-decode gate; missing tools never pass.
 
     A subset can pass its explicitly requested scope, but UPDATE must also
@@ -629,9 +640,12 @@ def run_full_decodes(ssh_alias='unifi-dream-machine', *, config_path=DEFAULT_CON
         report[key]={'expectedRequested':0,'checked':0,'passed':0,'expectedFull':11,'allRequested':False,'allEleven':False}
     profiles=[]
     try:
-        duration=_duration(duration);ssh=_ssh_command(ssh_alias)
-        need(config_path in (DEFAULT_CONFIG,'/data/reolink-bridge-events/config.json'),'decode_config_path_invalid')
-        need(remote_release is None or isinstance(remote_release,str) and
+        duration=_duration(duration)
+        need(architecture in ('udm','heimserver'), 'decode_architecture_invalid')
+        ssh=_ssh_command(ssh_alias, server=architecture=='heimserver')
+        allowed=(SERVER_CONFIG,) if architecture=='heimserver' else (DEFAULT_CONFIG,'/data/reolink-bridge-events/config.json')
+        need(config_path in allowed,'decode_config_path_invalid')
+        need(remote_release is None or architecture=='udm' and isinstance(remote_release,str) and
              re.fullmatch(r'/data/reolink-protect-events/releases/[a-f0-9]{16,64}',remote_release), 'decode_release_path_invalid')
         selected=sorted(HOSTS) if not ips else list(ips)
         need(1<=len(selected)<=6 and len(set(selected))==len(selected) and set(selected)<=HOSTS,'decode_scope_invalid')
@@ -641,7 +655,7 @@ def run_full_decodes(ssh_alias='unifi-dream-machine', *, config_path=DEFAULT_CON
         exe=_executable(ffmpeg,'ffmpeg')
         sibling=Path(exe).with_name('ffprobe.exe'if os.name=='nt'else'ffprobe')
         probe=_executable(ffprobe or (str(sibling)if sibling.is_file()else None),'ffprobe')
-        payload={'action':'discover','configPath':config_path,'remoteRelease':remote_release,'ips':selected,
+        payload={'action':'discover','architecture':architecture,'configPath':config_path,'remoteRelease':remote_release,'ips':selected,
                  'lagSeconds':recording_lag_seconds,'notBeforeMs':not_before_ms,'exportWindowMs':EXPORT_WINDOW_MS}
         async def execute():
             nonlocal profiles

@@ -10,10 +10,11 @@ import subprocess
 import sys
 import time
 import uuid
-from .decode import EXPORT_WINDOW_SECONDS, MIN_RECORDED_SECONDS, run_full_decodes
+from .decode import EXPORT_WINDOW_SECONDS, MIN_RECORDED_SECONDS, SERVER_CONFIG, run_full_decodes
 from .release import build_package, source_snapshot
 from .locking import process_lock
-from .transport import invoke, source_bundle
+from .transport import invoke, invoke_server, source_bundle
+from .heimserver import invoke as invoke_heimserver, valid_digest
 
 IPS = ['192.168.30.' + str(i) for i in range(210, 216)]
 
@@ -121,11 +122,18 @@ def recording_audio_repair_candidate(report, ip, cid):
 
 class Backend:
     def __init__(self, bridge_repo, events_repo, connector, host='unifi-dream-machine', ffmpeg=None, ffprobe=None,
-                 dependency_cache=None, progress=None):
+                 dependency_cache=None, progress=None, bridge_settings=None, architecture='udm',
+                 server_host='heimserver'):
         self.bridge_repo = Path(bridge_repo).resolve()
         self.events_repo = Path(events_repo).resolve()
         self.connector = connector
+        need(bridge_settings is None or isinstance(bridge_settings, dict), 'bridge_settings_invalid')
+        self.bridge_settings = json.loads(json.dumps(bridge_settings or {}))
         self.host = host
+        need(architecture in ('udm', 'heimserver'), 'controller_architecture_invalid')
+        need(architecture != 'heimserver' or server_host == 'heimserver', 'heimserver_ssh_alias_required')
+        self.architecture = architecture
+        self.server_host = server_host
         self.ffmpeg = ffmpeg
         self.ffprobe = ffprobe
         self.cache = dependency_cache
@@ -149,10 +157,14 @@ class Backend:
         need(not archive.is_symlink(), 'frozen_source_path_invalid')
         self.bridge_manifest.archive_sources(self.bridge_manifest.source_files(self.bridge_repo), temporary_archive, canonical=True)
         os.replace(temporary_archive, archive)
-        data, manifest = build_package(self.events_repo, cache=self.cache, require_clean=True)
-        (directory / 'events-package.zip').write_bytes(data)
+        if self.architecture == 'heimserver':
+            manifest = {'bridgeOnly': True}
+        else:
+            data, manifest = build_package(self.events_repo, cache=self.cache, require_clean=True)
+            (directory / 'events-package.zip').write_bytes(data)
         save(directory / 'operation-sources.json', {'events': self.operation_sources, 'bridge': self.nas_sources})
-        return {'sources': sources, 'archiveSha256': hashlib.sha256(archive.read_bytes()).hexdigest(), 'eventsManifest': manifest,
+        return {'sources': sources, 'architecture': self.architecture,
+                'archiveSha256': hashlib.sha256(archive.read_bytes()).hexdigest(), 'eventsManifest': manifest,
                 'operationSourcesSha256': hashlib.sha256((directory / 'operation-sources.json').read_bytes()).hexdigest()}
 
     def tests(self):
@@ -201,22 +213,38 @@ class Backend:
         return None
 
     def nas(self, payload):
+        if self.bridge_settings:
+            need('settings' not in payload, 'bridge_settings_override_rejected')
+            payload = dict(payload, settings=self.bridge_settings)
         return self.nas_cli.invoke(payload, self.connector, sources=self.nas_sources)
 
     def udm(self, request, timeout=180):
         if request.get('action') == 'health' and request.get('mode') == 'full':
             timeout = max(timeout, 300)
         readonly = request.get('action') in ('compatibility', 'health', 'event-evidence', 'monitor-status')
+        if getattr(self, 'architecture', 'udm') == 'heimserver' and request.get('action') != 'compatibility':
+            if request.get('action') == 'installer':
+                need(request.get('request', {}).get('mode') == 'maintenance',
+                     'heimserver_events_use_server_release_controller')
+            return invoke_server(self.events_repo, self.server_host, request, timeout=timeout,
+                                 sources=self.verification_sources if readonly else self.operation_sources)
         return invoke(self.events_repo, self.host, request, timeout=timeout,
                       sources=self.verification_sources if readonly else self.operation_sources)
+
+    def server_release(self):
+        need(self.architecture == 'heimserver', 'controller_architecture_invalid')
+        return invoke_heimserver({'mode': 'check'}, host=self.server_host)
 
     def decode(self, ips=None, not_before_ms=None):
         if not_before_ms is not None:
             # Entire export window must precede the thirty-second index lag.
             self.wait_until(not_before_ms + (EXPORT_WINDOW_SECONDS + 30 + 2) * 1000)
         while True:
-            value = run_full_decodes(self.host, ips=ips, ffmpeg=self.ffmpeg, ffprobe=self.ffprobe,
-                                     not_before_ms=not_before_ms)
+            dedicated = getattr(self, 'architecture', 'udm') == 'heimserver'
+            profile = {'config_path': SERVER_CONFIG, 'architecture': 'heimserver'} if dedicated else {}
+            value = run_full_decodes(self.server_host if dedicated else self.host,
+                                     ips=ips, ffmpeg=self.ffmpeg, ffprobe=self.ffprobe,
+                                     not_before_ms=not_before_ms, **profile)
             # Recording-index progress is a readiness condition. Its scoped
             # discovery fails before opening a viewer, so waiting does not hide
             # a failed payload decode or introduce concurrent readers.
@@ -243,6 +271,11 @@ class Update:
             need(self.path.is_file() and not self.path.is_symlink(), 'resume_receipt_required')
             self.state = json.loads(self.path.read_text(encoding='utf-8'))
             need(self.state.get('schemaVersion') == 1 and self.state.get('status') in ('running', 'failed'), 'resume_state_invalid')
+            need(self.state.get('architecture', 'udm') == getattr(backend, 'architecture', 'udm'),
+                 'resume_architecture_changed')
+            need(not self.bridge_only or not self.state.get('installIntent')
+                 and 'install-events' not in self.state.get('completed', []),
+                 'server_bridge_receipt_contains_events_install')
             if 'frozen' in self.state:
                 path = self.directory / 'operation-sources.json'
                 need(path.is_file() and not path.is_symlink(), 'frozen_operation_sources_missing')
@@ -257,8 +290,39 @@ class Update:
         else:
             need(not self.directory.exists(), 'fresh_update_directory_required')
             self.directory.mkdir(parents=True, mode=0o700)
-            self.state = {'schemaVersion': 1, 'owner': uuid.uuid4().hex, 'status': 'running', 'completed': [], 'evidence': {}}
+            self.state = {'schemaVersion': 1, 'architecture': getattr(backend, 'architecture', 'udm'),
+                          'owner': uuid.uuid4().hex, 'status': 'running', 'completed': [], 'evidence': {}}
             self.persist()
+
+    @property
+    def bridge_only(self):
+        return getattr(self.backend, 'architecture', 'udm') == 'heimserver'
+
+    def verify_server_release(self):
+        result = self.backend.server_release()
+        need(result.get('ok') is True and result.get('releaseVerified') is True
+             and result.get('servicesActive') is True
+             and result.get('runtime', {}).get('nativeSchemaVerified') is True
+             and valid_digest(result.get('deployment', {}).get('digest'))
+             and valid_digest(result.get('deployment', {}).get('manifestSha256')),
+             'server_release_unhealthy')
+        prior = self.state['evidence'].get('server-release-before')
+        if prior is not None:
+            need(result.get('deployment', {}).get('digest') == prior.get('deployment', {}).get('digest')
+                 and result.get('deployment', {}).get('manifestSha256') == prior.get('deployment', {}).get('manifestSha256'),
+                 'server_release_changed_during_bridge_update')
+        return result
+
+    def compatibility(self):
+        result = self.backend.udm({'action': 'compatibility'})
+        if result.get('ok') is not True:
+            return result
+        need(valid_digest(result.get('currentSettingsSha256')), 'compatibility_current_snapshot_missing')
+        prior = self.state['evidence'].get('compatibility-before')
+        if prior is not None:
+            need(result['currentSettingsSha256'] == prior.get('currentSettingsSha256'),
+                 'camera_settings_changed_during_update')
+        return result
 
     def persist(self):
         self.state['atMs'] = int(time.time() * 1000)
@@ -373,7 +437,7 @@ class Update:
     def rollback(self):
         self.maintenance(True, recovery=True)
         results = []
-        if self.state.get('installIntent'):
+        if self.state.get('installIntent') and not self.bridge_only:
             observed = self.backend.udm({'action': 'installer', 'request': {'mode': 'status'}})
             need(observed.get('ok') is True, 'rollback_events_inventory_failed')
             digest = observed.get('deployment', {}).get('sha256')
@@ -421,7 +485,9 @@ class Update:
                 self.persist()
             self.check_sources()
             self.step('offline-tests', self.backend.tests)
-            self.step('compatibility-before', lambda: self.backend.udm({'action': 'compatibility'}))
+            if self.bridge_only:
+                self.step('server-release-before', self.verify_server_release)
+            self.step('compatibility-before', self.compatibility)
             self.step('native-media-before', lambda: self.health())
             self.step('real-decode-before', self._full_decode)
             def build():
@@ -466,19 +532,22 @@ class Update:
                 need(status.get('ok') is True, 'bridge_resume_failed')
             self.step('bridge-final-receipt', lambda: self.backend.nas({'mode': 'final', 'baseline': self.state['baseline'],
                        'release': self.state['release'], 'expected': status['bridges']}))
-            self.step('compatibility-before-events', lambda: self.backend.udm({'action': 'compatibility'}))
-            self.check_sources()
-            package = (self.directory / 'events-package.zip').read_bytes()
-            need(hashlib.sha256(package).hexdigest() == self.state['frozen']['eventsManifest']['packageSha256'], 'events_package_changed')
-            if not self.state.get('installIntent'):
-                current = self.backend.udm({'action': 'installer', 'request': {'mode': 'status'}})
-                need(current.get('ok') is True, 'events_preinstall_inventory_failed')
-                self.state['installIntent'] = {'previousDigest': current.get('deployment', {}).get('sha256')}
-                self.persist()
-            self.step('install-events', lambda: self.backend.udm({'action': 'installer', 'request': {'mode': 'install',
-                'package': base64.b64encode(package).decode(), 'digest': self.state['frozen']['eventsManifest']['packageSha256'],
-                'owner': self.state['owner']}}, timeout=300))
-            self.step('compatibility-after', lambda: self.backend.udm({'action': 'compatibility'}))
+            if self.bridge_only:
+                self.step('server-release-after', self.verify_server_release)
+            else:
+                self.step('compatibility-before-events', self.compatibility)
+                self.check_sources()
+                package = (self.directory / 'events-package.zip').read_bytes()
+                need(hashlib.sha256(package).hexdigest() == self.state['frozen']['eventsManifest']['packageSha256'], 'events_package_changed')
+                if not self.state.get('installIntent'):
+                    current = self.backend.udm({'action': 'installer', 'request': {'mode': 'status'}})
+                    need(current.get('ok') is True, 'events_preinstall_inventory_failed')
+                    self.state['installIntent'] = {'previousDigest': current.get('deployment', {}).get('sha256')}
+                    self.persist()
+                self.step('install-events', lambda: self.backend.udm({'action': 'installer', 'request': {'mode': 'install',
+                    'package': base64.b64encode(package).decode(), 'digest': self.state['frozen']['eventsManifest']['packageSha256'],
+                    'owner': self.state['owner']}}, timeout=300))
+            self.step('compatibility-after', self.compatibility)
             self.step('native-media-after', lambda: self.health())
             self.step('real-decode-after', self._full_decode)
             self.step('genuine-event-evidence', lambda: self.backend.udm({'action': 'event-evidence'}))
@@ -486,7 +555,10 @@ class Update:
             self.state['status'] = 'complete'
             self.persist()
             return {'ok': True, 'status': 'complete', 'receipt': str(self.path), 'bridgeRelease': self.state['release'],
-                    'eventsVersion': self.state['frozen']['eventsManifest']['version'], 'allCameras': True}
+                    'eventsVersion': self.state['evidence']['server-release-before']['deployment']['version']
+                        if self.bridge_only else self.state['frozen']['eventsManifest']['version'],
+                    'scope': 'bridge-only' if self.bridge_only else 'bridge-and-events',
+                    'serverReleaseChanged': False if self.bridge_only else None, 'allCameras': True}
         except Exception as error:
             self.state['status'] = 'failed'
             self.state['errorCode'] = str(error) if isinstance(error, UpdateError) else 'update_operation_failed'

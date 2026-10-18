@@ -6,6 +6,7 @@ import socket
 import time
 import urllib.parse
 from ..http_deadline import _DeadlineSocket, _HTTPSConnection, get_bytes
+from ..remote import RemoteError, rpc as remote_rpc, settings as remote_settings
 from .safety import OperationError, need
 
 
@@ -28,6 +29,11 @@ def protect_json(config, path, *, method='GET', body=None, timeout=8, limit=1000
              and body['thirdPartyCameraInfo']['forceTcp'] in (None, True)
              and type(body['thirdPartyCameraInfo']['forceTcp']) in (type(None), bool), 'protect_patch_out_of_scope')
     try:
+        if remote_settings(config) is not None:
+            result = remote_rpc(config, 'api', {'path': path, 'method': method, 'body': body,
+                                               'timeout': timeout, 'limit': limit}, timeout=timeout)
+            need(isinstance(result, (dict, list)), 'protect_json_invalid')
+            return result
         if method == 'GET':
             status, raw = get_bytes('https://127.0.0.1:7443' + path, owner_headers(config),
                                     timeout=timeout, limit=limit)
@@ -53,6 +59,8 @@ def protect_json(config, path, *, method='GET', body=None, timeout=8, limit=1000
         return result
     except OperationError:
         raise
+    except RemoteError as error:
+        raise OperationError(error.code) from None
     except (TimeoutError, socket.timeout):
         raise OperationError('protect_total_deadline') from None
     except Exception:

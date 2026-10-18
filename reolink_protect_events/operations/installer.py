@@ -23,6 +23,10 @@ monitor_root = pathlib.Path('/data/reolink-protect-monitor')
 monitor_unit = pathlib.Path('/etc/systemd/system/reolink-protect-media-monitor.service')
 
 
+class MigratedToHeimserver(RuntimeError):
+    code = 'migrated_to_heimserver'
+
+
 def run(args):
     p = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
     if p.returncode:
@@ -414,6 +418,18 @@ os.umask(0o077)
 def execute(request):
     if os.geteuid() != 0:
         raise RuntimeError('root_required')
+    # After the server cutover this legacy UDM installer is read-only. A stale
+    # controller must never recreate the retired UDM application services.
+    if request.get('mode') != 'status':
+        marker = pathlib.Path('/data/reolink-protect-connector/server-architecture.json')
+        if marker.exists() or marker.is_symlink():
+            raise MigratedToHeimserver('migrated_to_heimserver')
+        config_path = root / 'config.json'
+        if config_path.exists() or config_path.is_symlink():
+            secure(config_path)
+            cfg = json.loads(config_path.read_text())
+            if isinstance(cfg, dict) and 'protectRemote' in cfg:
+                raise MigratedToHeimserver('migrated_to_heimserver')
     secure(root)
     secure(unit)
     secure(monitor_unit)

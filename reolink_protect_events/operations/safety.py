@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import stat
+from ..remote import RemoteError, settings as remote_settings
 
 HOSTS = frozenset('192.168.30.' + str(i) for i in range(210, 216))
 VERSION = '7.3.70'
@@ -84,7 +85,8 @@ def write_json(path, value):
     os.replace(str(temporary), str(path))
 
 
-def validate_config(config):
+def validate_config(config, *, require_credentials=True):
+    need(type(require_credentials) is bool, 'monitor_credentials_mode_invalid')
     need(isinstance(config, dict), 'monitor_config_invalid')
     bridges = config.get('bridges')
     need(isinstance(bridges, list) and len(bridges) == 6, 'monitor_scope_invalid')
@@ -92,12 +94,17 @@ def validate_config(config):
     ids = [row.get('cameraId') for row in bridges]
     need(len(set(ids)) == 6 and all(isinstance(i, str) and re.fullmatch(r'[a-f0-9]{24}', i) for i in ids),
          'monitor_camera_identity_invalid')
-    for row in bridges:
-        user, password = row.get('username'), row.get('password')
-        need(isinstance(user, str) and isinstance(password, str) and user and password and ':' not in user
-             and not any(c in user + password for c in '\r\n\0'), 'monitor_bridge_credentials_invalid')
+    if require_credentials:
+        for row in bridges:
+            user, password = row.get('username'), row.get('password')
+            need(isinstance(user, str) and isinstance(password, str) and user and password and ':' not in user
+                 and not any(c in user + password for c in '\r\n\0'), 'monitor_bridge_credentials_invalid')
     need(isinstance(config.get('protectUserId'), str) and bool(re.fullmatch(
         r'[A-Za-z0-9-]{1,80}', config['protectUserId'])), 'monitor_protect_identity_invalid')
+    try:
+        remote_settings(config)
+    except RemoteError as error:
+        raise OperationError(error.code) from None
     return config
 
 
@@ -120,4 +127,4 @@ def maintenance_blocks(root, owner=None):
 
 
 def error_code(error, fallback='operation_failed'):
-    return error.code if isinstance(error, OperationError) else fallback
+    return error.code if isinstance(error, (OperationError, RemoteError)) else fallback

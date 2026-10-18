@@ -49,6 +49,7 @@ class ReleaseCliTests(unittest.TestCase):
         self.config.write_text(json.dumps({'bridgeRepo': 'synthetic-bridge', 'eventsRepo': 'synthetic-events',
             'connector': 'external-safe-connector', 'stateDirectory': str(self.directory)}))
         self.backend = Mock()
+        self.backend.architecture = 'udm'
         self.backend.current_sources.return_value = {p: {'sourceSha256': 'a' * 64} for p in ('bridge', 'events')}
         self.backend.nas.return_value = {'ok': True, 'bridges': [{'ip': ip, 'imageId': IMAGE} for ip in IPS]}
         self.backend.udm.side_effect = lambda request: installed_status() if request['action'] == 'installer' else {'ok': True}
@@ -79,6 +80,20 @@ class ReleaseCliTests(unittest.TestCase):
         self.assertEqual(self.backend.udm.call_args_list[0].args[0],
                          {'action': 'installer', 'request': {'mode': 'status'}})
         self.assertEqual(self.backend.udm.call_args_list[1].args[0], {'action': 'health', 'mode': 'quick'})
+
+    def test_clean_host_settings_reach_backend_without_changing_udm_alias(self):
+        settings = {'scope': '/srv/cameras/bridges', 'runtimeUid': 1026, 'renderGroup': 992,
+                    'restartPolicy': 'unless-stopped', 'maintenanceMode': 'deployment-lock'}
+        config = json.loads(self.config.read_text())
+        config.update(bridgeSettings=settings, sshAlias='unifi-dream-machine')
+        self.config.write_text(json.dumps(config))
+        self.receipt(complete_state())
+        with patch.object(controller, 'Backend', return_value=self.backend) as constructor, \
+             patch('sys.argv', ['protect_ops.py', 'update', '--config', str(self.config)]), \
+             redirect_stdout(io.StringIO()):
+            self.assertEqual(controller.main(), 0)
+        self.assertEqual(constructor.call_args.kwargs['bridge_settings'], settings)
+        self.assertEqual(constructor.call_args.kwargs['host'], 'unifi-dream-machine')
 
     def test_healthy_manual_bridge_rollback_is_drift_and_never_reinstalled(self):
         self.receipt(complete_state())

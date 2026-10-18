@@ -260,6 +260,37 @@ def _read_json_output(output):
     raise NativeError("Database returned no JSON result")
 
 
+def adapter_for_config(config):
+    """Keep native SQL/guards unchanged while selecting local or SSH execution."""
+    from . import remote
+    options = remote.settings(config)
+    version = config.get("protectVersion", SUPPORTED_PROTECT_VERSION)
+    if options is None:
+        return NativeAdapter(protect_version=version)
+
+    def execute(sql):
+        try:
+            result = remote.rpc(config, "sql", {"sql": sql}, timeout=15)
+        except remote.RemoteError as error:
+            if error.remote_code == "event_retired":
+                raise RetiredEventError("Previously delivered event was retired by Protect") from None
+            raise NativeError("Protect remote database operation failed") from None
+        if not isinstance(result, str):
+            raise NativeError("Protect remote database returned invalid output")
+        return result
+
+    def installed_version():
+        try:
+            result = remote.rpc(config, "version", timeout=5)
+        except remote.RemoteError:
+            raise SchemaError("Cannot verify the remote Protect version") from None
+        if not isinstance(result, str) or not result or len(result) > 64:
+            raise SchemaError("Cannot verify the remote Protect version")
+        return result.strip()
+
+    return NativeAdapter(protect_version=version, execute=execute, version_reader=installed_version)
+
+
 class NativeAdapter:
     def __init__(self, protect_version=SUPPORTED_PROTECT_VERSION, execute=None,
                  psql_command=None, version_reader=None, timeout=15, guard_interval=60):

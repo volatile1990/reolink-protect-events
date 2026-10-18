@@ -8,6 +8,7 @@ media/header bytes. feed accepts any network splitting; summary emits numbers.
 """
 import struct
 import hashlib
+from ..remote import open_socket as remote_open_socket, settings as remote_settings
 
 
 class UbvMetadataError(Exception):
@@ -358,6 +359,9 @@ def probe_ubv(config, camera, channel, *, seconds=8, api=None, connector=None, c
         setup_deadline = clock() + 8
         if connector:
             connection = connector(port, 5)
+        elif remote_settings(config) is not None:
+            # TLS terminates on this host, over binary SSH stdio to UDM loopback.
+            connection = remote_open_socket(config, port, 5, tls=True)
         else:
             raw = socket.create_connection(('127.0.0.1', port), timeout=5)
             try:

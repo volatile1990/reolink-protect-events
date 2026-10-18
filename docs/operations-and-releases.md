@@ -1,5 +1,14 @@
 # Own releases and Protect media monitoring
 
+For the current Debian deployment, start with the
+[installed host layout](../deploy/heimserver/README.md),
+[shared server releases](server-release.md) and
+[BridgeOnly controller](heimserver-deployment.md#bridge-controller).
+The console-local installation and combined UDM/NAS release examples below
+describe the legacy architecture; they must not be reapplied to the migrated
+server. In the current hook installer, `--scope events` is the default;
+`--scope both --config ...` explicitly installs the two separate update paths.
+
 The bridge and Events repositories are maintained by this installation's owner.
 An update means deploying newly developed, committed code from those repositories.
 The tools do not poll for third-party bridge/Events updates or develop changes by

@@ -1,0 +1,19 @@
+[Unit]
+Description=Camera event processing and native Protect delivery
+PartOf=reolink-protect.target
+Requires=camera-host-access.service
+Wants=reolink-protect-ssh.service
+After=camera-host-access.service reolink-protect-ssh.service
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/cameras/protect/current/events
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 -B -m reolink_protect_events.runtime --config /srv/cameras/protect/config/events.json --root /srv/cameras/protect/state/events
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=45
+UMask=0077
+
+[Install]
+WantedBy=reolink-protect.target

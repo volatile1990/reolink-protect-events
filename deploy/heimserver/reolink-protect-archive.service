@@ -1,0 +1,19 @@
+[Unit]
+Description=Protect archive playback compatibility
+PartOf=reolink-protect.target
+Wants=reolink-protect-ssh.service
+After=reolink-protect-ssh.service
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/cameras/protect/current/archive
+EnvironmentFile=/srv/cameras/protect/config/archive.env
+ExecStart=/usr/bin/node /srv/cameras/protect/current/archive/proxy.cjs
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+UMask=0077
+
+[Install]
+WantedBy=reolink-protect.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=Host access to the six local camera macvlan bridges
+Requires=camera-vlan30.service
+After=camera-vlan30.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/python3 -B /usr/local/libexec/camera-host-access.py
+ExecStop=/usr/bin/python3 -B /usr/local/libexec/camera-host-access.py --stop
+
+[Install]
+WantedBy=multi-user.target
