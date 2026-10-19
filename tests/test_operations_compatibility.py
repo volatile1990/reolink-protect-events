@@ -27,20 +27,14 @@ class CompatibilityTests(unittest.TestCase):
                 'channels':[{'id':0,'enabled':True}],
                 'thirdPartyCameraInfo':{'forceTcp':None,'enableRtspAudio':True}})
         self.auto_scope=[]
-        for index,camera in enumerate(self.boot['cameras']):
-            dual=index<5
-            camera['channels']=[{'id':cid,'enabled':True}for cid in((0,1,2)if dual else(0,))]
+        for camera in self.boot['cameras']:
+            camera['channels']=[{'id':cid,'enabled':True}for cid in(0,1,2)]
             third=camera['thirdPartyCameraInfo']
             third.update(rtspUrl='rtsp://'+camera['host']+':8554/main',profileToken='main')
-            if dual:
-                third.update(rtspUrlLQ='rtsp://'+camera['host']+':8554/sub',profileTokenLQ='sub')
+            third.update(rtspUrlLQ='rtsp://'+camera['host']+':8554/sub',profileTokenLQ='sub')
             pin={key:camera[key]for key in('id','host','mac')}
-            if dual:
-                pin.update({field+'Sha256':sha(third[field].encode())for field in('rtspUrl','rtspUrlLQ','profileToken','profileTokenLQ')})
-                self.auto_scope.append(pin)
-            else:
-                pin.update({field+'Sha256':sha(third[field].encode())for field in('rtspUrl','profileToken')})
-                self.main_only=pin
+            pin.update({field+'Sha256':sha(third[field].encode())for field in('rtspUrl','rtspUrlLQ','profileToken','profileTokenLQ')})
+            self.auto_scope.append(pin)
         service=compatibility.SERVICE_PATH
         self.old=b'synthetic-reviewed-predecessor';self.new=b'synthetic-reviewed-automatic-layer'
         self.old_files={path:(self.old if path==service else ('synthetic:'+path).encode())
@@ -87,7 +81,6 @@ class CompatibilityTests(unittest.TestCase):
              patch.object(compatibility,'AUTOMATIC_ADDITIONAL_FILES',self.additional_expected), \
              patch.object(compatibility,'AUTOMATIC_WATCH_FILES',self.watch_expected), \
              patch.object(compatibility.automatic_profiles,'SCOPE',self.auto_scope), \
-             patch.object(compatibility.automatic_profiles,'MAIN_ONLY',self.main_only), \
              patch.object(compatibility,'private_path',side_effect=private), \
              patch.object(compatibility,'read_json',side_effect=read):
             return compatibility.assess(self.config,api=lambda *_:copy.deepcopy(self.boot if boot is None else boot),
@@ -101,7 +94,7 @@ class CompatibilityTests(unittest.TestCase):
 
     def test_fixed_production_chain_matches_audited_final_source(self):
         self.assertEqual(compatibility.AUTOMATIC_SERVICE_SHA256,
-            'a8009e4768be7e507a07639bdadc74f24f0981664580298294d94b9e2e74c2f9')
+            '099e9dc702bce8145b83e54c3f7f41c13c55b114c6e59514fc592087631646fe')
         self.assertEqual(compatibility.ACTIVE_FILES[compatibility.SERVICE_PATH],
             'a4e546e4a9d7cd82dc130a26cc5e92fa2b69f4cdb6fce1368870a543f0d08a7f')
         self.assertEqual(compatibility.AUTOMATIC_RECEIPT.as_posix(),
@@ -119,6 +112,8 @@ class CompatibilityTests(unittest.TestCase):
         self.assertTrue(report['checks']['serviceAndAacLayers'])
         self.assertTrue(report['checks']['automaticInputLayerOwnership'])
         self.assertTrue(report['automaticInputLayer']['currentProfileContractVerified'])
+        self.assertEqual(report['automaticInputLayer']['currentProfileContract']['automaticReuseCameraCount'],6)
+        self.assertEqual(report['automaticInputLayer']['currentProfileContract']['recordingProfileCount'],12)
         self.assertTrue(report['automaticInputLayer']['historicalSettingsBaselineMatches'])
         self.assertTrue(report['automaticInputLayer']['nginxRegenerationGuardVerified'])
         self.assertTrue(report['automaticInputLayer']['nginxEventWatchFilesVerified'])
@@ -242,20 +237,28 @@ class CompatibilityTests(unittest.TestCase):
             else:camera['thirdPartyCameraInfo']['rtspUrl']='rtsp://unrelated.invalid:8554/main'
             self.assert_drift(self.assess(boot=changed))
 
-    def test_hq_only_accepts_exact_approved_native_uri_not_a_guessed_path(self):
+    def test_sixth_dual_accepts_exact_approved_native_uris_not_guessed_paths(self):
         changed=copy.deepcopy(self.boot)
         uri='rtsp://'+changed['cameras'][-1]['host']+':8554/approved-native-onvif-profile'
         changed['cameras'][-1]['thirdPartyCameraInfo']['rtspUrl']=uri
-        self.main_only['rtspUrlSha256']=sha(uri.encode())
+        self.auto_scope[-1]['rtspUrlSha256']=sha(uri.encode())
         self.assertTrue(self.assess(boot=changed)['ok'])
         for field,value in(('rtspUrl',uri+'-foreign'),('profileToken','foreign-profile'),
-                           ('rtspUrlLQ',uri),('profileTokenLQ','sub')):
+                           ('rtspUrlLQ',uri),('profileTokenLQ','foreign-sub')):
             with self.subTest(field=field):
                 mismatch=copy.deepcopy(changed)
                 mismatch['cameras'][-1]['thirdPartyCameraInfo'][field]=value
                 report=self.assess(boot=mismatch)
                 self.assert_drift(report)
-                self.assertEqual(report['errorCode'],'compatibility_auto_main_only_source_changed')
+                self.assertEqual(report['errorCode'],'compatibility_auto_source_profile_changed')
+
+    def test_previous_main_only_sixth_camera_is_rejected(self):
+        changed=copy.deepcopy(self.boot);camera=changed['cameras'][-1]
+        camera['channels']=[{'id':0,'enabled':True}]
+        camera['thirdPartyCameraInfo'].update(rtspUrlLQ=None,profileTokenLQ=None)
+        report=self.assess(boot=changed)
+        self.assert_drift(report)
+        self.assertEqual(report['errorCode'],'compatibility_auto_channels_changed')
 
     def test_receipt_is_root_private_regular_and_single_link(self):
         for field,value in (('st_uid',1000),('st_mode',stat.S_IFREG|0o644),

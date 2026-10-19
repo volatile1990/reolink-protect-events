@@ -1,6 +1,6 @@
 # Betrieb auf dem Debian-Heimserver
 
-Stand: 18.10.2026. Der Heimserver `192.168.1.175` führt Events, Medienmonitor,
+Stand: 19.10.2026. Der Heimserver `192.168.1.175` führt Events, Medienmonitor,
 Controls und Archiv aus. Diese vier Anwendungen teilen sich ein öffentliches
 Release. Protect, seine Aufnahmen, PostgreSQL sowie die geprüften Service-/UI-
 und Automatic-Anpassungen bleiben auf der UDM `192.168.1.1`. Der dortige
@@ -162,8 +162,14 @@ MAX_SESSION_MS=0
 MAX_SESSION_BYTES=0
 IDLE_MS=0
 MAX_SESSIONS=6
-CAMERA_CHANNELS='{"6ac83993001a6d03e4001690":[0,2],"6ac83fed00bd6d03e4001b81":[0,2],"6ac844bd01096d03e4001f22":[0,2],"6ac844bf02026d03e4001f5f":[0,2],"6ac8ae7001ab6d03e4006410":[0,2],"6ac8ae7102b76d03e4006447":[0]}'
+CAMERA_CHANNELS='{"6ac83993001a6d03e4001690":[0,2],"6ac83fed00bd6d03e4001b81":[0,2],"6ac844bd01096d03e4001f22":[0,2],"6ac844bf02026d03e4001f5f":[0,2],"6ac8ae7001ab6d03e4006410":[0,2],"6ac8ae7102b76d03e4006447":[0,2]}'
 ```
+
+Der aktuelle Profilvertrag umfasst sechs Kameras mit je High/Low, also zwölf
+Aufzeichnungsprofile. Automatic verwendet bei allen sechs Kameras denselben
+Low-Aufnahmeeingang. Der aktuelle Compatibility-Check prüft dafür die exakt
+bekannten Service-/Starthookbytes und jede Kamera-/Profilzuordnung; ein bloß
+vorhandener Low-Kanal ersetzt diese Prüfung nicht.
 
 Auf der UDM wird die öffentliche `connector.py` als
 `/usr/local/lib/reolink-protect-connector.py` root-owned installiert. Ihre private

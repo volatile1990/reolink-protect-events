@@ -18,9 +18,8 @@ def fixture():
     cameras=[]
     for b in bridges:
         channels=[{'id':0,'name':'High','enabled':True,'width':320,'height':180,'fps':20}]
-        if not b['host'].endswith('.215'):
-            channels.extend([{'id':1,'name':'Medium','enabled':True,'width':160,'height':90,'fps':20},
-                             {'id':2,'name':'Low','enabled':True,'width':160,'height':90,'fps':20}])
+        channels.extend([{'id':1,'name':'Medium','enabled':True,'width':160,'height':90,'fps':20},
+                         {'id':2,'name':'Low','enabled':True,'width':160,'height':90,'fps':20}])
         cameras.append(dict(id=b['cameraId'],host=b['host'],mac=b['mac'],name='Synthetic camera',
             isAdopted=True,isThirdPartyCamera=True,isPairedWithAiPort=False,isProvisioned=True,
             state='CONNECTED',isConnected=True,hasRecordingStarted=True,videoReconfigurationInProgress=False,
@@ -68,21 +67,26 @@ class MonitorTests(unittest.TestCase):
             startup_at_ms=self.now-120000,api=self.api,fetch=metrics,probe=self.probe,recover=self.repair,**options)
     def test_quick_profiles_and_automatic_channel_are_actual(self):
         report=media_health.run_once(self.config,api=self.api,fetch=metrics,now_ms=self.now)
-        self.assertTrue(report['ok']);self.assertEqual(report['expectedRecordingProfiles'],11)
-        self.assertEqual([r['automaticChannel']for r in report['cameras']],[1,1,1,1,1,0])
+        self.assertTrue(report['ok']);self.assertEqual(report['expectedRecordingProfiles'],12)
+        self.assertEqual([r['automaticChannel']for r in report['cameras']],[1,1,1,1,1,1])
+    def test_previous_main_only_sixth_camera_is_not_a_complete_scope(self):
+        self.api.boot['cameras'][-1]['channels']=self.api.boot['cameras'][-1]['channels'][:1]
+        report=media_health.run_once(self.config,api=self.api,fetch=metrics,now_ms=self.now)
+        self.assertFalse(report['ok']);self.assertFalse(report['scopeValid'])
+        self.assertEqual(report['expectedRecordingProfiles'],11)
     def test_full_live_scope_is_explicit_and_invalid_ids_never_probe(self):
         self.api.advance=True
         cid=self.config['bridges'][-1]['cameraId']
         report=media_health.run_once(self.config,mode='full',camera_ids=[cid],api=self.api,fetch=metrics,probe=self.probe)
         self.assertTrue(report['ok']);self.assertFalse(report['fullActiveCoverage'])
-        self.assertEqual(report['activeProbeCameraIds'],[cid]);self.assertEqual(self.probes,[(cid,0)])
+        self.assertEqual(report['activeProbeCameraIds'],[cid]);self.assertEqual(self.probes,[(cid,0),(cid,1),(cid,2)])
         for ids in ([],[cid,cid],['f'*24]):
             report=media_health.run_once(self.config,mode='full',camera_ids=ids,api=self.api,fetch=metrics,probe=self.probe)
             self.assertFalse(report['ok']);self.assertEqual(report['errorCode'],'health_camera_scope_invalid')
-        self.assertEqual(self.probes,[(cid,0)])
+        self.assertEqual(self.probes,[(cid,0),(cid,1),(cid,2)])
         self.probes=[]
         report=media_health.run_once(self.config,mode='full',api=self.api,fetch=metrics,probe=self.probe)
-        self.assertTrue(report['fullActiveCoverage']);self.assertEqual(len(self.probes),16)
+        self.assertTrue(report['fullActiveCoverage']);self.assertEqual(len(self.probes),18)
     def test_one_rotating_probe_per_50s_covers_all_cameras_in_five_minutes(self):
         self.api.advance=True
         for i in range(6):
@@ -91,7 +95,7 @@ class MonitorTests(unittest.TestCase):
             self.sample(self.now+i*50000)
         self.assertEqual(len(self.probes),6)
         self.assertEqual(len({cid for cid,_ in self.probes}),6)
-        self.assertEqual(self.probes[-1][1],0)
+        self.assertEqual(self.probes[-1][1],1)
     def test_source_epoch_change_is_prioritized_and_maintenance_keeps_it_pending(self):
         self.api.advance=True;self.sample()
         cid=self.config['bridges'][-1]['cameraId']
@@ -107,7 +111,7 @@ class MonitorTests(unittest.TestCase):
         (self.root/'maintenance.json').unlink()
         report=monitor.run_once(self.config,self.root,now_ms=self.now+31000,startup_at_ms=self.now-120000,
             api=self.api,fetch=changed,probe=self.probe)
-        self.assertEqual(self.probes[-1],(cid,0))
+        self.assertEqual(self.probes[-1],(cid,1))
         self.assertEqual(next(r for r in report['cameras']if r['cameraId']==cid)['activeProbeReason'],'source_epoch_changed')
     def test_three_failures_are_required_and_source_failure_never_repairs(self):
         self.sample(allow_repair=True)
@@ -196,7 +200,7 @@ class HealthProgressTests(unittest.TestCase):
         self.assertEqual(self.reads,5);self.assertEqual(self.sleeps,[8,8,8,8])
         self.assertEqual(report['recordingProgressSampleSeconds'],32)
         ends=[r for row in report['cameras']for r in row['recordings']]
-        self.assertEqual(len(ends),11);self.assertTrue(all(r['advanced']is True for r in ends))
+        self.assertEqual(len(ends),12);self.assertTrue(all(r['advanced']is True for r in ends))
         self.assertTrue(all(0<call.kwargs['timeout']<=8 for call in api.call_args_list))
     def test_fresh_cached_ends_never_advancing_fail_at_45_second_limit(self):
         report=self.run_health(self.cached_api())
@@ -206,12 +210,12 @@ class HealthProgressTests(unittest.TestCase):
         self.assertTrue(all(row['sourceHealthy']and all(r['fresh']for r in row['recordings'])
                             for row in report['cameras']))
         self.assertFalse(self.probes)
-    def test_one_of_eleven_stalled_profiles_cannot_be_hidden_by_other_progress(self):
+    def test_one_of_twelve_stalled_profiles_cannot_be_hidden_by_other_progress(self):
         stuck=(self.boot['cameras'][4]['id'],'recordingEndLQ')
         report=self.run_health(self.cached_api(1,stuck_quality=stuck))
         self.assertFalse(report['ok']);self.assertEqual(self.elapsed,45)
         ends=[r for row in report['cameras']for r in row['recordings']]
-        self.assertEqual(sum(r['advanced']is True for r in ends),10)
+        self.assertEqual(sum(r['advanced']is True for r in ends),11)
         self.assertEqual(sum(r['advanced']is False for r in ends),1)
     def test_profiles_advancing_in_different_cached_blocks_use_one_original_checkpoint(self):
         def read(_config,_path,**_options):
@@ -247,12 +251,13 @@ class HealthProgressTests(unittest.TestCase):
                     for key in ('recordingEnd','recordingEndLQ'):camera['stats']['video'][key]=self.now+8000
             return value
         report=self.run_health(read,mode='full',camera_ids=[cid],probe=self.probe)
-        self.assertTrue(report['ok'],report);self.assertEqual(self.reads,3);self.assertEqual(report['atMs'],self.now+16000)
+        self.assertTrue(report['ok'],report);self.assertEqual(self.reads,3);self.assertEqual(report['atMs'],self.now+32000)
         self.assertTrue(report['recordingProgressObserved']);self.assertTrue(report['scopedRecordingProgressObserved'])
         self.assertFalse(report['fullActiveCoverage']);self.assertEqual(report['activeProbeCameraIds'],[cid])
-        self.assertEqual(self.probes,[(cid,0)])
-        self.assertEqual(report['cameras'][-1]['recordings'][0]['ageMs'],8000)
-        self.assertEqual(report['cameras'][-1]['activeProbes'],[{'ok':True,'channel':0,'mediaSaved':False}])
+        self.assertEqual(self.probes,[(cid,0),(cid,1),(cid,2)])
+        self.assertEqual(report['cameras'][-1]['recordings'][0]['ageMs'],24000)
+        self.assertEqual(report['cameras'][-1]['activeProbes'],[
+            {'ok':True,'channel':channel,'mediaSaved':False}for channel in(0,1,2)])
     def test_full_final_refresh_cannot_keep_old_green_when_source_fails(self):
         cid=self.boot['cameras'][-1]['id']
         def fetch(bridge):
@@ -261,7 +266,7 @@ class HealthProgressTests(unittest.TestCase):
         report=media_health.run_once(self.config,mode='full',camera_ids=[cid],api=self.cached_api(1),
             fetch=fetch,probe=self.probe,now_ms=self.now,clock=self.clock,sleep=self.sleep)
         self.assertFalse(report['ok']);self.assertEqual(self.reads,3)
-        self.assertFalse(report['cameras'][-1]['sourceHealthy']);self.assertEqual(report['atMs'],self.now+16000)
+        self.assertFalse(report['cameras'][-1]['sourceHealthy']);self.assertEqual(report['atMs'],self.now+32000)
         self.assertTrue(report['cameras'][-1]['activeProbes'][0]['ok'])
     def test_full_final_refresh_rejects_recordings_that_became_stale_during_sweep(self):
         def read(_config,_path,**_options):
@@ -271,9 +276,9 @@ class HealthProgressTests(unittest.TestCase):
                     for key in ('recordingEnd','recordingEndLQ'):camera['stats']['video'][key]=self.now+8000
             return value
         report=self.run_health(read,mode='full',probe=self.probe)
-        self.assertFalse(report['ok']);self.assertEqual(len(self.probes),16);self.assertEqual(self.elapsed,136)
+        self.assertFalse(report['ok']);self.assertEqual(len(self.probes),18);self.assertEqual(self.elapsed,152)
         self.assertTrue(report['fullActiveCoverage']);self.assertTrue(report['recordingProgressObserved'])
-        self.assertTrue(all(r['ageMs']==128000 and not r['fresh']for row in report['cameras']for r in row['recordings']))
+        self.assertTrue(all(r['ageMs']==144000 and not r['fresh']for row in report['cameras']for r in row['recordings']))
 
 
 class RecoveryTests(unittest.TestCase):
@@ -291,6 +296,9 @@ class RecoveryTests(unittest.TestCase):
         report=self.run_repair()
         self.assertTrue(report['ok']);self.assertTrue(report['restoredOriginalTcp']);self.assertEqual(report['recordingProfiles'],2)
         self.assertEqual(self.probes,[1,1]);self.assertEqual(protect.settings_digest(self.config,self.api.boot),before)
+        # The recovery primitive also supports a deliberately reduced camera;
+        # this is independent of the complete six-dual installation contract.
+        self.api.boot['cameras'][-1]['channels']=self.api.boot['cameras'][-1]['channels'][:1]
         report=self.run_repair(5)
         self.assertTrue(report['ok']);self.assertEqual(report['recordingProfiles'],1);self.assertEqual(self.probes,[1,1,0,0])
         self.assertEqual([flag for _,flag in self.api.patches],[True,None,True,None])

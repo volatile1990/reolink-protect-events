@@ -69,7 +69,7 @@ def inspect(config, *, prior=None, now_ms=None, api=None, fetch=None, deadline=N
             'sourceHealthy':source['ok'],'protectHealthy':connected and recording_ok,
             'cause':None if source['ok'] and connected and recording_ok else 'source_unhealthy'if not source['ok']else'protect_media_unhealthy',
             'ok':source['ok'] and connected and recording_ok})
-    scope_ok=expected_count==11
+    scope_ok=expected_count==12 and all(row['enabledChannels']==[0,1,2] for row in rows)
     return {'schemaVersion':1,'atMs':now_ms,'protectVersion':bootstrap['nvr']['version'],
             'ok':scope_ok and all(r['ok']for r in rows),'expectedRecordingProfiles':expected_count,
             'scopeValid':scope_ok,'cameras':rows,'readOnly':True,'mediaPersisted':False,
@@ -106,7 +106,7 @@ def run_once(config, root=None, *, mode='quick', prior=None, now_ms=None, api=No
         report,bootstrap=inspect(config,prior=prior,now_ms=sample_time(),api=api,fetch=fetch,
                                  deadline=deadline if observe else None,clock=clock)
         # Never replace this checkpoint while waiting: different cached profiles
-        # may advance in different responses, and all eleven must advance.
+        # may advance in different responses, and all twelve must advance.
         previous=prior if prior is not None else {
             row['cameraId']:{'recordingEnds':dict(row['recordingEnds'])}for row in report['cameras']}
         known={row['cameraId']for row in report['cameras']}

@@ -34,6 +34,7 @@ EXPORT_RETRY_ERRORS = frozenset(('decode_export_timeout','decode_export_http_500
                                   'decode_export_http_503','decode_recording_audio_missing'))
 DEFAULT_CONFIG = '/data/reolink-protect-events/config.json'
 SERVER_CONFIG = '/srv/cameras/protect/config/events.json'
+FULL_PROFILE_COUNT = len(HOSTS) * 2
 
 
 def _creation_options():
@@ -272,7 +273,7 @@ def _private_profiles(response, selected):
     need(isinstance(response, dict) and response.get('ok') is True and set(response) == {'ok', 'profiles'},
          'decode_discovery_failed')
     rows = response['profiles'];expected = {(host, profile) for host in selected
-        for profile in (('main',) if host.endswith('.215') else ('main', 'sub'))}
+        for profile in ('main', 'sub')}
     need(isinstance(rows, list) and len(rows) == len(expected), 'decode_profile_coverage_invalid')
     required = {'host', 'cameraId', 'profile', 'quality', 'channel', 'url', 'username', 'password',
                 'expectedCodec', 'expectedWidth', 'expectedHeight', 'startMs', 'endMs'}
@@ -619,8 +620,9 @@ def _coverage(profiles,rows):
     checked={(r['host'],r['quality'])for r in rows}
     successful={(r['host'],r['quality'])for r in rows if r.get('ok')is True}
     return {'expectedRequested':len(expected),'checked':len(checked),'passed':len(successful),
-        'expectedFull':11,'allRequested':checked==expected and successful==expected,
-        'allEleven':len(expected)==11 and checked==expected and successful==expected}
+        'expectedFull':FULL_PROFILE_COUNT,'allRequested':checked==expected and successful==expected,
+        'allProfiles':expected=={(host,quality)for host in HOSTS for quality in ('high','low')}
+                      and checked==expected and successful==expected}
 
 
 def run_full_decodes(ssh_alias='unifi-dream-machine', *, config_path=DEFAULT_CONFIG, remote_release=None,
@@ -629,7 +631,7 @@ def run_full_decodes(ssh_alias='unifi-dream-machine', *, config_path=DEFAULT_CON
     """Return a projected read-only real-decode gate; missing tools never pass.
 
     A subset can pass its explicitly requested scope, but UPDATE must also
-    require both profile coverage `allEleven` flags and `realDecodes`.
+    require both profile coverage `allProfiles` flags and `realDecodes`.
     `not_before_ms` requires the entire requested 24 s window after activation.
     No synthetic events, media files, configuration changes or concurrent viewers.
     """
@@ -637,7 +639,7 @@ def run_full_decodes(ssh_alias='unifi-dream-machine', *, config_path=DEFAULT_CON
         'readOnly':True,'mediaPersisted':False,'credentialsPrinted':False,'handsetPlaybackVerified':False,
         'maxConcurrentViewers':1,'rtsp':[],'recordings':[]}
     for key in ('rtspProfileCoverage','recordedProfileCoverage'):
-        report[key]={'expectedRequested':0,'checked':0,'passed':0,'expectedFull':11,'allRequested':False,'allEleven':False}
+        report[key]={'expectedRequested':0,'checked':0,'passed':0,'expectedFull':FULL_PROFILE_COUNT,'allRequested':False,'allProfiles':False}
     profiles=[]
     try:
         duration=_duration(duration)

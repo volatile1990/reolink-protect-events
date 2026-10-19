@@ -1,6 +1,5 @@
 """Current routing contract of the exact audited Automatic-input service bytes."""
 import hashlib
-import urllib.parse
 from .protect import qualities, selected_cameras
 from .safety import need
 
@@ -49,18 +48,17 @@ SCOPE = [
         "rtspUrlLQSha256": "d17898a2a2042653661bbb18900c1e22dbd15a5a7ce899abd06296aaddeedd88",
         "profileTokenSha256": "0d6e4079e36703ebd37c00722f5891d28b0e2811dc114b129215123adcce3605",
         "profileTokenLQSha256": "ddc6e2b224d0fd821669202258386936fc9ce2899e215eec6322b95f8dd96d6a"
+    },
+    {
+        "id": "6ac8ae7102b76d03e4006447",
+        "host": "192.168.30.215",
+        "mac": "0242C0A81ED7",
+        "rtspUrlSha256": "176afa9c426caf315822c909e99553eb3ee356e140acc93b20b3b51289bee319",
+        "rtspUrlLQSha256": "a5ebe2746663032667a9a0ad4ec92bb49b02ef802e6ac956c61ddfa38ae11904",
+        "profileTokenSha256": "0d6e4079e36703ebd37c00722f5891d28b0e2811dc114b129215123adcce3605",
+        "profileTokenLQSha256": "ddc6e2b224d0fd821669202258386936fc9ce2899e215eec6322b95f8dd96d6a"
     }
 ]
-MAIN_ONLY = {
-    "id": "6ac8ae7102b76d03e4006447",
-    "host": "192.168.30.215",
-    "mac": "0242C0A81ED7",
-    # Exact source fields from the approved settings.before-rollback snapshot
-    # (canonical SHA256 dcb78b411ccf14334a33803cac2d0d122454d29f169d122985cdffe58bc6f208).
-    # The native ONVIF URI is not assumed to have the bridge's /main path.
-    "rtspUrlSha256": "176afa9c426caf315822c909e99553eb3ee356e140acc93b20b3b51289bee319",
-    "profileTokenSha256": "0d6e4079e36703ebd37c00722f5891d28b0e2811dc114b129215123adcce3605"
-}
 
 
 def source_hash(value):
@@ -71,9 +69,9 @@ def verify(config, bootstrap):
     """Check source identity/routing, never historic user preferences."""
     cameras = selected_cameras(config, bootstrap)
     by = {row['id']: row for row in cameras}
-    need(set(by) == {row['id'] for row in SCOPE} | {MAIN_ONLY['id']},
+    need(len(SCOPE) == 6 and set(by) == {row['id'] for row in SCOPE},
          'compatibility_auto_camera_scope_changed')
-    for pin in [*SCOPE, MAIN_ONLY]:
+    for pin in SCOPE:
         camera = by[pin['id']]
         need(camera.get('host') == pin['host'] and camera.get('mac') == pin['mac']
              and camera.get('isAdopted') is True and camera.get('isThirdPartyCamera') is True
@@ -87,41 +85,24 @@ def verify(config, bootstrap):
              and type(c.get('id')) is int and c['id'] in (0, 1, 2) for c in channels)
              and len({c['id'] for c in channels}) == len(channels),
              'compatibility_auto_channels_changed')
-        dual = pin['id'] != MAIN_ONLY['id']
-        expected = {0, 1, 2} if dual else {0}
         enabled = {c['id'] for c in channels if c.get('enabled') is True}
-        need(enabled == expected and (not dual or len(channels) == 3),
+        need(enabled == {0, 1, 2} and len(channels) == 3,
              'compatibility_auto_channels_changed')
         # Bootstrap omits the native computed recordingChannels getter. The
         # fixed 7.3.70 service maps HIGH/LOW to recording channels 0/2; verify
         # current enabled profiles through that same existing contract.
         recording = {row[2] for row in qualities(camera)}
-        want_recording = {0, 2} if dual else {0}
+        want_recording = {0, 2}
         need(recording == want_recording, 'compatibility_auto_recording_profiles_changed')
         if 'recordingChannels' in camera:
             values = camera['recordingChannels']
             need(isinstance(values, list) and all(type(v) is int for v in values)
                  and len(values) == len(set(values)) and set(values) == want_recording,
                  'compatibility_auto_recording_profiles_changed')
-        if dual:
-            need(all(source_hash(third.get(field)) == pin[field + 'Sha256']
-                     for field in ('rtspUrl', 'rtspUrlLQ', 'profileToken', 'profileTokenLQ')),
-                 'compatibility_auto_source_profile_changed')
-        else:
-            try:
-                endpoint = urllib.parse.urlsplit(third.get('rtspUrl', ''))
-                valid = (endpoint.scheme == 'rtsp' and endpoint.hostname == pin['host']
-                         and endpoint.port == 8554
-                         and endpoint.username is None and endpoint.password is None
-                         and not endpoint.query and not endpoint.fragment)
-            except (TypeError, ValueError):
-                valid = False
-            need(valid and source_hash(third.get('rtspUrl')) == pin['rtspUrlSha256']
-                 and source_hash(third.get('profileToken')) == pin['profileTokenSha256']
-                 and third.get('rtspUrlLQ') in (None, '')
-                 and third.get('profileTokenLQ') in (None, ''),
-                 'compatibility_auto_main_only_source_changed')
-    return {'cameraCount': 6, 'automaticReuseCameraCount': 5,
-            'mainOnlyCameraCount': 1, 'recordingProfileCount': 11,
+        need(all(source_hash(third.get(field)) == pin[field + 'Sha256']
+                 for field in ('rtspUrl', 'rtspUrlLQ', 'profileToken', 'profileTokenLQ')),
+             'compatibility_auto_source_profile_changed')
+    return {'cameraCount': 6, 'automaticReuseCameraCount': 6,
+            'mainOnlyCameraCount': 0, 'recordingProfileCount': 12,
             'audioEnabled': True, 'sourceIdentityAndProfilePinsVerified': True,
             'recordingChannelsBasis': 'audited-7.3.70-enabled-profile-contract'}

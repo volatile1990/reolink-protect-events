@@ -172,8 +172,8 @@ exact marker; no successful installation is reported in this case.
    remain unchanged. Freeze the actual remote worker source for restoration too.
 2. Run both repositories' offline contracts. Check the currently audited Protect
    7.3.70 database, camera scope and owned UI/AAC layers without changing them.
-3. Verify six fresh video sources, eleven advancing recording profiles, all native
-   High/Low/Automatic modes and real video/audio decoding of all eleven live and
+3. Verify six fresh video sources, twelve advancing recording profiles, all native
+   High/Low/Automatic modes and real video/audio decoding of all twelve live and
    recorded profiles. Missing decoders or incomplete coverage stop the update.
    Each recorded probe requests a fixed 24-second window, allowing room for
    the observed variation in Protect export duration while still requiring at least

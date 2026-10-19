@@ -173,7 +173,7 @@ class FairMonitorTests(unittest.TestCase):
         report=media_health.run_once(self.config,mode='full',camera_ids=[cid],now_ms=self.now,
             api=advancing,fetch=metrics,probe=self.probe,startup_probe=self.startup)
         self.assertTrue(report['ok'],report);self.assertTrue(report['fmp4StartupCoverageVerified'])
-        self.assertEqual(self.calls,[('ubv',cid),('fmp4',cid)])
+        self.assertEqual(self.calls,[('ubv',cid),('ubv',cid),('ubv',cid),('fmp4',cid)])
         self.calls=[]
         report=media_health.run_once(self.config,mode='full',camera_ids=[cid],now_ms=self.now,
             api=advancing,fetch=metrics,probe=self.probe,startup_probe=lambda *_a,**_kw:{'ok':False})

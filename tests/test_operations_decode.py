@@ -35,7 +35,12 @@ def profile(host='192.168.30.215', kind='main'):
 
 def all_profiles():
     return [profile(host,kind)for host in sorted(HOSTS)
-            for kind in (('main',)if host.endswith('.215')else('main','sub'))]
+            for kind in ('main','sub')]
+
+
+def camera_profiles(row):
+    return [dict(row,profile=kind,quality='high'if kind=='main'else'low',channel=0 if kind=='main'else 2)
+            for kind in ('main','sub')]
 
 
 def success(row,recorded=False):
@@ -49,7 +54,7 @@ def success(row,recorded=False):
 class DecodeScopeTests(unittest.TestCase):
     def test_private_payload_strict_scope_and_profile_coverage(self):
         rows=all_profiles()
-        self.assertEqual(len(decode._private_profiles({'ok':True,'profiles':rows},sorted(HOSTS))),11)
+        self.assertEqual(len(decode._private_profiles({'ok':True,'profiles':rows},sorted(HOSTS))),12)
         for mutation in ('extra','missing','duplicate','foreign','credentials','profile','url','short','long'):
             value=copy.deepcopy(rows)
             if mutation=='extra':value[0]['bootstrap']={'token':SECRET}
@@ -175,7 +180,7 @@ class DecodeScopeTests(unittest.TestCase):
             result=decode.run_full_decodes()
         self.assertFalse(result['ok']);self.assertFalse(result['realDecodes'])
         self.assertEqual(result['errorCode'],'local_ffmpeg_unavailable')
-        self.assertFalse(result['recordedProfileCoverage']['allEleven'])
+        self.assertFalse(result['recordedProfileCoverage']['allProfiles'])
         network.assert_not_called()
 
     def test_validations_fail_before_subprocess_or_private_input(self):
@@ -187,7 +192,7 @@ class DecodeScopeTests(unittest.TestCase):
                 result=decode.run_full_decodes(**options)
                 self.assertFalse(result['ok']);network.assert_not_called()
 
-    def test_full_gate_requires_actual_decodes_and_all_eleven_reports(self):
+    def test_full_gate_requires_actual_decodes_and_all_twelve_reports(self):
         rows=all_profiles();calls=[]
         async def captured(command,**kwargs):
             self.assertEqual(command[-1],'python3 -')
@@ -201,15 +206,16 @@ class DecodeScopeTests(unittest.TestCase):
              patch.object(decode,'_rtsp_decode',side_effect=live),patch.object(decode,'_recorded_decode',side_effect=recorded):
             result=decode.run_full_decodes(not_before_ms=START)
         self.assertTrue(result['ok']);self.assertTrue(result['realDecodes'])
-        self.assertTrue(result['recordedProfileCoverage']['allEleven'])
-        self.assertTrue(result['rtspProfileCoverage']['allEleven'])
-        self.assertEqual(len(calls),22)
-        self.assertEqual([kind for kind,_,_ in calls],['live','recorded']*11)
+        self.assertTrue(result['recordedProfileCoverage']['allProfiles'])
+        self.assertTrue(result['rtspProfileCoverage']['allProfiles'])
+        self.assertEqual(result['recordedProfileCoverage']['expectedFull'],12)
+        self.assertEqual(len(calls),24)
+        self.assertEqual([kind for kind,_,_ in calls],['live','recorded']*12)
         self.assertNotIn(SECRET,json.dumps(result));self.assertNotIn('rtsp://',json.dumps(result))
         self.assertTrue(result['newRecordingGateRequired'])
 
     def test_scoped_result_never_claims_all_profiles(self):
-        rows=[profile()]
+        rows=camera_profiles(profile())
         async def captured(*_,**kwargs):return 0,json.dumps({'ok':True,'profiles':rows}).encode(),b''
         async def live(row,*_):return success(row)
         async def recorded(row,*_):return success(row,True)
@@ -218,11 +224,20 @@ class DecodeScopeTests(unittest.TestCase):
              patch.object(decode,'_rtsp_decode',side_effect=live),patch.object(decode,'_recorded_decode',side_effect=recorded):
             result=decode.run_full_decodes(ips=['192.168.30.215'])
         self.assertTrue(result['ok'])
-        self.assertEqual(result['recordedProfileCoverage']['expectedRequested'],1)
-        self.assertFalse(result['recordedProfileCoverage']['allEleven'])
+        self.assertEqual(result['recordedProfileCoverage']['expectedRequested'],2)
+        self.assertFalse(result['recordedProfileCoverage']['allProfiles'])
+
+    def test_vorhaus_main_only_is_incomplete_even_when_its_hq_passes(self):
+        rows=camera_profiles(profile())
+        with self.assertRaisesRegex(OperationError,'decode_profile_coverage_invalid'):
+            decode._private_profiles({'ok':True,'profiles':rows[:1]},['192.168.30.215'])
+        coverage=decode._coverage(rows,[success(rows[0])])
+        self.assertEqual(coverage['expectedRequested'],2)
+        self.assertFalse(coverage['allRequested'])
+        self.assertFalse(coverage['allProfiles'])
 
     def test_metadata_only_result_is_not_a_real_decode(self):
-        rows=[profile()]
+        rows=camera_profiles(profile())
         async def captured(*_,**kwargs):return 0,json.dumps({'ok':True,'profiles':rows}).encode(),b''
         async def metadata(row,*_):return dict(decode._public_profile(row),ok=True)
         with patch.object(decode,'_executable',side_effect=lambda _,name:'/public/'+name), \
@@ -365,7 +380,7 @@ class ExportRetryTests(unittest.TestCase):
         async def read(command,**kwargs):
             self.readiness_calls.append(kwargs)
             if len(self.readiness_calls)==1:return 2,json.dumps(pending).encode(),b''
-            return 0,json.dumps({'ok':True,'profiles':[fresh]}).encode(),b''
+            return 0,json.dumps({'ok':True,'profiles':camera_profiles(fresh)}).encode(),b''
         captured=[]
         def source(value):captured.append(value);return b'public-readonly-source'
         with patch.object(decode,'_run_bytes',side_effect=read),patch.object(decode,'_remote_source',side_effect=source):
@@ -417,7 +432,7 @@ class ExportRetryTests(unittest.TestCase):
             if mutation=='dimensions':fresh['expectedWidth']=128
             async def read(command,**kwargs):
                 if mutation=='source':return 2,json.dumps({'ok':False,'errorCode':'decode_source_unhealthy'}).encode(),b''
-                return 0,json.dumps({'ok':True,'profiles':[fresh]}).encode(),b''
+                return 0,json.dumps({'ok':True,'profiles':camera_profiles(fresh)}).encode(),b''
             expected={'overlap':'decode_retry_window_overlaps_failed_export','codec':'decode_retry_profile_changed',
                       'dimensions':'decode_retry_profile_changed','source':'decode_source_unhealthy'}[mutation]
             with self.subTest(mutation=mutation),patch.object(decode,'_run_bytes',side_effect=read), \

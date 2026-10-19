@@ -421,7 +421,7 @@ test("two configured cameras normalize AAC and preserve H264 bytes; unknown came
 const ALL_CHANNELS = {
   '6ac83993001a6d03e4001690': [0, 2], '6ac83fed00bd6d03e4001b81': [0, 2],
   '6ac844bd01096d03e4001f22': [0, 2], '6ac844bf02026d03e4001f5f': [0, 2],
-  '6ac8ae7001ab6d03e4006410': [0, 2], '6ac8ae7102b76d03e4006447': [0]
+  '6ac8ae7001ab6d03e4006410': [0, 2], '6ac8ae7102b76d03e4006447': [0, 2]
 };
 test("camera/channel map is strict, deeply immutable and retains CAMERA_IDS channel0 compatibility", () => {
   assert.deepEqual(candidate.parseCameraChannels(), { [candidate.CAMERA]: [0] });
@@ -443,7 +443,7 @@ test("camera/channel map is strict, deeply immutable and retains CAMERA_IDS chan
   assert.throws(() => candidate.parseCameraIds(sparse), /compat_camera_allowlist/);
 });
 
-test("exact six-camera eleven-profile map normalizes only those pairs, preserving native auth, payload and unknown/Mid1 bypass", async () => {
+test("exact six-camera twelve-profile map normalizes only those pairs, preserving native auth, payload and unknown/Mid1 bypass", async () => {
   const video = record(7, 0xc902, 1000, Buffer.alloc(1237, 0x57));
   const body = Buffer.concat([frame(2, audio(1000)), frame(2, video)]), seen = [];
   const f = await fixture((socket, head) => {
@@ -460,7 +460,7 @@ test("exact six-camera eleven-profile map normalizes only those pairs, preservin
       assert.equal(records[0].format, 0xfd06); assert.deepEqual(records[0].payload, AAC);
       assert.deepEqual(records[1].raw, video);
     }
-    const bypasses = [[candidate.CAMERA, 2], ['1'.repeat(24), 0], ['__proto__', 0], ['toString', 0],
+    const bypasses = [['1'.repeat(24), 0], ['__proto__', 0], ['toString', 0],
       ...Object.keys(ALL_CHANNELS).map(id => [id, 1]), [Object.keys(ALL_CHANNELS)[0], 3]];
     for (const [id, channel] of bypasses) {
       const sent = request(target(id, channel)), response = await exchange(f, sent);
@@ -470,8 +470,8 @@ test("exact six-camera eleven-profile map normalizes only those pairs, preservin
     assert(denied.includes(Buffer.from('403 Forbidden'))); assert(!denied.includes(Buffer.from('101 Switching')));
     const health = await exchange(f, Buffer.from('GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n'));
     const values = JSON.parse(health.subarray(health.indexOf('\r\n\r\n') + 4).toString());
-    assert.equal(values.cameraCount, 6); assert.equal(values.profileCount, 11); assert.equal(values.activeSessionLimit, 6);
-    assert.equal(f.proxy.metrics.transformed, 12); assert.equal(f.proxy.metrics.bypassed, bypasses.length);
+    assert.equal(values.cameraCount, 6); assert.equal(values.profileCount, 12); assert.equal(values.activeSessionLimit, 6);
+    assert.equal(f.proxy.metrics.transformed, 13); assert.equal(f.proxy.metrics.bypassed, bypasses.length);
     assert.equal(f.proxy.activeSessions(), 0);
   } finally { await f.close(); }
 });
@@ -491,7 +491,7 @@ test("dedicated-host defaults retain all six production viewer slots without lif
     const health = JSON.parse(reply.subarray(reply.indexOf('\r\n\r\n') + 4));
     assert.equal(health.activeSessionLimit, 6);
     assert.equal(health.sessionLimitMs, 0); assert.equal(health.sessionByteLimit, 0);
-    assert.equal(health.idleLimitMs, 0); assert.equal(health.cameraCount, 6); assert.equal(health.profileCount, 11);
+    assert.equal(health.idleLimitMs, 0); assert.equal(health.cameraCount, 6); assert.equal(health.profileCount, 12);
     const live = await exchange(f, Buffer.from('GET /livez HTTP/1.1\r\nHost: localhost\r\n\r\n'));
     assert(live.includes(Buffer.from('200 OK')));
   } finally { for (const client of clients) client.destroy(); await f.close(); }

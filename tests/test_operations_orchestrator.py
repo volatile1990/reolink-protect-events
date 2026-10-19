@@ -112,8 +112,8 @@ class FakeBackend:
         self.calls.append(('decode',copy.deepcopy(ips),not_before_ms))
         failed=(ips is not None and self.fail_decode_ip in ips)or(self.partial_decode and ips is None and not self.in_rollback)
         return {'ok':True,'realDecodes':True,
-            'rtspProfileCoverage':{'allEleven':not failed,'allRequested':not failed},
-            'recordedProfileCoverage':{'allEleven':not failed,'allRequested':not failed},
+            'rtspProfileCoverage':{'allProfiles':not failed,'allRequested':not failed},
+            'recordedProfileCoverage':{'allProfiles':not failed,'allRequested':not failed},
             'mediaPersisted':False}
 
 
@@ -123,6 +123,12 @@ class ControllerTests(unittest.TestCase):
     def tearDown(self):self.temp.cleanup()
     def execute(self):
         return Update(self.backend,self.directory).run()
+    def test_full_gate_does_not_accept_the_old_eleven_profile_receipt(self):
+        report={'ok':True,'realDecodes':True,
+            'rtspProfileCoverage':{'allEleven':True,'allRequested':True},
+            'recordedProfileCoverage':{'allEleven':True,'allRequested':True}}
+        with self.assertRaisesRegex(orchestrator.UpdateError,'real_media_decode_coverage_failed'):
+            orchestrator.gate_decode(report)
     def modes(self,mode):return [r for r in self.backend.calls if r[0]=='nas'and r[1]==mode]
     def installers(self,mode):return [r for r in self.backend.calls if r[0]=='udm'and r[1]['action']=='installer'and r[1]['request']['mode']==mode]
     def test_full_success_orders_six_targets_and_keeps_actual_postactivation_decode_gates(self):
@@ -384,6 +390,13 @@ class RecordingAudioRepairTests(unittest.TestCase):
         self.assertTrue(state['evidence']['camera-'+IPS[0]+'-health-after-audio-repair']['ok'])
         self.assertEqual(state['evidence']['camera-'+IPS[0]]['afterRecorderReadyMs'],boundary)
         self.assertIsNone(self.backend.marker)
+
+    def test_vorhaus_repair_evidence_requires_both_live_profiles(self):
+        cid=self.backend.identities[IPS[-1]]
+        report=persistent_recording_audio_missing(IPS[-1],cid)
+        self.assertTrue(orchestrator.recording_audio_repair_candidate(report,IPS[-1],cid))
+        report['rtsp'].pop();report['recordings'].pop()
+        self.assertFalse(orchestrator.recording_audio_repair_candidate(report,IPS[-1],cid))
 
     def test_corrupt_codec_audio_clock_and_payload_errors_never_dispatch_recovery(self):
         original=copy.deepcopy(self.failure)

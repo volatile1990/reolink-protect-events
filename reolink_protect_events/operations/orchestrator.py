@@ -48,7 +48,7 @@ def save(path, value):
 
 def gate_decode(report, full=True):
     need(report.get('ok') is True and report.get('realDecodes') is True, 'real_media_decode_failed')
-    key = 'allEleven' if full else 'allRequested'
+    key = 'allProfiles' if full else 'allRequested'
     need(all(report.get(kind, {}).get(key) is True for kind in ('rtspProfileCoverage', 'recordedProfileCoverage')),
          'real_media_decode_coverage_failed')
 
@@ -59,8 +59,8 @@ def recording_audio_repair_candidate(report, ip, cid):
         if report.get('ok') is not False or report.get('errorCode') or report.get('realDecodes') is not False:
             return False
         live, recorded = report['rtsp'], report['recordings']
-        count = 1 if ip == IPS[-1] else 2
-        expected = {('main', 'high', 0)} | (set() if count == 1 else {('sub', 'low', 2)})
+        count = 2
+        expected = {('main', 'high', 0), ('sub', 'low', 2)}
         identity = lambda row: (row['profile'], row['quality'], row['channel'])
         if len(live) != count or len(recorded) != count or {identity(r) for r in live} != expected or {identity(r) for r in recorded} != expected:
             return False
