@@ -57,6 +57,22 @@ promise two visible icons in every timeline layout.
 
 ## Operation and rollback
 
+An existing automatic partition keeps its publication envelope when later source
+history reveals an earlier still-open member. The immutable native identity must
+remain inside that envelope; class intervals continue to describe only genuine
+activity and can leave gaps within it. An inherited open source is admitted only
+inside a partition that already owns that member. It does not prove a new
+continuation beyond a presentation cap.
+
+The ordinary restart/sync path also recognizes the older forward-shift defect:
+the retained identity predates the stored start, the deterministic automatic ID
+pins that same identity, and a linked genuine source still covers it. Only this
+proved case recovers the original anchor, before connectivity and maximum-span
+partitioning. Existing IDs and truthful remainder coverage are retained. Manual
+groups and unproved identity mismatches are never silently rebased. Delivery
+retry state and historical counters remain intact; normal successful delivery
+acknowledges the repaired revision.
+
 Once a group has been published, later source finalization preserves its bounded
 member association. For example, an initially open person source can later clear
 to a time range separated from an animal source by a genuine short gap. The

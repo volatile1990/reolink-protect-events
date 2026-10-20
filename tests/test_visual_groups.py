@@ -286,6 +286,130 @@ class VisualGroupTests(unittest.TestCase):
         self.assertEqual(after["provenance"]["identityStart"], START + 5000)
         self.assertEqual(self.sync(50000), [after])
 
+    def late_open_partitions(self):
+        """The observed 82.591-second shift needs two existing identities."""
+        self.add("car", "vehicle", 12983, None)
+        first, = self.sync(20000)
+        self.j.acknowledge(first["id"], first["revision"], "delivered")
+        self.j.acknowledge(first["id"], first["revision"], "notified")
+        self.add("person", "person", 95574, None)
+        self.sync(100000)
+        self.add("second-person", "person", 137417, None)
+        first, second = self.sync(150000)
+        for row in (first, second):
+            self.j.acknowledge(row["id"], row["revision"], "delivered")
+            self.j.acknowledge(row["id"], row["revision"], "notified")
+        return first["id"], second["id"]
+
+    def assert_native_bounds(self, groups):
+        from reolink_protect_events.native import NativeAdapter
+        for row in groups:
+            self.assertLessEqual(row["start"], row["provenance"]["identityStart"])
+            if row["end"] is not None:
+                self.assertLessEqual(row["end"] - row["start"], 120000)
+            # This is the actual pure native validator, without any SQL I/O.
+            NativeAdapter().build_interval_sql({"eventId": row["id"], "cameraId": CAMERA,
+                "classes": row["classes"], "start": row["start"], "end": row["end"],
+                "provenance": row["provenance"], "deliveredRevision": row["delivered"]})
+
+    def test_late_inherited_open_preserves_published_anchor_and_existing_classes(self):
+        first, second = self.late_open_partitions()
+        with self.j.db:
+            self.j.db.execute("UPDATE intervals SET start=? WHERE id='car'", (START,))
+        original = self.j.db.execute("SELECT * FROM intervals ORDER BY id").fetchall()
+        groups = self.sync(160000)
+        by_id = {row["id"]: row for row in groups}
+        # Earlier history gets only the necessary prefix. The already-owned
+        # open vehicle remains in the first partition, not in a new phantom
+        # continuation whose only evidence is the inherited open detector.
+        self.assertEqual([(row["start"] - START, None if row["end"] is None else row["end"] - START)
+                          for row in groups], [(0, 12983), (12983, 132983), (137417, None)])
+        self.assertEqual(by_id[first]["provenance"]["identityStart"], START + 12983)
+        self.assertEqual(by_id[first]["classes"], ["person", "vehicle"])
+        self.assertEqual(by_id[first]["provenance"]["classIntervals"], {
+            "person": [{"start": START + 95574, "end": START + 132983}],
+            "vehicle": [{"start": START + 12983, "end": START + 132983}]})
+        self.assertEqual(by_id[second]["classes"], ["person"])
+        self.assertEqual(self.j.db.execute("SELECT * FROM intervals ORDER BY id").fetchall(), original)
+        self.assert_native_bounds(groups)
+        self.assertEqual(self.sync(160001), groups)
+
+    def test_restart_repairs_exact_shifted_legacy_partition_before_recomputing_caps(self):
+        first, second = self.late_open_partitions()
+        with self.j.db:
+            self.j.db.execute("UPDATE intervals SET start=?,end=? WHERE id='car'", (START, START + 744085))
+            self.j.db.execute("UPDATE intervals SET end=? WHERE id='person'", (START + 135608,))
+            self.j.db.execute("UPDATE intervals SET end=? WHERE id='second-person'", (START + 392839,))
+        correct = self.sync(800000)
+        previous_ids = {row["id"] for row in correct}
+        row = next(row for row in correct if row["id"] == first)
+        bad_meta = json.loads(json.dumps(row["provenance"]))
+        bad_meta["classIntervals"] = {
+            "person": [{"start": START + 95574, "end": START + 135608},
+                       {"start": START + 137417, "end": START + 215574}],
+            "vehicle": [{"start": START + 95574, "end": START + 215574}]}
+        # Seed the old runtime's persisted bad result in this temporary DB.
+        # Production repair must need only ordinary restart/pending processing.
+        with self.j.db:
+            self.j.db.execute("UPDATE visual_groups SET start=?,end=?,provenance=?,revision=34,"
+                              "delivered_revision=3,notified_revision=3 WHERE id=?",
+                              (START + 95574, START + 215574, json.dumps(bad_meta), first))
+            self.j.db.execute("INSERT OR IGNORE INTO visual_group_segments VALUES(?,?)", (first, "second-person"))
+            self.j.db.execute("INSERT INTO delivery_failures VALUES(?,25,?)", (first, START + 700000))
+        source_rows = self.j.db.execute("SELECT * FROM intervals ORDER BY id").fetchall()
+        self.j.close()
+        self.j = Journal(self.path)
+        self.groups = self.open_groups()
+        self.j.visual_groups = self.groups
+        with patch("reolink_protect_events.runtime.time.time", return_value=(START + 800000) / 1000):
+            pending = self.j.pending()
+        groups = self.rows()
+        repaired = next(row for row in groups if row["id"] == first)
+        self.assertEqual((repaired["start"], repaired["end"]), (START + 12983, START + 132983))
+        self.assertEqual(repaired["provenance"]["identityStart"], START + 12983)
+        self.assertEqual((repaired["revision"], repaired["delivered"], repaired["notified"]), (35, 3, 3))
+        self.assertIn(first, {interval["eventId"] for interval in pending})
+        self.assertEqual({row["id"] for row in groups}, previous_ids)
+        self.assertIn(second, previous_ids)
+        # The cap is recomputed from the recovered anchor; its genuine
+        # remainder remains in adjacent partitions with exact class gaps.
+        self.assertEqual([(row["start"], row["end"]) for row in groups],
+                         [(row["start"], row["end"]) for row in correct])
+        self.assertEqual([row["provenance"]["classIntervals"] for row in groups],
+                         [row["provenance"]["classIntervals"] for row in correct])
+        self.assertEqual(self.j.db.execute("SELECT * FROM intervals ORDER BY id").fetchall(), source_rows)
+        self.assertEqual(self.j.db.execute("SELECT attempts,next_attempt FROM delivery_failures WHERE event_id=?", (first,)).fetchone(),
+                         (25, START + 700000))
+        self.assert_native_bounds(groups)
+        self.assertEqual(self.sync(800001), groups)
+        self.j.close()
+        self.j = Journal(self.path)
+        self.groups = self.open_groups()
+        self.assertEqual(self.sync(800002), groups)
+
+    def test_shifted_partition_with_unproven_identity_is_not_silently_rebased(self):
+        first, _ = self.late_open_partitions()
+        with self.j.db:
+            self.j.db.execute("UPDATE intervals SET start=? WHERE id='car'", (START,))
+        groups = self.sync(160000)
+        meta = next(row for row in groups if row["id"] == first)["provenance"]
+        # This identity has genuine source coverage but is not the identity
+        # bound by the deterministic existing native ID. Never repair it by
+        # changing either the identity metadata or that native ID.
+        meta["identityStart"] = meta["groupIdentityStart"] = START + 12984
+        with self.j.db:
+            self.j.db.execute("UPDATE visual_groups SET start=?,provenance=? WHERE id=?",
+                              (START + 95574, json.dumps(meta), first))
+        self.groups = self.open_groups()
+        after = next(row for row in self.sync(160001) if row["id"] == first)
+        self.assertEqual(after["start"], START + 95574)
+        self.assertEqual(after["provenance"]["identityStart"], START + 12984)
+        from reolink_protect_events.native import NativeAdapter
+        with self.assertRaisesRegex(ValueError, "identity or activation boundary"):
+            NativeAdapter().build_interval_sql({"eventId": after["id"], "cameraId": CAMERA,
+                "classes": after["classes"], "start": after["start"], "end": after["end"],
+                "provenance": after["provenance"], "deliveredRevision": after["delivered"]})
+
     def test_source_clears_then_later_activity_cannot_reopen_past_group(self):
         self.add("active", "person", 0, None)
         old, = self.sync(5000)

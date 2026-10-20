@@ -36,6 +36,11 @@ def _json(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
+def _group_id(camera, start):
+    return "%08x%s" % (start // 1000, hashlib.sha256(
+        ("visual:" + camera + ":" + str(start)).encode()).hexdigest()[:16])
+
+
 def _merge(ranges):
     """Normalize genuine class coverage; touching ranges have continuous union."""
     result = []
@@ -316,6 +321,14 @@ class VisualGroups:
                                                  "JOIN visual_groups g ON g.id=s.group_id WHERE g.camera IN (" + marks + ") "
                                                  "AND NOT EXISTS(SELECT 1 FROM visual_group_manual m WHERE m.group_id=g.id)", parameters):
             links.setdefault(group, set()).add(identifier)
+        for identifier, group in old.items():
+            restored = self._recover_anchor(group, links.get(identifier, ()), sources)
+            if restored != group["row"][2]:
+                # Repair the partition anchor before connectivity, overlap and
+                # cap calculations. Merely widening _store's final envelope
+                # would retain the bad cap and skip or overlap real remainder.
+                row = group["row"]
+                group["row"] = row[:2] + (restored,) + row[3:]
         groups_by_source = {}
         for group, identifiers in links.items():
             for identifier in identifiers:
@@ -458,6 +471,37 @@ class VisualGroups:
             else:
                 self._next_due.pop(camera, None)
 
+    def _recover_anchor(self, group, members, sources):
+        """Recognize only the old forward-shift bug from retained evidence.
+
+        The auto-generated ID independently pins the original identity. A
+        matching linked source must still prove activity at that instant; an
+        arbitrary bad identity, manual ID or withdrawn source is never clamped.
+        This is an in-memory input correction: _store owns the atomic revision.
+        """
+        row, meta = group["row"], group["meta"]
+        identity = meta.get("groupIdentityStart")
+        if (type(identity) is not int or identity >= row[2]
+                or type(meta.get("identityStart")) is not int or meta["identityStart"] != identity
+                or type(meta.get("visualGroupVersion")) is not int or meta["visualGroupVersion"] != 1
+                or type(meta.get("sourceUnionVersion")) is not int or meta["sourceUnionVersion"] != 1
+                or type(self.activation_ms) is not int
+                or type(meta.get("activationMs")) is not int
+                or not self.activation_ms <= meta["activationMs"] <= identity
+                or type(meta.get("groupMaxSpanMs")) is not int
+                or not 30000 <= meta["groupMaxSpanMs"] <= 300000
+                or row[0] != _group_id(row[1], identity)):
+            return row[2]
+        labels = set(json.loads(row[6]))
+        for member in members:
+            source = sources.get(member)
+            if (source is not None and source["row"][1] == row[1]
+                    and source["row"][2] in labels
+                    and any(start <= identity and (end is None or identity < end)
+                            for start, end in source["ranges"])):
+                return identity
+        return row[2]
+
     def _store(self, camera, left, right, spans, prior, old, links, sources, span_ms, partition, now):
         coverage, identifiers, prior_groups = {}, set(), set()
         included_open = False
@@ -468,7 +512,8 @@ class VisualGroups:
             # the presentation cap. A real end, or a newly starting source,
             # supplies that evidence. This avoids phantom continuation events
             # when the detector reports an earlier genuine clear late.
-            if end is None and start < left:
+            owned_member = prior is not None and identifier in links.get(prior["row"][0], ())
+            if end is None and start < left and not owned_member:
                 continue
             clipped = _clip([(start, end)], left, right)
             if not clipped:
@@ -482,13 +527,16 @@ class VisualGroups:
                 identifiers.add(identifier)
         if not coverage:
             return False
-        left = min(value[0] for ranges in coverage.values() for value in ranges)
+        # An existing partition's envelope anchors its immutable native graph.
+        # Its first genuine class may now begin later, leaving an honest gap;
+        # moving the envelope as well would put identityStart before start.
+        if prior is None:
+            left = min(value[0] for ranges in coverage.values() for value in ranges)
         if not included_open:
             actual_end = max(value[1] for ranges in coverage.values() for value in ranges)
             if right is None or actual_end < right:
                 right, partition = actual_end, None
-        identifier = prior["row"][0] if prior else "%08x%s" % (
-            left // 1000, hashlib.sha256(("visual:" + camera + ":" + str(left)).encode()).hexdigest()[:16])
+        identifier = prior["row"][0] if prior else _group_id(camera, left)
         previous = prior["meta"] if prior else {}
         classes = sorted(coverage)
         source_types, details, diagnostic = set(), {}, []
