@@ -107,6 +107,32 @@ class EventsReadinessTests(unittest.TestCase):
             with self.assertRaisesRegex(server.ServerError,'heimserver_activation_health_failed'):
                 server.ready(self.activation,seconds=1)
             read.assert_not_called()
+    def test_default_gate_allows_bounded_cold_start_over_sixty_seconds(self):
+        elapsed=[0];activation=1000000
+        def health():
+            at=activation+elapsed[0]*1000
+            value=dict(self.health,atMs=at,lastNativeDeliveryMs=activation-1 if elapsed[0]<70 else at)
+            return json.dumps(value).encode()
+        with patch.object(server,'unit_states',return_value=units()), \
+             patch.object(server,'read_private',side_effect=lambda *a:health()), \
+             patch.object(server.time,'monotonic',side_effect=lambda:elapsed[0]), \
+             patch.object(server.time,'time',side_effect=lambda:(activation+elapsed[0]*1000)/1000), \
+             patch.object(server.time,'sleep',side_effect=lambda seconds:elapsed.__setitem__(0,elapsed[0]+seconds)):
+            self.assertEqual(server.ready(activation),units())
+        self.assertEqual(elapsed[0],70)
+    def test_default_gate_still_expires_at_one_hundred_eighty_seconds_without_new_delivery(self):
+        elapsed=[0];activation=1000000
+        def health():
+            return json.dumps(dict(self.health,atMs=activation+elapsed[0]*1000,
+                                   lastNativeDeliveryMs=activation-1)).encode()
+        with patch.object(server,'unit_states',return_value=units()), \
+             patch.object(server,'read_private',side_effect=lambda *a:health()), \
+             patch.object(server.time,'monotonic',side_effect=lambda:elapsed[0]), \
+             patch.object(server.time,'time',side_effect=lambda:(activation+elapsed[0]*1000)/1000), \
+             patch.object(server.time,'sleep',side_effect=lambda seconds:elapsed.__setitem__(0,elapsed[0]+seconds)):
+            with self.assertRaisesRegex(server.ServerError,'heimserver_activation_health_failed'):
+                server.ready(activation)
+        self.assertEqual(elapsed[0],180)
 
 
 class BundleTests(unittest.TestCase):

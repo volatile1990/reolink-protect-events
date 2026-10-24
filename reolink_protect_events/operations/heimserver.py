@@ -369,7 +369,7 @@ def events_ready(value, after_ms, now_ms):
             and type(delivered) is int and delivered >= after_ms and 0 <= now_ms-delivered <= 60000)
 
 
-def ready(after_ms, seconds=60):
+def ready(after_ms, seconds=180):
     """Process and fresh events-health gate; a full monitor cycle is separate."""
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
