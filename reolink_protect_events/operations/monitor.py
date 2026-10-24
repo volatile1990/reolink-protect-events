@@ -308,7 +308,7 @@ def run_once(config,root,*,allow_repair=False,now_ms=None,startup_at_ms=None,api
             report['alerts'].append({'code':'maintenance_expired_mutation_active','actionRequired':True})
         if pending_recovery is not None:
             report['alerts'].append({'code':'recovery_requires_review'if pending_recovery['requiresReview']else'recovery_restoration_pending',
-                'cameraId':pending_recovery['cameraId'],'actionRequired':pending_recovery['requiresReview']})
+                'cameraId':pending_recovery['cameraId'],'actionRequired':True})
         for row in monitored_rows:
             if row['confirmedFailure']and (row.get('readOnly')or not row['sourceHealthy']):
                 report['alerts'].append({'code':'native_media_requires_attention'if row.get('readOnly')else'source_unhealthy',

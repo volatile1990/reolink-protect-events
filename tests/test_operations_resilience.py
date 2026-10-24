@@ -163,6 +163,35 @@ class RecoveryProgressTests(unittest.TestCase):
         self.pending();value=read_json(self.root/'recovery.json');value['phase']='blocked';write_json(self.root/'recovery.json',value)
         report=self.sample(self.now,allow_repair=True,resume=lambda *a,**kw:self.fail('blocked retry'))
         self.assertTrue(report['actionRequired']);self.assertEqual(report['state'],'attention');self.assertFalse(self.api.patches)
+    def test_persistent_restore_dispatch_failure_is_publicly_actionable_without_another_toggle(self):
+        self.pending();attempts=[]
+        def unavailable(config,path,method='GET',body=None,**options):
+            if method=='PATCH':
+                attempts.append(body['thirdPartyCameraInfo']['forceTcp'])
+                raise OSError('synthetic_patch_unavailable')
+            return self.api(config,path,method=method,body=body,**options)
+        def resume(config,root,**options):
+            return recovery.resume_pending(config,root,**options,sleep=lambda _:None)
+        for elapsed in(0,30000,90000):
+            report=monitor.run_once(self.config,self.root,now_ms=self.now+elapsed,
+              startup_at_ms=self.now-120000,allow_repair=True,api=unavailable,fetch=metrics,
+              probe=lambda *a,**kw:{'ok':True},resume=resume,
+              recover=lambda *a,**kw:self.fail('pending restoration cannot start another repair'))
+            self.assertTrue(report['quickHealthy']);self.assertFalse(report['pendingRecovery']['requiresReview'])
+            self.assertTrue(report['actionRequired']);self.assertEqual(report['state'],'attention')
+            alert=next(row for row in report['alerts']if row['code']=='recovery_restoration_pending')
+            self.assertTrue(alert['actionRequired']);self.assertEqual(alert['cameraId'],self.cid)
+            self.assertTrue(public_status.projection(report)['actionRequired'])
+        self.assertEqual(attempts,[None]*9)
+        self.assertEqual(read_json(self.root/'recovery.json')['phase'],'restore-dispatching')
+    def test_restored_flag_with_failed_postmedia_verification_completes_restoration_barrier(self):
+        self.pending()
+        result=recovery.resume_pending(self.config,self.root,api=self.api,fetch=metrics,
+            probe=lambda *a,**kw:{'ok':False,'errorCode':'synthetic_media_failure'},sleep=lambda _:None)
+        receipt=read_json(self.root/'recovery.json')
+        self.assertFalse(result['ok']);self.assertTrue(result['restoredOriginalTcp'])
+        self.assertEqual(receipt['phase'],'complete');self.assertIn('verificationErrorCode',receipt)
+        self.assertEqual([value for _,value in self.api.patches],[None])
     def test_expired_automatic_lease_reconciles_before_pending_restore(self):
         lease.change(self.root,'a'*32,True,monotonic_ms=1,boot_id='old');self.pending()
         with patch.object(lease,'identity',return_value='new'):
