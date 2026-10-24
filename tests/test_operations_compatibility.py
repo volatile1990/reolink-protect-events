@@ -94,7 +94,7 @@ class CompatibilityTests(unittest.TestCase):
 
     def test_fixed_production_chain_matches_audited_final_source(self):
         self.assertEqual(compatibility.AUTOMATIC_SERVICE_SHA256,
-            '099e9dc702bce8145b83e54c3f7f41c13c55b114c6e59514fc592087631646fe')
+            'e9d90673366b3a5fcb8a01ba967d485881bbef273769d6c0fabc98fafdfd800c')
         self.assertEqual(compatibility.ACTIVE_FILES[compatibility.SERVICE_PATH],
             'a4e546e4a9d7cd82dc130a26cc5e92fa2b69f4cdb6fce1368870a543f0d08a7f')
         self.assertEqual(compatibility.AUTOMATIC_RECEIPT.as_posix(),

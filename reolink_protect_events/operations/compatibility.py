@@ -16,15 +16,15 @@ ACTIVE_FILES={
  '/usr/local/lib/reolink-protect-controls/ubv-aac-clock-compat-all.cjs':'139b46a64eb0170a8fdbb4c890db823f12ec2ea2ea1743f40791f8c34ded2a0b'}
 UI_ROOT=Path('/usr/share/unifi-protect/app/node_modules/@ubnt/unifi-protect-ui-internal/dist')
 SERVICE_PATH='/usr/share/unifi-protect/app/service.js'
-AUTOMATIC_SERVICE_SHA256='099e9dc702bce8145b83e54c3f7f41c13c55b114c6e59514fc592087631646fe'
+AUTOMATIC_SERVICE_SHA256='e9d90673366b3a5fcb8a01ba967d485881bbef273769d6c0fabc98fafdfd800c'
 AUTOMATIC_RECEIPT=Path('/data/reolink-protect-controls/automatic-quality/active.json')
 AUTOMATIC_GUARD_PATH='/usr/local/lib/reolink-protect-controls/automatic-quality-guard.py'
 AUTOMATIC_DROPIN_PATH='/etc/systemd/system/unifi-protect.service.d/70-reolink-automatic-quality.conf'
 AUTOMATIC_FILES={
- AUTOMATIC_GUARD_PATH:'4989288984a8a600885dcca36a320053366c1928306d328e62ab9ba7f40616be',
+ AUTOMATIC_GUARD_PATH:'919fd11b7f8c711b422c5f663ac5383094886c16e99f67f6be18ea9e531f93c8',
  AUTOMATIC_DROPIN_PATH:'6ab9c89f5d41402ad46f9b7c25fbafcc108414ccf002bc3eb4d880397ba22c7f'}
 AUTOMATIC_ADDITIONAL_FILES={
- '/usr/local/lib/reolink-protect-controls/automatic-quality-nginx-guard.py':'93419b3503c18300eafe316264e7dfe0a59163af92d1815e6bebf4e41abeced1',
+ '/usr/local/lib/reolink-protect-controls/automatic-quality-nginx-guard.py':'d11cf75b2034ab82f20ea2fd717d813e9ba82e5a40d61d9859ebcbde79fddbae',
  '/etc/systemd/system/unifi-protect.service.d/71-reolink-nginx-compat.conf':'80c9d69f1297acfbd62d2ee61808271c08c6f5189f8affb952a9a9b37f81533d'}
 AUTOMATIC_WATCH_FILES={
  '/etc/systemd/system/reolink-protect-nginx-regeneration.service':'8381467f8fed88d11d945d6de263f4704b0564df92b590b5f8acfcb036dce93f',
