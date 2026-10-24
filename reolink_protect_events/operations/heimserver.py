@@ -344,6 +344,31 @@ def config_fingerprints():
     return {name: digest(read_private(ROOT / 'config' / name)) for name in ('events.json', 'controls.json')}
 
 
+def events_ready(value, after_ms, now_ms):
+    """Fresh readiness also allows an outbox proven to deliver after activation.
+
+    Runtime's strict healthy flag and durable outbox remain unchanged. A queued
+    revision is not a startup failure when the fresh native worker demonstrably
+    delivered since this activation and has no current retry/error condition.
+    """
+    if not isinstance(value, dict) or type(after_ms) is not int or type(now_ms) is not int:
+        return False
+    at = value.get('atMs')
+    if value.get('mode') != 'native' or type(at) is not int or at < after_ms or not 0 <= now_ms-at <= 30000:
+        return False
+    if value.get('healthy') is True:
+        return True
+    pending, retries = value.get('pending'), value.get('retryIntervals')
+    delivered, worker_age = value.get('lastNativeDeliveryMs'), value.get('nativeWorkerAgeMs')
+    return (value.get('captureHealthy') is True and value.get('nativeReady') is True
+            and value.get('frigateHealthy') is True and value.get('nativeError') is None
+            and value.get('workerStopped') is not True
+            and type(worker_age) is int and 0 <= worker_age <= 60000
+            and type(retries) is int and retries == 0
+            and type(pending) is int and pending > 0
+            and type(delivered) is int and delivered >= after_ms and 0 <= now_ms-delivered <= 60000)
+
+
 def ready(after_ms, seconds=60):
     """Process and fresh events-health gate; a full monitor cycle is separate."""
     deadline = time.monotonic() + seconds
@@ -352,8 +377,7 @@ def ready(after_ms, seconds=60):
         if all(row['LoadState'] == 'loaded' and row['ActiveState'] == 'active' for row in units.values()):
             try:
                 value = json.loads(read_private(ROOT / 'state' / 'events' / 'health.json'))
-                if value.get('mode') == 'native' and value.get('healthy') is True \
-                        and type(value.get('atMs')) is int and value['atMs'] >= after_ms:
+                if events_ready(value, after_ms, int(time.time() * 1000)):
                     return units
             except (OSError, ValueError):
                 pass
@@ -389,7 +413,8 @@ def switch(expected, target, *, rollback=False):
         set_current(target)
         atomic_write(ROOT / 'deployment.json', candidate_raw)
         run(['systemctl', 'restart', *UNITS], timeout=90)
-        units = ready(began)
+        ready_barrier = int(time.time() * 1000)
+        units = ready(ready_barrier)
         need(config_fingerprints() == baseline, 'heimserver_private_config_changed')
         after, after_raw = deployment()
         need(after_raw == candidate_raw, 'heimserver_deployment_CAS_failed')
@@ -410,7 +435,8 @@ def switch(expected, target, *, rollback=False):
                 set_current(expected)
                 atomic_write(ROOT / 'deployment.json', prior_raw)
                 run(['systemctl', 'restart', *UNITS], timeout=90)
-                ready(int(time.time() * 1000) - 1000)
+                ready_barrier = int(time.time() * 1000)
+                ready(ready_barrier)
                 restored = True
         except Exception:
             restored = False

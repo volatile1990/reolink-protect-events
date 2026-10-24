@@ -54,6 +54,61 @@ def units():
             for name in (*server.UNITS, server.TUNNEL, server.TARGET)}
 
 
+class EventsReadinessTests(unittest.TestCase):
+    def setUp(self):
+        self.now=200000;self.activation=150000
+        self.health={'mode':'native','atMs':self.now-1000,'healthy':False,
+          'captureHealthy':True,'nativeReady':True,'frigateHealthy':True,
+          'nativeError':None,'nativeWorkerAgeMs':100,'pending':9,'retryIntervals':0,
+          'lastNativeDeliveryMs':self.now-2000,'importErrors':147}
+    def ready(self,value=None):
+        return server.events_ready(self.health if value is None else value,self.activation,self.now)
+    def test_current_healthy_and_proven_postactivation_delivery_are_ready_without_mutation(self):
+        original=copy.deepcopy(self.health)
+        self.assertTrue(self.ready());self.assertEqual(self.health,original)
+        strict={'mode':'native','atMs':self.now,'healthy':True}
+        self.assertTrue(self.ready(strict))
+        self.assertFalse(self.health['healthy']);self.assertEqual(self.health['pending'],9)
+    def test_old_or_missing_delivery_cannot_be_replaced_by_a_fresh_worker_heartbeat(self):
+        for delivered in(self.activation-1,self.now-60001,self.now+1,None,True,'199000'):
+            value=dict(self.health,lastNativeDeliveryMs=delivered)
+            with self.subTest(delivered=delivered):self.assertFalse(self.ready(value))
+    def test_stale_pre_activation_or_future_health_is_not_ready_even_if_healthy(self):
+        for at in(self.now-30001,self.activation-1,self.now+1,None,True):
+            for healthy in(True,False):
+                with self.subTest(at=at,healthy=healthy):
+                    self.assertFalse(self.ready(dict(self.health,atMs=at,healthy=healthy)))
+    def test_delivery_retry_capture_native_and_frigate_failures_remain_negative(self):
+        for change in({'retryIntervals':1},{'retryIntervals':False},{'captureHealthy':False},
+          {'nativeReady':False},{'frigateHealthy':False},{'nativeError':'RuntimeError'},
+          {'nativeWorkerAgeMs':60001},{'nativeWorkerAgeMs':None},{'nativeWorkerAgeMs':-1},
+          {'workerStopped':True},{'mode':'capture'}):
+            with self.subTest(change=change):self.assertFalse(self.ready(dict(self.health,**change)))
+    def test_only_a_positive_integer_pending_count_enables_the_narrow_alternative(self):
+        for pending in(0,-1,True,1.5,'9',None):
+            with self.subTest(pending=pending):self.assertFalse(self.ready(dict(self.health,pending=pending)))
+        self.assertTrue(self.ready(dict(self.health,nativeWorkerAgeMs=60000)))
+    def test_pending_requires_explicit_true_frigate_health(self):
+        for value in(None,False,0,1,'true',{},[]):
+            with self.subTest(value=value):self.assertFalse(self.ready(dict(self.health,frigateHealthy=value)))
+        missing=dict(self.health);missing.pop('frigateHealthy')
+        self.assertFalse(self.ready(missing))
+        self.assertTrue(self.ready({'mode':'native','atMs':self.now,'healthy':True}))
+    def test_gate_uses_the_proof_while_still_requiring_all_own_units_active(self):
+        with patch.object(server,'unit_states',return_value=units()), \
+             patch.object(server,'read_private',return_value=json.dumps(self.health).encode()), \
+             patch.object(server.time,'time',return_value=self.now/1000):
+            self.assertEqual(server.ready(self.activation),units())
+        bad=units();bad[server.UNITS[0]]['ActiveState']='inactive'
+        with patch.object(server,'unit_states',return_value=bad), \
+             patch.object(server,'read_private')as read, \
+             patch.object(server.time,'monotonic',side_effect=[0,0,2]), \
+             patch.object(server.time,'sleep'):
+            with self.assertRaisesRegex(server.ServerError,'heimserver_activation_health_failed'):
+                server.ready(self.activation,seconds=1)
+            read.assert_not_called()
+
+
 class BundleTests(unittest.TestCase):
     def assert_code(self, expected, function, *args):
         with self.assertRaises(server.ServerError) as caught:
@@ -149,17 +204,38 @@ class SwitchTests(unittest.TestCase):
         run.assert_called_once_with(['systemctl', 'restart', *server.UNITS], timeout=90)
         self.assertNotIn(server.TUNNEL, run.call_args.args[0])
 
+    def test_readiness_barrier_follows_restart_and_rejects_stop_window_or_early_new_delivery(self):
+        prior,raw,candidate,candidate_raw=self.fixtures();clock=[100]
+        def restart(*args,**kwargs):clock[0]=102
+        def ready(barrier):
+            self.assertEqual(barrier,102000)
+            health={'mode':'native','atMs':107000,'healthy':False,'captureHealthy':True,
+              'nativeReady':True,'frigateHealthy':True,'nativeError':None,'nativeWorkerAgeMs':1,
+              'pending':1,'retryIntervals':0}
+            for delivery in(100100,101000):
+                self.assertFalse(server.events_ready(dict(health,lastNativeDeliveryMs=delivery),barrier,107000))
+            self.assertTrue(server.events_ready(dict(health,lastNativeDeliveryMs=103000),barrier,107000))
+            return units()
+        with patch.object(server,'deployment',side_effect=[(prior,raw),(prior,raw),(candidate,candidate_raw)]), \
+             patch.object(server,'verify_tree',side_effect=[({},OLD_MANIFEST),({},NEW_MANIFEST)]), \
+             patch.object(server,'runtime_check',return_value={}),patch.object(server,'unit_states',return_value=units()), \
+             patch.object(server,'config_fingerprints',return_value={}),patch.object(server.time,'time',side_effect=lambda:clock[0]), \
+             patch.object(server,'set_current'),patch.object(server,'atomic_write'), \
+             patch.object(server,'run',side_effect=restart),patch.object(server,'ready',side_effect=ready):
+            self.assertTrue(server.switch(OLD,NEW)['ok'])
+
     def test_fsync_failure_after_symlink_commit_is_detected_and_rolled_back(self):
         prior, raw, _candidate, _candidate_raw = self.fixtures()
+        clock=[100]
         with patch.object(server, 'deployment', side_effect=[(prior, raw), (prior, raw)]), \
              patch.object(server, 'verify_tree', side_effect=[({}, OLD_MANIFEST), ({}, NEW_MANIFEST)]), \
              patch.object(server, 'runtime_check', return_value={}), \
              patch.object(server, 'unit_states', return_value=units()), \
              patch.object(server, 'config_fingerprints', return_value={}), \
-             patch.object(server.time, 'time', return_value=100), \
+             patch.object(server.time, 'time', side_effect=lambda:clock[0]), \
              patch.object(server, 'set_current', side_effect=[OSError('PRIVATE_DIAGNOSTIC'), None]) as current, \
-             patch.object(server, 'atomic_write') as write, patch.object(server, 'run'), \
-             patch.object(server, 'ready', return_value=units()), \
+             patch.object(server, 'atomic_write') as write, patch.object(server, 'run',side_effect=lambda *a,**kw:clock.__setitem__(0,105)), \
+             patch.object(server, 'ready', return_value=units())as ready, \
              patch.object(server, 'read_private', return_value=raw), \
              patch.object(Path, 'is_symlink', return_value=True), \
              patch.object(server.os, 'readlink', return_value=str(server.release_path(NEW))):
@@ -168,6 +244,7 @@ class SwitchTests(unittest.TestCase):
         self.assertFalse(result['manualInspectionRequired'])
         self.assertEqual([call.args[0] for call in current.call_args_list], [NEW, OLD])
         write.assert_called_once_with(server.ROOT / 'deployment.json', raw)
+        ready.assert_called_once_with(105000)
         self.assertNotIn('PRIVATE_', json.dumps(result))
 
     def test_foreign_postfailure_state_is_never_overwritten(self):
