@@ -115,6 +115,12 @@ pairs). The full-GOP allowlist is limited to the reviewed Eingang
 `6ac8ae7001ab6d03e4006410`, Garage `6ac83fed00bd6d03e4001b81`, Garten
 `6ac844bf02026d03e4001f5f`, Vor dem Haus `6ac8ae7102b76d03e4006447`, Neubau Eingang
 `6ac83993001a6d03e4001690` and Hintertür `6ac844bd01096d03e4001f22` IDs.
+An optional `relativePartialGopCameraIds` list is limited to Eingang
+`6ac8ae7001ab6d03e4006410` and must not overlap `fullGopCameraIds`. It requests
+partial GOP fragments with `useWallClock=false`; the startup probe requires a
+relative initial clock and still checks every A/V fragment for continuity. This
+mode avoids the web player's full-GOP delivery cycle while retaining one clock
+origin from startup. It requires the same three exact Nginx pins below.
 Enable an exception only when its actual frontend scope has been reviewed and
 freshly pinned. It requires exact current hashes for
 `/etc/nginx/nginx.conf`, `/ssd1/.data/unifi-core/config/http/shared-runnable-protect.conf`

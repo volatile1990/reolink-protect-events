@@ -407,12 +407,14 @@ class ProtectFrameStream:
 
 
 def configuration(config):
-    """An explicit full-GOP exception must remain tied to inspected nginx bytes."""
+    """Reviewed browser clock/GOP exceptions stay tied to inspected nginx bytes."""
     value = config.get('fmp4Startup', {})
-    need(isinstance(value, dict) and not set(value) - {'enabled', 'fullGopCameraIds', 'nginxFilePins'},
+    need(isinstance(value, dict) and not set(value) - {'enabled', 'fullGopCameraIds',
+         'relativePartialGopCameraIds', 'nginxFilePins'},
          'fmp4_configuration_invalid')
     enabled = value.get('enabled', False)
     ids = value.get('fullGopCameraIds', [])
+    relative_ids = value.get('relativePartialGopCameraIds', [])
     pins = value.get('nginxFilePins', [])
     scope = {b['cameraId'] for b in config['bridges']}
     need(type(enabled) is bool and isinstance(ids, list)
@@ -423,7 +425,12 @@ def configuration(config):
     need(set(ids) <= {'6ac8ae7001ab6d03e4006410', '6ac83fed00bd6d03e4001b81',
                      '6ac844bf02026d03e4001f5f', '6ac8ae7102b76d03e4006447',
                      '6ac83993001a6d03e4001690', '6ac844bd01096d03e4001f22'}, 'fmp4_configuration_invalid')
-    need(isinstance(pins, list) and len(pins) <= 8 and (not ids or bool(pins)), 'fmp4_configuration_invalid')
+    need(isinstance(relative_ids, list) and len(relative_ids) <= 1
+         and all(isinstance(cid, str) and cid in scope
+                 and cid == '6ac8ae7001ab6d03e4006410' for cid in relative_ids)
+         and not set(relative_ids) & set(ids), 'fmp4_configuration_invalid')
+    exceptions = bool(ids or relative_ids)
+    need(isinstance(pins, list) and len(pins) <= 8 and (not exceptions or bool(pins)), 'fmp4_configuration_invalid')
     seen = set()
     for pin in pins:
         need(isinstance(pin, dict) and set(pin) == {'path', 'sha256'} and isinstance(pin['path'], str)
@@ -435,10 +442,13 @@ def configuration(config):
             '/ssd1/.data/unifi-core/config/http/upstream-protect_api_backend.conf'}
              and str(path) not in seen, 'fmp4_configuration_invalid')
         seen.add(str(path))
-    need(not ids or seen == {'/etc/nginx/nginx.conf',
+    need(not exceptions or seen == {'/etc/nginx/nginx.conf',
         '/ssd1/.data/unifi-core/config/http/shared-runnable-protect.conf',
         '/ssd1/.data/unifi-core/config/http/upstream-protect_api_backend.conf'}, 'fmp4_configuration_invalid')
-    return {'enabled': enabled, 'fullGopCameraIds': ids, 'nginxFilePins': pins}
+    options = {'enabled': enabled, 'fullGopCameraIds': ids, 'nginxFilePins': pins}
+    if relative_ids:
+        options['relativePartialGopCameraIds'] = relative_ids
+    return options
 
 
 def verify_configuration(options, config=None, *, timeout=8):
@@ -472,16 +482,18 @@ def verify_configuration(options, config=None, *, timeout=8):
 
 
 def browser_flags(options, camera_id):
-    return {'useWallClock': True, 'allowPartialGOP': camera_id not in options['fullGopCameraIds'],
+    relative = camera_id in options.get('relativePartialGopCameraIds', [])
+    return {'useWallClock': not relative, 'allowPartialGOP': camera_id not in options['fullGopCameraIds'],
             'progressive': True, 'extendedVideoMetadata': True, 'rebaseTimestampsToZero': False,
             'fragmentDurationMillis': 100}
 
 
 class StartupClock:
     """Include the very first fragment; no warmup can hide a startup discontinuity."""
-    def __init__(self, started, *, full_gop=False):
+    def __init__(self, started, *, full_gop=False, relative=False):
         self.started = started
         self.full_gop = full_gop
+        self.expected_origin = 'relative' if relative else 'epoch'
         self.tracks, self.defaults, self.stats, self.pending = {}, {}, {}, None
         self.payload_fragments = self.payload_bytes = self.sample_bytes = 0
         self.payload_sizes_valid = True
@@ -549,7 +561,7 @@ class StartupClock:
         return rows, {'video': bool(video), 'audio': not expected_audio or bool(audio),
             'samplePayloadSizes': self.payload_sizes_valid and self.payload_fragments > 0,
             'continuousFromFirstFragment': bool(rows) and all(s['fragments'] >= 2 and s['samples'] >= 5
-                and s['clockGaps'] == s['clockOverlaps'] == 0 and s['initialClockOrigin'] == 'epoch'
+                and s['clockGaps'] == s['clockOverlaps'] == 0 and s['initialClockOrigin'] == self.expected_origin
                 and 2 <= s['mediaSpanSeconds'] <= 20
                 and abs(s['mediaSpanSeconds'] - s['summedDurationSeconds']) <= 1 / s['timescale'] + 1e-6
                 for s in rows),
@@ -604,7 +616,9 @@ def probe_fmp4(config, camera, channel, *, seconds=12, api=None, connector=None,
             connection = socket.create_connection(('127.0.0.1', endpoint.port), timeout=remaining)
         need(clock() < deadline, 'fmp4_setup_timeout')
         connection.settimeout(max(0.01, deadline - clock())); connection.sendall(leading)
-        started = clock(); deadline = started + seconds; collector = StartupClock(started,full_gop=flags['allowPartialGOP']is False)
+        started = clock(); deadline = started + seconds
+        collector = StartupClock(started, full_gop=flags['allowPartialGOP']is False,
+                                 relative=flags['useWallClock']is False)
         parser = BoxStream(collector.on_box); framed = ProtectFrameStream(parser)
         prelude = bytearray(); wire = None
         while clock() < deadline:

@@ -1,5 +1,6 @@
 """Synthetic native TCP startup framing, clocks, flags and secret-safe failures."""
 import hashlib
+import contextlib
 import json
 import socket
 import struct
@@ -23,10 +24,10 @@ def initialization(audio=True,video_size=1,duration=100):
         defaults.append(box(b'trex',struct.pack('!IIIIII',0,tid,1,duration,video_size if tid==1 else 1,0)))
     return box(b'moov',b''.join(tracks)+box(b'mvex',b''.join(defaults)))
 
-def fragment(index,*,audio=True,first_relative=False,backward=False,audio_offset=0,payload_size=None):
+def fragment(index,*,audio=True,first_relative=False,relative=False,backward=False,audio_offset=0,payload_size=None):
     trafs=[]
     for tid in (1,2) if audio else (1,):
-        start=EPOCH+index*1000
+        start=(0 if relative else EPOCH)+index*1000
         if tid==2:start+=audio_offset
         if first_relative and index==0:start=0
         if backward and index==3:start-=100
@@ -38,11 +39,11 @@ def fragment(index,*,audio=True,first_relative=False,backward=False,audio_offset
 
 def frame(kind,data):return bytes([kind])+len(data).to_bytes(3,'big')+data
 
-def stream(*,extended=True,audio=True,first_relative=False,backward=False,audio_offset=0,payload_size=None):
+def stream(*,extended=True,audio=True,first_relative=False,relative=False,backward=False,audio_offset=0,payload_size=None):
     init=initialization(audio)
     values=[frame(250,init) if extended else init]
     for index in range(12):
-        moof,mdat=fragment(index,audio=audio,first_relative=first_relative,backward=backward,audio_offset=audio_offset,payload_size=payload_size)
+        moof,mdat=fragment(index,audio=audio,first_relative=first_relative,relative=relative,backward=backward,audio_offset=audio_offset,payload_size=payload_size)
         if extended:
             values.append(frame(249,b'')+frame(251,moof)+frame(254,mdat[:8])+
                 frame(252,mdat[8:])+frame(255,b''))
@@ -67,19 +68,27 @@ class Socket:
     def close(self):self.closed=True
 
 class StartupProbeTests(unittest.TestCase):
-    def check(self,values=None,*,flags_change=None,connector_error=False):
+    def check(self,values=None,*,flags_change=None,connector_error=False,relative=False):
         config={'protectUserId':'test-owner','bridges':[{'cameraId':CID}], 'fmp4Startup':{'enabled':True}}
         camera={'id':CID,'channels':[{'id':1,'enabled':True}], 'thirdPartyCameraInfo':{'enableRtspAudio':True}}
+        if relative:
+            camera['id']='6ac8ae7001ab6d03e4006410'
+            config['bridges']=[{'cameraId':camera['id']}]
+            config['fmp4Startup'].update(relativePartialGopCameraIds=[camera['id']],nginxFilePins=[
+                {'path':path,'sha256':'a'*64}for path in ('/etc/nginx/nginx.conf',
+                '/ssd1/.data/unifi-core/config/http/shared-runnable-protect.conf',
+                '/ssd1/.data/unifi-core/config/http/upstream-protect_api_backend.conf')])
         clock=Clock();sock=Socket(clock,stream()if values is None else values);seen=[]
         def api(_config,path,**_):
-            seen.append(path);flags=fmp4.browser_flags(fmp4.configuration(config),CID)
+            seen.append(path);flags=fmp4.browser_flags(fmp4.configuration(config),camera['id'])
             if flags_change:flags.update(flags_change)
             body=json.dumps({'cmd':'play','params':{'channel':1,'type':'fmp4',**flags},'privateToken':'PRIVATE_NATIVE_TOKEN'}).encode()
             return {'uri':'tcp://127.0.0.1:7447','data':{'type':'Buffer','data':list(len(body).to_bytes(4,'big')+body)}}
         def connector(*_):
             if connector_error:raise OSError('PRIVATE_CREDENTIAL')
             return sock
-        result=fmp4.probe_fmp4(config,camera,1,api=api,connector=connector,clock=clock)
+        with patch.object(fmp4,'verify_configuration',return_value=True)if relative else contextlib.nullcontext():
+            result=fmp4.probe_fmp4(config,camera,1,api=api,connector=connector,clock=clock)
         self.assertNotIn('PRIVATE_',json.dumps(result));self.assertFalse(result['mediaSaved'])
         self.assertFalse(result['frontdoorAuthenticationVerified'])
         if not connector_error and not flags_change:self.assertTrue(sock.closed)
@@ -98,6 +107,35 @@ class StartupProbeTests(unittest.TestCase):
         result,_,_=self.check(stream(first_relative=True))
         self.assertFalse(result['ok']);self.assertFalse(result['checks']['continuousFromFirstFragment'])
         self.assertTrue(any(t['clockGaps'] for t in result['tracks']))
+
+    def test_relative_partial_startup_requires_effective_flags_and_full_continuity(self):
+        for extended in (True,False):
+            result,_,seen=self.check(stream(relative=True,extended=extended),relative=True)
+            self.assertTrue(result['ok'],result)
+            self.assertIn('allowPartialGOP=true',seen[0]);self.assertIn('useWallClock=false',seen[0])
+            self.assertTrue(all(t['initialClockOrigin']=='relative'for t in result['tracks']))
+            result,_,_=self.check(stream(first_relative=True,extended=extended),relative=True)
+            self.assertFalse(result['ok']);self.assertFalse(result['checks']['continuousFromFirstFragment'])
+        result,sock,_=self.check(stream(relative=True),relative=True,flags_change={'useWallClock':True})
+        self.assertEqual(result['errorCode'],'fmp4_effective_flags_mismatch');self.assertFalse(sock.sent)
+        result,_,_=self.check(stream(),relative=True)
+        self.assertFalse(result['checks']['continuousFromFirstFragment'])
+
+    def test_relative_partial_exception_is_disjoint_scoped_and_hash_bound(self):
+        cid='6ac8ae7001ab6d03e4006410'
+        base={'bridges':[{'cameraId':cid},{'cameraId':CID}], 'fmp4Startup':{
+            'enabled':True,'relativePartialGopCameraIds':[cid],'nginxFilePins':[
+                {'path':path,'sha256':'a'*64}for path in ('/etc/nginx/nginx.conf',
+                '/ssd1/.data/unifi-core/config/http/shared-runnable-protect.conf',
+                '/ssd1/.data/unifi-core/config/http/upstream-protect_api_backend.conf')]}}
+        options=fmp4.configuration(base)
+        self.assertFalse(fmp4.browser_flags(options,cid)['useWallClock'])
+        self.assertTrue(fmp4.browser_flags(options,cid)['allowPartialGOP'])
+        self.assertTrue(fmp4.browser_flags(options,CID)['useWallClock'])
+        for delta in ({'relativePartialGopCameraIds':[CID]}, {'relativePartialGopCameraIds':[cid,cid]},
+                      {'fullGopCameraIds':[cid]}, {'nginxFilePins':[]}, {'nginxFilePins':base['fmp4Startup']['nginxFilePins'][:2]}):
+            config=dict(base,fmp4Startup=dict(base['fmp4Startup'],**delta))
+            with self.assertRaises(OperationError):fmp4.configuration(config)
 
     def test_full_gop_startup_delay_accepts_overlapping_clocks_not_arbitrary_skew(self):
         result,_,_=self.check(stream(audio_offset=-3000))

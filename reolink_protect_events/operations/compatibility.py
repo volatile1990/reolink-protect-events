@@ -24,7 +24,7 @@ AUTOMATIC_FILES={
  AUTOMATIC_GUARD_PATH:'919fd11b7f8c711b422c5f663ac5383094886c16e99f67f6be18ea9e531f93c8',
  AUTOMATIC_DROPIN_PATH:'6ab9c89f5d41402ad46f9b7c25fbafcc108414ccf002bc3eb4d880397ba22c7f'}
 AUTOMATIC_ADDITIONAL_FILES={
- '/usr/local/lib/reolink-protect-controls/automatic-quality-nginx-guard.py':'d11cf75b2034ab82f20ea2fd717d813e9ba82e5a40d61d9859ebcbde79fddbae',
+ '/usr/local/lib/reolink-protect-controls/automatic-quality-nginx-guard.py':'1b577898455733e6dadd2ce51added25f8e6004614be86988eae88162613d09c',
  '/etc/systemd/system/unifi-protect.service.d/71-reolink-nginx-compat.conf':'80c9d69f1297acfbd62d2ee61808271c08c6f5189f8affb952a9a9b37f81533d'}
 AUTOMATIC_WATCH_FILES={
  '/etc/systemd/system/reolink-protect-nginx-regeneration.service':'8381467f8fed88d11d945d6de263f4704b0564df92b590b5f8acfcb036dce93f',
