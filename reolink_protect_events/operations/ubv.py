@@ -327,7 +327,32 @@ def _control(opcode, payload):
     return bytes((128 | opcode, 128 | len(payload))) + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
 
 
-def probe_ubv(config, camera, channel, *, seconds=8, api=None, connector=None, clock=None):
+def _empty_startup_close(result):
+    """Only the first close control, before any media or partial record."""
+    return (result.get('ok')is False and result.get('errorCode')=='ubv_closed_before_deadline'
+        and result.get('websocketCloseCode')in(None,1000,1001)
+        and type(result.get('websocketFrames'))is int and result['websocketFrames']==1
+        and type(result.get('binaryBytesDiscarded'))is int and result['binaryBytesDiscarded']==0
+        and type(result.get('maxHeaderBytesRetained'))is int and result['maxHeaderBytesRetained']==0
+        and result.get('tracks')==[] and result.get('checks',{}).get('continuousMediaTimes')is True)
+
+
+def probe_ubv(config, camera, channel, *, seconds=8, api=None, connector=None, clock=None,sleep=None):
+    """One bounded setup-close retry; every first failure remains visible.
+
+    A new alias can overlap the preceding alias's asynchronous native cleanup.
+    Retry only a close with zero media, never a parser/media/timing failure.
+    Each call below owns and closes its own complete native connection.
+    """
+    import time
+    first=_probe_ubv_once(config,camera,channel,seconds=seconds,api=api,connector=connector,clock=clock)
+    if not _empty_startup_close(first):return dict(first,setupRetryUsed=False)
+    (sleep or time.sleep)(2)
+    second=_probe_ubv_once(config,camera,channel,seconds=8,api=api,connector=connector,clock=clock)
+    return dict(second,setupRetryUsed=True,firstAttempt=first,attempts=[first,second])
+
+
+def _probe_ubv_once(config, camera, channel, *, seconds=8, api=None, connector=None, clock=None):
     """Read one native UBV stream; retain only bounded numeric metadata.
 
     Neither the signed URL nor media bytes can enter the returned report.
@@ -357,7 +382,7 @@ def probe_ubv(config, camera, channel, *, seconds=8, api=None, connector=None, c
     need(channel in enabled, 'ubv_channel_not_enabled')
     api = api or protect_json; clock = clock or time.monotonic
     parser = UbvMetadataParser(); connection = None; failure = None
-    frames = binary_bytes = 0; started = None
+    frames = binary_bytes = 0; started = None; close_code = None
     try:
         params = urllib.parse.urlencode({'camera': camera['id'], 'channel': channel, 'lens': 0, 'type': 'ubv',
             'allowPartialGOP': 'false', 'fragmentDurationMillis': 500, 'chunkSize': 1024,
@@ -423,7 +448,10 @@ def probe_ubv(config, camera, channel, *, seconds=8, api=None, connector=None, c
             if opcode >= 8:
                 need(fin and length <= 125 and opcode in (8, 9, 10), 'ubv_ws_control_invalid')
                 control = read(length)
-                if opcode == 8: raise OperationError('ubv_closed_before_deadline')
+                if opcode == 8:
+                    need(length!=1,'ubv_ws_control_invalid')
+                    if length>=2:close_code=struct.unpack('!H',control[:2])[0]
+                    raise OperationError('ubv_closed_before_deadline')
                 if opcode == 9: connection.sendall(_control(10, control))
                 continue
             if opcode == 0:
@@ -476,6 +504,7 @@ def probe_ubv(config, camera, channel, *, seconds=8, api=None, connector=None, c
             and all(a['sampleRate']==t['clockRates'][0]and a['channels']in(1,2)
                     for a in t['adtsConfigurations'])for t in audio)
     return {'ok': all(checks.values()), 'channel': channel, 'requestedSeconds': seconds, 'checks': checks,
-            'errorCode': failure, 'tracks': tracks, 'websocketFrames': frames, 'binaryBytesDiscarded': binary_bytes,
+            'errorCode': failure, 'tracks': tracks, 'websocketFrames': frames, 'websocketCloseCode':close_code,
+            'binaryBytesDiscarded': binary_bytes,
             'maxHeaderBytesRetained': summary['maxMediaHeaderBytesRetained'],
             'mediaSaved': False, 'mediaDecoded': False, 'handsetPlaybackVerified': False}

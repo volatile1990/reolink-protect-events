@@ -10,7 +10,8 @@ from .safety import need
 
 ALERT_CODES=frozenset(('maintenance_requires_review','recovery_requires_review',
     'recovery_restoration_pending','recorder_repair_budget_exhausted','source_unhealthy',
-    'native_media_requires_attention','monitor_sample_failed','maintenance_expired_mutation_active'))
+    'native_media_requires_attention','monitor_sample_failed','maintenance_expired_mutation_active',
+    'media_configuration_requires_review'))
 STATES=frozenset(('maintenance','starting','attention','healthy','verifying','degraded'))
 
 

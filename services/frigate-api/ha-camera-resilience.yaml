@@ -61,6 +61,7 @@ automation:
                       'source_unhealthy': 'Kameraquelle liefert keine frischen Daten',
                       'native_media_requires_attention': 'Haustürkamera benötigt Prüfung',
                       'monitor_sample_failed': 'Kameraprüfung konnte nicht ausgeführt werden',
+                      'media_configuration_requires_review': 'Medienkonfiguration benötigt Prüfung',
                       'monitor_status_unavailable': 'Kameraprüfung fehlt oder ist veraltet',
                       'events_status_unavailable': 'Ereignisprüfung fehlt oder ist veraltet',
                       'events_capture_unhealthy': 'Kameraereignisse sind eingeschränkt',

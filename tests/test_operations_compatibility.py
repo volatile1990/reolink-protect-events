@@ -107,13 +107,15 @@ class CompatibilityTests(unittest.TestCase):
         self.assertEqual(compatibility.AUTOMATIC_RECEIPT.as_posix(),
             '/data/reolink-protect-controls/automatic-quality/active.json')
         self.assertEqual(compatibility.AUTOMATIC_ROOT_FILES,{
+            '/data/reolink-protect-controls/automatic-quality/nginx-regeneration-retry.py':
+                'a19b3f047b4c90c39a4446a939d87d26ed85472598826e3ef2c92aa18e7eb4b1',
             '/data/reolink-protect-controls/automatic-quality/nginx-root-restore.py':
                 '8b0474d881c920c5b41149d879b8755596d2f09ed8cda728f98f1a39ff95a740',
             '/data/reolink-protect-controls/automatic-quality/nginx-root-template.conf':
                 '8e6b5039a16375c112d9a608ef6ba890a2fcc54eded3e13524e4dc30b2a602d4'})
         self.assertEqual(compatibility.AUTOMATIC_WATCH_FILES,{
             '/etc/systemd/system/reolink-protect-nginx-regeneration.service':
-                'd8727bb280e1751615029b796b0ba7d84d947f54052850cc72ac913bf12be16e',
+                '9b4b4fad145396836ea98b8038e4558e7c6fef36a0e68198216e83373250633b',
             '/etc/systemd/system/reolink-protect-nginx-regeneration.path':
                 'b706f4f5be49662e0770245df5d5677eab098e2736b8a12d30b902c64e376068'})
 

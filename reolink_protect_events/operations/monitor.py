@@ -300,6 +300,8 @@ def run_once(config,root,*,allow_repair=False,now_ms=None,startup_at_ms=None,api
         report['fmp4StartupFailureCameraIds']=[r['cameraId']for r in report['cameras']if r['fmp4StartupNeedsReview']]
         report['activeCoverageVerified']=all(r['allActivePathsVerified']for r in monitored_rows)
         report['alerts']=[]
+        if not startup_configuration_ok:
+            report['alerts'].append({'code':'media_configuration_requires_review','actionRequired':True})
         if lease_state.get('requiresReview'):
             report['alerts'].append({'code':'maintenance_requires_review','actionRequired':True})
         if lease_state.get('expired')and lease_state.get('waitingForMutation'):
