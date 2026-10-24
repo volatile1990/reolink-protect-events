@@ -126,7 +126,7 @@ class MonitorTests(unittest.TestCase):
             report=monitor.run_once(self.config,other,now_ms=self.now+i*30000,
                 startup_at_ms=self.now-120000,allow_repair=True,api=self.api,fetch=bad,probe=self.probe,recover=self.repair)
         self.assertEqual(len(self.repairs),1)
-        self.assertTrue(all(r['recommendedAction']=='nas_watchdog'for r in report['cameras']))
+        self.assertTrue(all(r['recommendedAction']=='wait_for_bridge_reconnect'for r in report['cameras']))
     def test_startup_and_maintenance_suppress_probes_and_repairs(self):
         for i in range(4):
             report=monitor.run_once(self.config,self.root,now_ms=self.now+i*30000,

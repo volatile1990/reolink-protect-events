@@ -7,6 +7,8 @@
 const net = require("node:net");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const { spawnSync } = require("node:child_process");
+const { inflateSync } = require("node:zlib");
 const { Transform, pipeline } = require("node:stream");
 
 const CAMERA = "6ac8ae7102b76d03e4006447";
@@ -23,6 +25,8 @@ const MAX_SESSIONS = 6;
 const MAX_CONNECTIONS = 8;
 const KEEP_ALIVE_MS = 30000;
 const UPSTREAM_CHECK_MS = 750;
+const MEDIA_PROGRESS_MS = 45000;
+const OBSERVED_CONTROL_MAX = 65536;
 
 class ProtocolError extends Error {
   constructor(code) { super(code); this.code = code; }
@@ -154,6 +158,105 @@ function isBinmeStatus(data) {
   return offset === data.length;
 }
 
+function nativeControl(data) {
+  // Native Protect onChannelCommand uses these two uncompressed JSON binme
+  // envelopes. Observation never rewrites or synthesizes control messages.
+  if (data.length < 16 || data.length > OBSERVED_CONTROL_MAX) return null;
+  const parts = []; let offset = 0;
+  try {
+    for (const kind of [1, 2]) {
+      if (offset + 8 > data.length || data[offset] !== kind ||
+          ![1, 2, 3].includes(data[offset + 1]) || ![0, 1].includes(data[offset + 2]) || data[offset + 3]) return null;
+      const format = data[offset + 1], compressed = data[offset + 2], size = data.readUInt32BE(offset + 4); offset += 8;
+      if (size > 32768 || offset + size > data.length) return null;
+      let value = data.subarray(offset, offset + size); offset += size;
+      if (compressed) value = inflateSync(value, { maxOutputLength: 32768 });
+      parts.push(format === 1 ? JSON.parse(value.toString("utf8")) : value);
+    }
+    if (offset !== data.length) return null;
+  } catch (_) { return null; }
+  const [header, body] = parts;
+  if (!header || typeof header !== "object" || Array.isArray(header) ||
+      !["pause", "resume", "cancel", "close"].includes(header.command)) return null;
+  return { command: header.command,
+    pauseAfter: body && Number.isSafeInteger(body.pauseAfter) && body.pauseAfter >= 0 ? body.pauseAfter : 0 };
+}
+
+class ClientControlObserver {
+  constructor(onControl) {
+    this.onControl = onControl; this.buffer = Buffer.alloc(0);
+    this.parts = []; this.bytes = 0; this.fragment = null; this.disabled = false;
+  }
+  disable() { this.disabled = true; this.buffer = Buffer.alloc(0); this.parts = []; this.bytes = 0; }
+  feed(chunk) {
+    if (this.disabled) return;
+    this.buffer = this.buffer.length ? Buffer.concat([this.buffer, chunk]) : chunk;
+    if (this.buffer.length > OBSERVED_CONTROL_MAX + 65550) { this.disable(); return; }
+    while (this.buffer.length >= 2) {
+      const a = this.buffer[0], b = this.buffer[1], opcode = a & 15, fin = Boolean(a & 128);
+      if ((a & 112) || !(b & 128)) { this.disable(); return; }
+      let size = b & 127, offset = 2;
+      if (size === 126) {
+        if (this.buffer.length < 4) return;
+        size = this.buffer.readUInt16BE(2); offset = 4;
+      } else if (size === 127) {
+        if (this.buffer.length < 10) return;
+        const wide = this.buffer.readBigUInt64BE(2);
+        if (wide > BigInt(OBSERVED_CONTROL_MAX)) { this.disable(); return; }
+        size = Number(wide); offset = 10;
+      }
+      if (size > OBSERVED_CONTROL_MAX) { this.disable(); return; }
+      if (this.buffer.length < offset + 4 + size) return;
+      const mask = this.buffer.subarray(offset, offset + 4); offset += 4;
+      const payload = Buffer.from(this.buffer.subarray(offset, offset + size));
+      for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i % 4];
+      this.buffer = this.buffer.subarray(offset + size);
+      if (opcode >= 8) continue; // Ping/pong/close are not a pause or progress.
+      if (opcode === 0 ? this.fragment === null : ![1, 2].includes(opcode) || this.fragment !== null) { this.disable(); return; }
+      if (opcode !== 0) this.fragment = opcode;
+      this.parts.push(payload); this.bytes += payload.length;
+      if (this.bytes > OBSERVED_CONTROL_MAX || this.parts.length > 4096) { this.disable(); return; }
+      if (fin) {
+        const kind = this.fragment, data = Buffer.concat(this.parts, this.bytes);
+        this.fragment = null; this.parts = []; this.bytes = 0;
+        if (kind === 2) { const value = nativeControl(data); if (value) this.onControl(value); }
+      }
+    }
+  }
+}
+
+class PlaybackProgress {
+  constructor(target, timeoutMs, onStall) {
+    const query = new URLSearchParams(target.includes("?") ? target.slice(target.indexOf("?") + 1) : "");
+    // Protect defaults autoStart to false. A later actual video frame proves
+    // play began even when that optional query was absent.
+    this.state = query.getAll("autoStart").length === 1 && /^(true|1)$/i.test(query.get("autoStart")) ? "playing" : "initial-paused";
+    this.plannedPause = query.getAll("pauseAfter").length === 1 && /^[0-9]+$/.test(query.get("pauseAfter")) && Number(query.get("pauseAfter")) > 0;
+    this.timeoutMs = timeoutMs; this.onStall = onStall; this.timer = null;
+    this.arm();
+  }
+  arm() {
+    clearTimeout(this.timer); this.timer = null;
+    if (this.state === "playing") this.timer = setTimeout(() => {
+      // An explicit native pauseAfter is a pause intent, not a frozen source.
+      // It remains unlimited like a direct pause command and may be resumed.
+      if (this.plannedPause) this.state = "paused";
+      else this.onStall();
+    }, this.timeoutMs);
+  }
+  control(value) {
+    if (value.command === "pause") { this.state = "paused"; this.arm(); }
+    else if (value.command === "resume") {
+      this.state = "playing"; this.plannedPause = value.pauseAfter > 0; this.arm();
+    }
+  }
+  progress() {
+    if (this.state === "initial-paused") this.state = "playing";
+    if (this.state === "playing") this.arm();
+  }
+  close() { clearTimeout(this.timer); this.timer = null; }
+}
+
 class ArchiveFrameTransform extends Transform {
   constructor(TransformClass, options = {}) {
     super({ readableHighWaterMark: 65536, writableHighWaterMark: 65536 });
@@ -175,6 +278,7 @@ class ArchiveFrameTransform extends Transform {
     });
     this.media.on("error", error => { this.mediaError = error; });
     this.onStats = options.onStats || (() => {});
+    this.onMediaProgress = options.onMediaProgress || (() => {});
   }
 
   async _message(opcode, data, rawFrames) {
@@ -188,10 +292,12 @@ class ArchiveFrameTransform extends Transform {
     const partial = this.media._state !== "header" || this.media._headerUsed !== 0;
     need(partial || data[0] === 0xa0, "compat_unknown_binary");
     this.outputParts = [];
+    const before = this.media.snapshot().videoProgressRecords;
     try {
       await new Promise((resolve, reject) => this.media.write(data, error => error ? reject(error) : resolve()));
       if (this.mediaError) throw this.mediaError;
       const output = Buffer.concat(this.outputParts);
+      if (this.media.snapshot().videoProgressRecords > before) this.onMediaProgress();
       // A tiny source chunk may leave only a partial UBV header. Emit it with
       // the next actual UBV bytes rather than manufacturing an empty record.
       if (output.length) this.push(websocketFrame(2, output));
@@ -297,6 +403,23 @@ function upstreamReachable(host, portNumber, timeoutMs) {
     } catch (_) { done(false); }
   });
 }
+
+function startSystemdWatchdog(env = process.env, notify = null) {
+  if (!env.NOTIFY_SOCKET || !env.WATCHDOG_USEC || env.WATCHDOG_PID && env.WATCHDOG_PID !== String(process.pid)) return () => {};
+  need(/^[0-9]+$/.test(env.WATCHDOG_USEC) && Number(env.WATCHDOG_USEC) > 0, "compat_watchdog_interval");
+  const send = notify || (() => {
+    const result = spawnSync("/usr/bin/systemd-notify", ["--no-block", "--pid=" + process.pid, "WATCHDOG=1"],
+      { stdio: "ignore", timeout: 1000, env });
+    need(!result.error && result.status === 0, "compat_watchdog_notify_failed");
+  });
+  // The callback is scheduled by this Node event loop. A blocked event loop
+  // cannot emit these pulses, even if another thread or child is still alive.
+  send();
+  const timer = setInterval(send, Math.max(100, Math.floor(Number(env.WATCHDOG_USEC) / 2000)));
+  timer.unref();
+  return () => clearInterval(timer);
+}
+
 function createProxy(options = {}) {
   const listenHost = options.listenHost || "127.0.0.1", upstreamHost = options.upstreamHost || "127.0.0.1";
   need(listenHost === "127.0.0.1" && upstreamHost === "127.0.0.1", "compat_loopback_required");
@@ -313,12 +436,13 @@ function createProxy(options = {}) {
   const maxSessions = limit(options.maxSessions, MAX_SESSIONS, 8, 1);
   const keepAliveMs = limit(options.keepAliveMs, KEEP_ALIVE_MS, 600000, 1000);
   const upstreamCheckMs = limit(options.upstreamCheckMs, UPSTREAM_CHECK_MS, 5000, 1);
+  const mediaProgressMs = limit(options.mediaProgressMs, MEDIA_PROGRESS_MS, 600000, 1);
   const cameraChannels = parseCameraChannels(options.cameraChannels, options.cameraIds);
   const cameraIds = Object.freeze(Object.keys(cameraChannels));
   const profileCount = cameraIds.reduce((total, id) => total + cameraChannels[id].length, 0);
   const TransformClass = options.TransformClass || loadTransform(options.transformPath || DEFAULT_TRANSFORM_PATH);
   const sockets = new Set();
-  const metrics = { accepted: 0, transformed: 0, bypassed: 0, closed: 0, failed: 0, normalizedAudioRecords: 0 };
+  const metrics = { accepted: 0, transformed: 0, bypassed: 0, closed: 0, failed: 0, normalizedAudioRecords: 0, mediaProgressTimeouts: 0 };
   let activeSessions = 0, readinessPending = null;
   const checkUpstream = () => {
     if (readinessPending === null) {
@@ -336,12 +460,14 @@ function createProxy(options = {}) {
     sockets.add(client); metrics.accepted++;
     let upstream = null, transformer = null, header = Buffer.alloc(0), settled = false, upgraded = false, responseRelayed = false;
     let counted = false, inBytes = 0, outBytes = 0, idle = null;
+    let playback = null, controlObserver = null;
     const deadline = sessionMs ? setTimeout(() => stop(true), sessionMs) : null;
     let headerTimer = setTimeout(() => stop(true), headerMs);
     const touch = () => { if (idle) idle.refresh(); };
     const finish = failed => {
       if (settled) return;
       settled = true; clearTimeout(deadline); clearTimeout(headerTimer); clearTimeout(idle);
+      if (playback) playback.close(); if (controlObserver) controlObserver.disable();
       if (counted) { activeSessions--; metrics.closed++; }
       if (failed) metrics.failed++;
       if (transformer) metrics.normalizedAudioRecords += transformer.snapshot().normalizedAudioRecords;
@@ -380,7 +506,7 @@ function createProxy(options = {}) {
             upstreamTcpReachable: livenessOnly ? null : reachable,
             capacityAvailable, activeSessions, sessionLimitMs: sessionMs,
             sessionByteLimit: sessionBytes, idleLimitMs: idleMs, activeSessionLimit: maxSessions,
-            keepAliveMs, cameraCount: cameraIds.length, profileCount, ...metrics });
+            keepAliveMs, mediaProgressLimitMs: mediaProgressMs, cameraCount: cameraIds.length, profileCount, ...metrics });
           respond("HTTP/1.1 " + (livenessOnly || ready ? "200 OK" : "503 Service Unavailable") +
             "\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: " +
             Buffer.byteLength(body) + "\r\n\r\n" + body);
@@ -398,6 +524,7 @@ function createProxy(options = {}) {
       if (activeSessions >= maxSessions) { reject("503 Service Unavailable"); return; }
       counted = true; activeSessions++;
       const enabled = transformationGate(request, undefined, cameraChannels);
+      const initialClientData = header.subarray(marker + 4);
       if (enabled) metrics.transformed++; else metrics.bypassed++;
       idle = idleMs ? setTimeout(() => stop(true), idleMs) : null;
       upstream = net.createConnection({ host: upstreamHost, port: upstreamPort, noDelay: true });
@@ -410,6 +537,7 @@ function createProxy(options = {}) {
         finish(false); if (upstream) upstream.destroy(); client.destroy();
       });
       client.on("data", data => { touch(); inBytes += data.length;
+        if (controlObserver) controlObserver.feed(data);
         if (sessionBytes && inBytes > Math.min(MAX_CONTROL_BYTES, sessionBytes)) stop(true); });
       upstream.on("data", data => { touch(); outBytes += data.length; if (sessionBytes && outBytes > sessionBytes) stop(true); });
       let response = Buffer.alloc(0);
@@ -443,7 +571,10 @@ function createProxy(options = {}) {
         const remaining = response.subarray(end + 4); response = Buffer.alloc(0);
         if (remaining.length) upstream.unshift(remaining);
         if (transformResponse) {
-          transformer = new ArchiveFrameTransform(TransformClass);
+          playback = new PlaybackProgress(request.target, mediaProgressMs, () => { metrics.mediaProgressTimeouts++; stop(true); });
+          controlObserver = new ClientControlObserver(value => playback.control(value));
+          if (initialClientData.length) controlObserver.feed(initialClientData);
+          transformer = new ArchiveFrameTransform(TransformClass, { onMediaProgress: () => playback.progress() });
           pipeline(upstream, transformer, client, error => {
             finish(Boolean(error)); if (error) stop(true);
             if (!upstream.destroyed) upstream.end();
@@ -484,14 +615,17 @@ if (require.main === module) {
       sessionBytes: process.env.MAX_SESSION_BYTES === undefined ? undefined : Number(process.env.MAX_SESSION_BYTES),
       idleMs: process.env.IDLE_MS === undefined ? undefined : Number(process.env.IDLE_MS),
       maxSessions: process.env.MAX_SESSIONS === undefined ? undefined : Number(process.env.MAX_SESSIONS),
+      mediaProgressMs: process.env.MEDIA_PROGRESS_MS === undefined ? undefined : Number(process.env.MEDIA_PROGRESS_MS),
       cameraIds: process.env.CAMERA_IDS, cameraChannels: process.env.CAMERA_CHANNELS });
+    const stopWatchdog = startSystemdWatchdog();
     proxy.listen().then(address => process.stdout.write(JSON.stringify({ ready: true, listenHost: "127.0.0.1",
       listenPort: address.port, upstreamPort: Number(process.env.UPSTREAM_PORT || 17702),
       cameraCount: proxy.cameraIds.length, profileCount: proxy.profileCount }) + "\n"),
       () => { process.stderr.write("compat_listen_failed\n"); process.exitCode = 1; });
-    const shutdown = () => proxy.close().then(() => process.exit(0));
+    const shutdown = () => { stopWatchdog(); return proxy.close().then(() => process.exit(0)); };
     process.once("SIGTERM", shutdown); process.once("SIGINT", shutdown);
   } catch (_) { process.stderr.write("compat_start_failed\n"); process.exitCode = 1; }
 }
 module.exports = { createProxy, ArchiveFrameTransform, transformationGate, headers,
-  websocketFrame, isBinmeStatus, parseCameraIds, parseCameraChannels, ProtocolError, CAMERA, DEFAULT_TRANSFORM_PATH };
+  websocketFrame, isBinmeStatus, nativeControl, ClientControlObserver, PlaybackProgress, startSystemdWatchdog,
+  parseCameraIds, parseCameraChannels, ProtocolError, CAMERA, DEFAULT_TRANSFORM_PATH };

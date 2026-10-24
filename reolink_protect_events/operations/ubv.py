@@ -342,9 +342,17 @@ def probe_ubv(config, camera, channel, *, seconds=8, api=None, connector=None, c
     from .http import protect_json
     from .safety import OperationError, error_code, need
     from .protect import qualities
-    need(type(channel) is int and channel in (0, 1, 2), 'ubv_channel_invalid')
+    need(type(channel) is int and channel in (0, 1, 2,3), 'ubv_channel_invalid')
     need(type(seconds) is int and 3 <= seconds <= 12, 'ubv_probe_duration_invalid')
-    need(camera.get('id') in {b['cameraId'] for b in config['bridges']}, 'ubv_camera_out_of_scope')
+    from .protect import read_only_cameras
+    bridge_scope={b['cameraId']for b in config['bridges']}
+    native_scope={r['cameraId']for r in config.get('readOnlyCameras',[])}
+    native=camera.get('id')in native_scope
+    need(camera.get('id')in bridge_scope or native,'ubv_camera_out_of_scope')
+    need(channel!=3 or native,'ubv_channel_invalid')
+    if native:
+        read_only_cameras(dict(config,readOnlyCameras=[r for r in config['readOnlyCameras']if r['cameraId']==camera['id']]),
+                          {'cameras':[camera]})
     enabled = {c.get('id') for c in camera.get('channels', []) if c.get('enabled') is True}
     need(channel in enabled, 'ubv_channel_not_enabled')
     api = api or protect_json; clock = clock or time.monotonic
@@ -450,7 +458,8 @@ def probe_ubv(config, camera, channel, *, seconds=8, api=None, connector=None, c
         observations=parser.tracks[raw['trackId']]['observations']
         row['lastCompleteFrameAgeMs']=(ended-parser.started_at-observations[-1][0])*1000 if observations else None
     video = [t for t in tracks if t['kind'] in ('H264','H265','AV1')]; audio = [t for t in tracks if t['kind'] == 'AAC']
-    expected_audio = camera.get('thirdPartyCameraInfo', {}).get('enableRtspAudio') is True
+    expected_audio = (camera.get('isMicEnabled') is True and channel!=3 if native else
+                      camera.get('thirdPartyCameraInfo', {}).get('enableRtspAudio') is True)
     checks = {'transport': failure is None, 'parser': summary['ok'],
         'videoPictures': bool(video) and all(t['completeFrames'] >= 5 and t['dtsSpanSeconds'] >= 2 and t['keyframes'] >= 1
             and t['wallSpanSeconds']>=2 and t['lastCompleteFrameAgeMs']is not None and t['lastCompleteFrameAgeMs']<=3000 for t in video),
@@ -460,6 +469,12 @@ def probe_ubv(config, camera, channel, *, seconds=8, api=None, connector=None, c
             and t['formatCodes'] == ['fd06'] and t['adtsConfigurations']
             and all(a['sampleRate'] == 16000 and a['channels'] == 1 for a in t['adtsConfigurations']) for t in audio),
         'continuousMediaTimes': all(t['sequenceErrors'] == t['zeroDts'] == t['backwardDts'] == t['clockJumpsOverFiveSeconds'] == t['clockRateChanges'] == t['invalidAdts'] == 0 for t in tracks)}
+    if native:
+        # Native cameras do not use the Reolink-specific FD06/16-kHz rewrite.
+        checks['aacCompatibility']=not expected_audio or bool(audio)and all(
+            t['adtsConfigurations']and len(t['clockRates'])==1
+            and all(a['sampleRate']==t['clockRates'][0]and a['channels']in(1,2)
+                    for a in t['adtsConfigurations'])for t in audio)
     return {'ok': all(checks.values()), 'channel': channel, 'requestedSeconds': seconds, 'checks': checks,
             'errorCode': failure, 'tracks': tracks, 'websocketFrames': frames, 'binaryBytesDiscarded': binary_bytes,
             'maxHeaderBytesRetained': summary['maxMediaHeaderBytesRetained'],

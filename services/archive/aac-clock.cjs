@@ -54,7 +54,8 @@ class UbvAacClockTransform extends Transform {
     this._sourceOffset = 0n;
     this._parts = null;
     this._callChanged = false;
-    this.diagnostics = { records: 0, normalizedAudioRecords: 0, normalizedDts32Records: 0,
+    this._lastVideoProgressDts = null;
+    this.diagnostics = { records: 0, videoProgressRecords: 0, normalizedAudioRecords: 0, normalizedDts32Records: 0,
       normalizedDts64Records: 0, unsupportedAudioRecords: 0, passthroughAudioRecords: 0,
       payloadBytesForwarded: 0, maxRetainedMetadataBytes: 0, errors: 0,
       sourceClockWrapsRejected: 0, lastNormalizedSourceDts: null };
@@ -158,6 +159,13 @@ class UbvAacClockTransform extends Transform {
     } else this._emit(Buffer.from(this._trailer));
     this._sourceOffset += BigInt(expected + 4);
     this.diagnostics.records++;
+    // Observability only: metadata/audio/ping traffic cannot stand in for a
+    // newly completed video picture in the archive's progress deadline.
+    if ([7, 1003].includes(r.track) && r.size > 0 && r.dts !== null &&
+        [1, 3].includes(r.format >>> 14) &&
+        (this._lastVideoProgressDts === null || r.dts > this._lastVideoProgressDts)) {
+      this._lastVideoProgressDts = r.dts; this.diagnostics.videoProgressRecords++;
+    }
     this._headerUsed = this._prefixUsed = this._trailerUsed = 0;
     this._headerNeed = 8; this._state = "header"; this._record = null;
   }

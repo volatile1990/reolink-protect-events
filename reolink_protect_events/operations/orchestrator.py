@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 import uuid
+from contextlib import nullcontext
 from .decode import EXPORT_WINDOW_SECONDS, MIN_RECORDED_SECONDS, SERVER_CONFIG, run_full_decodes
 from .release import build_package, source_snapshot
 from .locking import process_lock
@@ -213,23 +214,30 @@ class Backend:
         return None
 
     def nas(self, payload):
+        lease=getattr(self,'maintenance_lease',None)
         if self.bridge_settings:
             need('settings' not in payload, 'bridge_settings_override_rejected')
             payload = dict(payload, settings=self.bridge_settings)
-        return self.nas_cli.invoke(payload, self.connector, sources=self.nas_sources)
+        with lease.activity(6000 if payload.get('mode')=='build'else 900)if lease else nullcontext():
+            return self.nas_cli.invoke(payload, self.connector, sources=self.nas_sources)
 
     def udm(self, request, timeout=180):
+        if getattr(self,'maintenance_lease',None)is not None and request.get('action')in('recover','installer') \
+                and request.get('request',{}).get('mode')!='maintenance':self.maintenance_lease.check()
         if request.get('action') == 'health' and request.get('mode') == 'full':
-            timeout = max(timeout, 300)
+            timeout = max(timeout, 600)
         readonly = request.get('action') in ('compatibility', 'health', 'event-evidence', 'monitor-status')
-        if getattr(self, 'architecture', 'udm') == 'heimserver' and request.get('action') != 'compatibility':
-            if request.get('action') == 'installer':
-                need(request.get('request', {}).get('mode') == 'maintenance',
-                     'heimserver_events_use_server_release_controller')
-            return invoke_server(self.events_repo, self.server_host, request, timeout=timeout,
-                                 sources=self.verification_sources if readonly else self.operation_sources)
-        return invoke(self.events_repo, self.host, request, timeout=timeout,
-                      sources=self.verification_sources if readonly else self.operation_sources)
+        lease=getattr(self,'maintenance_lease',None)
+        control=request.get('action')=='installer'and request.get('request',{}).get('mode')=='maintenance'
+        with lease.activity(timeout)if lease and not control else nullcontext():
+            if getattr(self, 'architecture', 'udm') == 'heimserver' and request.get('action') != 'compatibility':
+                if request.get('action') == 'installer':
+                    need(request.get('request', {}).get('mode') == 'maintenance',
+                         'heimserver_events_use_server_release_controller')
+                return invoke_server(self.events_repo, self.server_host, request, timeout=timeout,
+                                     sources=self.verification_sources if readonly else self.operation_sources)
+            return invoke(self.events_repo, self.host, request, timeout=timeout,
+                          sources=self.verification_sources if readonly else self.operation_sources)
 
     def server_release(self):
         need(self.architecture == 'heimserver', 'controller_architecture_invalid')
@@ -242,9 +250,10 @@ class Backend:
         while True:
             dedicated = getattr(self, 'architecture', 'udm') == 'heimserver'
             profile = {'config_path': SERVER_CONFIG, 'architecture': 'heimserver'} if dedicated else {}
+            progress={'progress':self.maintenance_lease.check}if getattr(self,'maintenance_lease',None)else{}
             value = run_full_decodes(self.server_host if dedicated else self.host,
                                      ips=ips, ffmpeg=self.ffmpeg, ffprobe=self.ffprobe,
-                                     not_before_ms=not_before_ms, **profile)
+                                     not_before_ms=not_before_ms,**progress,**profile)
             # Recording-index progress is a readiness condition. Its scoped
             # discovery fails before opening a viewer, so waiting does not hide
             # a failed payload decode or introduce concurrent readers.
@@ -257,13 +266,16 @@ class Backend:
             self.wait_until(min(now + 20000, not_before_ms + 180000))
 
     def wait_until(self, timestamp):
+        need(type(timestamp)is int and timestamp-int(time.time()*1000)<=300000,'recording_wait_deadline_invalid')
         while int(time.time() * 1000) < timestamp:
+            if getattr(self,'maintenance_lease',None)is not None:self.maintenance_lease.check()
             self.progress({'stage': 'waiting-for-recording-index', 'remainingSeconds': max(1, (timestamp - int(time.time() * 1000)) // 1000)})
             time.sleep(min(20, max(0.05, (timestamp - int(time.time() * 1000)) / 1000)))
 
 
 class Update:
     def __init__(self, backend, directory, resume=False):
+        self.resuming=resume
         self.backend = backend
         self.directory = Path(directory).resolve()
         self.path = self.directory / 'update.json'
@@ -298,6 +310,10 @@ class Update:
     def bridge_only(self):
         return getattr(self.backend, 'architecture', 'udm') == 'heimserver'
 
+    @property
+    def maintenance_owner(self):
+        return self.state.get('maintenanceOwner',self.state['owner'])
+
     def verify_server_release(self):
         result = self.backend.server_release()
         need(result.get('ok') is True and result.get('releaseVerified') is True
@@ -329,10 +345,12 @@ class Update:
         save(self.path, self.state)
 
     def step(self, name, operation):
+        if getattr(self,'_maintenance_lease',None)is not None:self._maintenance_lease.check()
         if name in self.state['completed']:
             return self.state['evidence'][name]
         self.backend.progress({'stage': name, 'status': 'running'})
         value = operation()
+        if getattr(self,'_maintenance_lease',None)is not None:self._maintenance_lease.check()
         if not isinstance(value, dict) or value.get('ok') is not True:
             self.state['evidence'][name + '-failed'] = value if isinstance(value, dict) else {'ok': False, 'errorCode': 'invalid_operation_result'}
             self.persist()
@@ -348,7 +366,29 @@ class Update:
             self.check_sources()
         self.state['maintenanceIntent'] = enabled
         self.persist()
-        result = self.backend.udm({'action': 'installer', 'request': {'mode': 'maintenance', 'owner': self.state['owner'], 'enable': enabled}})
+        from .transport import MaintenanceLease
+        if enabled:
+            if getattr(self,'_maintenance_lease',None)is None:
+                self._maintenance_lease=MaintenanceLease(lambda request:self.backend.udm(request,timeout=30),self.maintenance_owner)
+                self.backend.maintenance_lease=self._maintenance_lease
+            try:result=self._maintenance_lease.start()
+            except RuntimeError as error:
+                if not self.resuming or str(error)!='maintenance_owner_expired':raise
+                # Only a new explicit resume may replace a server-retired
+                # capability. The operation owner/artifact identities stay put.
+                self._maintenance_lease.stop(release=False)
+                old=self.maintenance_owner;new=uuid.uuid4().hex
+                self.state.setdefault('maintenanceOwnerHistory',[]).append({'owner':old,'replacedAtMs':int(time.time()*1000)})
+                self.state['maintenanceOwner']=new;self.persist()
+                self._maintenance_lease=MaintenanceLease(lambda request:self.backend.udm(request,timeout=30),new)
+                self.backend.maintenance_lease=self._maintenance_lease
+                result=self._maintenance_lease.start()
+        elif getattr(self,'_maintenance_lease',None)is not None:
+            current=self._maintenance_lease
+            self._maintenance_lease=None;self.backend.maintenance_lease=None
+            result=current.stop()
+        else:
+            result=self.backend.udm({'action':'installer','request':{'mode':'maintenance','owner':self.maintenance_owner,'enable':False}})
         need(result.get('ok') is True, 'maintenance_change_failed')
         self.state['maintenanceActive'] = enabled
         self.persist()
@@ -369,7 +409,7 @@ class Update:
         attempts.append(cid)
         self.state['evidence']['repair-trigger-' + cid] = trigger
         self.persist()  # Both recovery causes share one budget, charged before dispatch.
-        repair = self.backend.udm({'action': 'recover', 'cameraId': cid, 'owner': self.state['owner']}, timeout=300)
+        repair = self.backend.udm({'action': 'recover', 'cameraId': cid, 'owner': self.maintenance_owner}, timeout=300)
         self.state['evidence']['repair-' + cid] = repair
         self.persist()
         need(repair.get('ok') is True and repair.get('restoredOriginalTcp') is True, 'native_recorder_repair_failed')
@@ -443,7 +483,8 @@ class Update:
             digest = observed.get('deployment', {}).get('sha256')
             candidate = self.state['frozen']['eventsManifest']['packageSha256']
             if digest == candidate:
-                results.append(self.backend.udm({'action': 'installer', 'request': {'mode': 'rollback', 'expectedDigest': candidate}}, timeout=240))
+                results.append(self.backend.udm({'action': 'installer', 'request': {'mode': 'rollback', 'expectedDigest': candidate,
+                    'owner':self.maintenance_owner}}, timeout=240))
             else:
                 need(digest == self.state['installIntent']['previousDigest'], 'rollback_events_deployment_drift')
         if self.state.get('baseline') and self.state.get('release'):
@@ -546,7 +587,7 @@ class Update:
                     self.persist()
                 self.step('install-events', lambda: self.backend.udm({'action': 'installer', 'request': {'mode': 'install',
                     'package': base64.b64encode(package).decode(), 'digest': self.state['frozen']['eventsManifest']['packageSha256'],
-                    'owner': self.state['owner']}}, timeout=300))
+                    'owner': self.maintenance_owner}}, timeout=300))
             self.step('compatibility-after', self.compatibility)
             self.step('native-media-after', lambda: self.health())
             self.step('real-decode-after', self._full_decode)
@@ -576,6 +617,9 @@ class Update:
             return {'ok': False, 'status': self.state['status'], 'errorCode': self.state['errorCode'],
                     'rollback': self.state.get('rollback'), 'receipt': str(self.path)}
         finally:
+            if getattr(self,'_maintenance_lease',None)is not None:
+                self._maintenance_lease.stop(release=False)
+                self._maintenance_lease=None;self.backend.maintenance_lease=None
             lease.__exit__(None, None, None)
 
     def _full_decode(self):

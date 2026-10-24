@@ -7,6 +7,20 @@ import re
 import shlex
 import subprocess
 import zipfile
+import threading
+import time
+from contextlib import contextmanager
+
+
+def _lease_clock():
+    # Include suspend time. CLOCK_MONOTONIC alone pauses during Linux suspend.
+    if hasattr(time,'CLOCK_BOOTTIME'):return time.clock_gettime(time.CLOCK_BOOTTIME)
+    if __import__('os').name=='nt':
+        import ctypes
+        function=ctypes.windll.kernel32.GetTickCount64
+        function.restype=ctypes.c_ulonglong
+        return function()/1000
+    return time.monotonic()
 
 
 BOOTSTRAP = r'''
@@ -31,7 +45,12 @@ try:
  request=bundle['request'];action=request['action']
  if action=='installer':
   from reolink_protect_events.operations.installer import execute
-  result=execute(request['request'])
+  if request['request'].get('mode')in('install','capture','rollback'):
+   from reolink_protect_events.operations.maintenance_lease import mutation_guard
+   if request['request'].get('owner')is None:raise RuntimeError('installer_requires_owned_maintenance')
+   with mutation_guard(pathlib.Path('/data/reolink-protect-monitor'),request['request'].get('owner')):
+    result=execute(request['request'])
+  else:result=execute(request['request'])
  else:
   path=pathlib.Path(request.get('configPath','/data/reolink-protect-events/config.json'))
   if path.as_posix()!='/data/reolink-protect-events/config.json':raise RuntimeError('config_scope_invalid')
@@ -153,3 +172,113 @@ def invoke_server(repo, host, request, timeout=180, sources=None):
         return result
     except (OSError, subprocess.TimeoutExpired, ValueError, TypeError):
         raise RuntimeError('server_operation_transport_failed') from None
+
+
+class MaintenanceLease:
+    """Client heartbeat for the existing private automatic-maintenance RPC.
+
+    send receives one public request, must enforce its own finite timeout, and
+    never returns credentials. check() fences every later deployment step if a
+    heartbeat becomes uncertain. stop(release=False) lets orphan reconciliation
+    deal with an interrupted transaction instead of creating an endless marker.
+    """
+    def __init__(self,send,owner,*,interval_seconds=30,progress_timeout_seconds=300,clock=None):
+        if not isinstance(owner,str)or re.fullmatch('[a-f0-9]{32}',owner)is None:
+            raise ValueError('maintenance_owner_invalid')
+        if type(interval_seconds)not in(int,float)or not 0<interval_seconds<=60:
+            raise ValueError('maintenance_heartbeat_interval_invalid')
+        if type(progress_timeout_seconds)not in(int,float)or not 0<progress_timeout_seconds<=7200:
+            raise ValueError('maintenance_progress_timeout_invalid')
+        self.send=send;self.owner=owner;self.interval=interval_seconds
+        self.stopping=threading.Event();self.failure=None;self.thread=None
+        self.clock=clock or _lease_clock
+        self.progress_timeout=progress_timeout_seconds
+        self.confirmed_until=None;self.progress_until=None;self.activities=[]
+        self.state_lock=threading.Lock()
+
+    def _fence(self,code):
+        if self.failure is None:self.failure=code
+        self.stopping.set()
+        raise RuntimeError(self.failure)
+
+    def _valid(self,*,initial=False,allow_stopped=False):
+        if self.failure is not None:raise RuntimeError(self.failure)
+        if self.stopping.is_set()and not allow_stopped:raise RuntimeError('maintenance_lease_closed')
+        now=self.clock()
+        if not initial:
+            if self.confirmed_until is None or now>=self.confirmed_until:self._fence('maintenance_confirmation_expired')
+            deadline=min(item[1]for item in self.activities)if self.activities else self.progress_until
+            if deadline is None or now>=deadline:self._fence('maintenance_controller_progress_stalled')
+        return now
+
+    def _request(self,enabled,*,initial=False):
+        with self.state_lock:
+            began=self._valid(initial=initial,allow_stopped=not enabled)
+        value=self.send({'action':'installer','request':{'mode':'maintenance','owner':self.owner,'enable':enabled}})
+        if not isinstance(value,dict)or value.get('ok')is not True or value.get('manual')is True:
+            if isinstance(value,dict)and value.get('errorCode')in('maintenance_owner_expired',
+                    'maintenance_pending_restoration','maintenance_owned_by_other_rollout'):
+                raise RuntimeError(value['errorCode'])
+            raise RuntimeError('automatic_maintenance_lease_failed')
+        if enabled:
+            ttl=value.get('ttlMs',180000)
+            if type(ttl)is not int or not 30000<=ttl<=600000:raise RuntimeError('maintenance_confirmation_invalid')
+            deadline=began+ttl/1000-min(5,ttl/10000)
+            with self.state_lock:
+                self._valid(initial=initial)
+                if self.clock()>=deadline:self._fence('maintenance_confirmation_expired')
+                self.confirmed_until=deadline
+                if initial:self.progress_until=self.clock()+self.progress_timeout
+        return value
+
+    def start(self):
+        if self.thread is not None:self.check();return {'ok':True,'maintenance':True,'owner':self.owner}
+        value=self._request(True,initial=True)
+        def heartbeat():
+            while not self.stopping.wait(self.interval):
+                try:self._request(True)
+                except Exception:
+                    if not self.stopping.is_set():
+                        self.failure=self.failure or'maintenance_heartbeat_failed';self.stopping.set()
+                    return
+        self.thread=threading.Thread(target=heartbeat,name='maintenance-heartbeat',daemon=True)
+        self.thread.start();return value
+
+    def check(self):
+        with self.state_lock:
+            now=self._valid();self.progress_until=now+self.progress_timeout
+
+    @contextmanager
+    def activity(self,timeout_seconds):
+        """A finite known RPC can renew only until its actual operation limit."""
+        if type(timeout_seconds)not in(int,float)or not 1<=timeout_seconds<=7200:
+            raise ValueError('maintenance_activity_timeout_invalid')
+        self.check();token=object()
+        with self.state_lock:self.activities.append((token,self.clock()+timeout_seconds+5))
+        try:yield self
+        finally:
+            with self.state_lock:
+                if not self.activities or self.activities[-1][0]is not token:self._fence('maintenance_activity_order_invalid')
+                _,deadline=self.activities.pop()
+                if self.clock()>=deadline:self._fence('maintenance_controller_progress_stalled')
+                self.progress_until=self.clock()+self.progress_timeout
+            self.check()
+
+    def stop(self,*,release=True):
+        if release:
+            with self.state_lock:self._valid()
+        self.stopping.set()
+        if self.thread is not None:self.thread.join(timeout=35)
+        if self.thread is not None and self.thread.is_alive():
+            raise RuntimeError('maintenance_heartbeat_not_stopped')
+        if release:return self._request(False)
+        return {'ok':True,'maintenance':True,'owner':self.owner,'renewalStopped':True}
+
+    def __enter__(self):self.start();return self
+    def __exit__(self,kind,error,traceback):
+        if kind is not None:self.stop(release=False)
+        else:
+            try:self.check()
+            except Exception:
+                self.stop(release=False);raise
+            self.stop()

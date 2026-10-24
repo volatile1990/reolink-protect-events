@@ -4,12 +4,15 @@ PartOf=reolink-protect.target
 Requires=camera-host-access.service
 Wants=reolink-protect-ssh.service
 After=camera-host-access.service reolink-protect-ssh.service
+StartLimitIntervalSec=0
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
+WatchdogSec=300
 WorkingDirectory=/srv/cameras/protect/current/events
 Environment=PYTHONDONTWRITEBYTECODE=1
-ExecStart=/usr/bin/python3 -B -m reolink_protect_events.operations.monitor --config /srv/cameras/protect/config/events.json --root /srv/cameras/protect/state/monitor --allow-repair
+ExecStart=/usr/bin/python3 -B -m reolink_protect_events.operations.monitor --config /srv/cameras/protect/config/events.json --root /srv/cameras/protect/state/monitor --allow-repair --public-status /srv/cameras/protect/status/monitor.json
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=45

@@ -38,13 +38,32 @@ def selected_cameras(config, bootstrap, *, require_version=True):
 
 def qualities(camera):
     enabled = {c.get('id') for c in camera.get('channels', []) if isinstance(c, dict) and c.get('enabled') is True}
-    need(0 in enabled and enabled <= {0, 1, 2}, 'camera_channels_invalid')
+    allowed={0,1,2,3}if camera.get('isThirdPartyCamera')is False else{0,1,2}
+    need(0 in enabled and enabled <= allowed, 'camera_channels_invalid')
     return [('high', 'recordingEnd', 0)] + ([('low', 'recordingEndLQ', 2)] if 2 in enabled else [])
+
+
+def read_only_cameras(config,bootstrap):
+    """An explicit native identity adds observation, never a recovery target."""
+    validate_config(config,require_credentials=False)
+    rows=[]
+    for expected in config.get('readOnlyCameras',[]):
+        matches=[c for c in bootstrap.get('cameras',[])if c.get('id')==expected['cameraId']]
+        need(len(matches)==1,'readonly_camera_identity_changed')
+        c=matches[0]
+        need(c.get('host')==expected['host']and c.get('isAdopted')is True
+             and c.get('isThirdPartyCamera')is False,'readonly_camera_mapping_changed')
+        if expected.get('mac'):
+            clean=lambda x:str(x).lower().replace(':','').replace('-','')
+            need(clean(c.get('mac'))==clean(expected['mac']),'readonly_camera_mac_changed')
+        rows.append(c)
+    return rows
 
 
 def automatic_channel(camera):
     enabled = {c.get('id') for c in camera.get('channels', []) if isinstance(c, dict) and c.get('enabled') is True}
-    need(0 in enabled and enabled <= {0, 1, 2}, 'camera_channels_invalid')
+    allowed={0,1,2,3}if camera.get('isThirdPartyCamera')is False else{0,1,2}
+    need(0 in enabled and enabled <= allowed, 'camera_channels_invalid')
     return 1 if 1 in enabled else 0
 
 

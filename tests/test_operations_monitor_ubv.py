@@ -116,4 +116,34 @@ class UbvProbeTests(unittest.TestCase):
         self.assertLessEqual(parser.max_metadata_buffer,36)
 
 
+class NativeUbvTests(unittest.TestCase):
+    def native(self,packets,channel=0):
+        from test_operations_monitor import fixture
+        config,boot,_=fixture();cid='f'*24
+        config['readOnlyCameras']=[{'cameraId':cid,'host':'192.168.30.129'}]
+        camera=dict(boot['cameras'][0],id=cid,host='192.168.30.129',isThirdPartyCamera=False,
+            isMicEnabled=True,channels=[{'id':ch,'enabled':True}for ch in [0,1,2,3]])
+        clock=Clock();sock=Socket(clock,packets)
+        result=probe_ubv(config,camera,channel,seconds=8,clock=clock,connector=lambda *_:sock,
+            api=lambda *_a,**_k:{'url':'wss://127.0.0.1:7443/live?token=PRIVATE_TOKEN'})
+        self.assertTrue(sock.closed);self.assertNotIn('PRIVATE_',json.dumps(result));return result
+    def test_native_48khz_aac_uses_its_own_consistent_adts_clock(self):
+        packets=[];seq=0
+        for i in range(120):
+            payload=record(1003,i,i*7200,b'PRIVATE_VIDEO',flags=0xed if i%25==0 else 0xcd)
+            while seq*1024/48000<=i*.08:
+                audio=bytearray(adts());audio[2]=0x4c
+                payload+=record(1000,seq,seq*1024,bytes(audio),flags=0xfd,index=11);seq+=1
+            packets.append(ws(payload))
+        value=self.native(packets)
+        self.assertTrue(value['ok'],value);self.assertTrue(value['checks']['aacCompatibility'])
+        self.assertEqual(next(t for t in value['tracks']if t['kind']=='AAC')['clockRates'],[48000])
+    def test_package_camera_does_not_require_nonexistent_audio(self):
+        value=self.native(frames(audio=False),channel=3)
+        self.assertTrue(value['ok'],value);self.assertTrue(value['checks']['audioPictures'])
+    def test_main_native_camera_still_requires_audio_when_mic_enabled(self):
+        value=self.native(frames(audio=False),channel=0)
+        self.assertFalse(value['ok']);self.assertFalse(value['checks']['audioPictures'])
+
+
 if __name__=='__main__':unittest.main()

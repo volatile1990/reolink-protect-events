@@ -1,0 +1,95 @@
+# Private authorization stays in HA secrets.yaml; no actuator calls.
+rest_command:
+  camera_resilience_status:
+    url: http://192.168.1.175:18799/resilience
+    method: GET
+    headers:
+      Authorization: !secret camera_resilience_api_authorization
+    timeout: 10
+
+automation:
+  - id: camera_resilience_operator_status_v1
+    alias: Kamera-Dienste überwachen
+    mode: single
+    max_exceeded: silent
+    triggers:
+      - trigger: time_pattern
+        minutes: /1
+      - trigger: homeassistant
+        event: start
+    actions:
+      - action: rest_command.camera_resilience_status
+        response_variable: camera_report
+        continue_on_error: true
+      - if: >-
+          {{ camera_report is not defined or camera_report is not mapping
+             or camera_report.get('status', 0) != 200
+             or camera_report.get('content') is not mapping
+             or camera_report.content.get('schemaVersion') != 1
+             or camera_report.content.get('actionRequired', true) is not false }}
+        then:
+          - delay: '00:02:00'
+          - action: rest_command.camera_resilience_status
+            response_variable: camera_recheck
+            continue_on_error: true
+          - if: >-
+              {{ camera_recheck is not defined or camera_recheck is not mapping
+                 or camera_recheck.get('status', 0) != 200
+                 or camera_recheck.get('content') is not mapping
+                 or camera_recheck.content.get('schemaVersion') != 1
+                 or camera_recheck.content.get('actionRequired', true) is not false }}
+            then:
+              - action: persistent_notification.create
+                data:
+                  notification_id: camera_resilience_status
+                  title: Kameradienste prüfen
+                  message: >-
+                    {% set names = {
+                      '6ac83993001a6d03e4001690': 'Neubau Eingang',
+                      '6ac83fed00bd6d03e4001b81': 'Garage hinten',
+                      '6ac844bd01096d03e4001f22': 'Hintertür',
+                      '6ac844bf02026d03e4001f5f': 'Garten Neubau',
+                      '6ac8ae7001ab6d03e4006410': 'Eingang',
+                      '6ac8ae7102b76d03e4006447': 'Vor dem Haus',
+                      '6ad623df037f3f03e402c6b4': 'Haustür G6'} %}
+                    {% set labels = {
+                      'maintenance_requires_review': 'Wartung benötigt Prüfung',
+                      'maintenance_expired_mutation_active': 'Wartungsvorgang hängt',
+                      'recovery_requires_review': 'Recorder-Reparatur benötigt Prüfung',
+                      'recovery_restoration_pending': 'Recorder-Wiederherstellung wartet',
+                      'recorder_repair_budget_exhausted': 'Automatische Reparaturgrenze erreicht',
+                      'source_unhealthy': 'Kameraquelle liefert keine frischen Daten',
+                      'native_media_requires_attention': 'Haustürkamera benötigt Prüfung',
+                      'monitor_sample_failed': 'Kameraprüfung konnte nicht ausgeführt werden',
+                      'monitor_status_unavailable': 'Kameraprüfung fehlt oder ist veraltet',
+                      'events_status_unavailable': 'Ereignisprüfung fehlt oder ist veraltet',
+                      'events_capture_unhealthy': 'Kameraereignisse sind eingeschränkt',
+                      'events_delivery_unhealthy': 'Protect-Ereigniszustellung ist eingeschränkt',
+                      'events_worker_stalled': 'Ereignisverarbeitung hängt'} %}
+                    {% set found = namespace(count=0) %}
+                    {% if camera_recheck is defined and camera_recheck is mapping
+                          and camera_recheck.get('status', 0) == 200
+                          and camera_recheck.get('content') is mapping
+                          and camera_recheck.content.get('schemaVersion') == 1
+                          and camera_recheck.content.get('actionRequired') is boolean %}
+                      {% set raw_alerts = camera_recheck.content.get('alerts', []) %}
+                      {% set alerts = raw_alerts if raw_alerts is sequence
+                         and raw_alerts is not string and raw_alerts is not mapping else [] %}
+                      {% for item in alerts if item is mapping and item.get('actionRequired') is true %}
+                      {% set found.count = found.count + 1 %}
+                      • {{ labels.get(item.get('code', ''), 'Kameradienst benötigt Prüfung') if item.get('code') is string else 'Kameradienst benötigt Prüfung' }}{% if item.get('cameraId') is string %}: {{ names.get(item.cameraId, 'Kamera') }}{% endif %}
+                      {% endfor %}
+                      {% if found.count == 0 %}
+                      Die Kameraprüfung meldet Prüfbedarf ohne zugeordneten Einzelhinweis. Heimserver und Kameradienste prüfen.
+                      {% endif %}
+                    {% else %}
+                      Die unabhängige Kameraprüfung ist seit mindestens zwei Minuten nicht erreichbar oder liefert keine gültige Antwort. Heimserver und Netzwerk prüfen.
+                    {% endif %}
+            else:
+              - action: persistent_notification.dismiss
+                data:
+                  notification_id: camera_resilience_status
+        else:
+          - action: persistent_notification.dismiss
+            data:
+              notification_id: camera_resilience_status

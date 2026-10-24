@@ -97,8 +97,12 @@ def load_config(path=CONFIG):
     value = json.loads(path.read_text())
     need(isinstance(value, dict) and isinstance(value.get('cameraIds'), list)
          and len(value['cameraIds']) == 6
-         and all(re.fullmatch('[a-f0-9]{24}', c) for c in value['cameraIds'])
+         and all(isinstance(c,str) and re.fullmatch('[a-f0-9]{24}', c) for c in value['cameraIds'])
          and len(set(value['cameraIds'])) == 6, 'connector_camera_scope')
+    readonly=value.get('readOnlyCameraIds',[])
+    need(isinstance(readonly,list) and len(readonly)<=1
+         and all(isinstance(c,str) and re.fullmatch('[a-f0-9]{24}',c) for c in readonly)
+         and not set(readonly)&set(value['cameraIds']), 'connector_readonly_camera_scope')
     need(isinstance(value.get('protectUserId'), str)
          and re.fullmatch('[a-f0-9-]{36}', value['protectUserId']), 'connector_user_scope')
     return value
@@ -148,14 +152,16 @@ def api_request(config, request):
     need(not endpoint.scheme and not endpoint.netloc and not endpoint.fragment,
          'connector_api_path')
     camera_paths = {'/api/cameras/' + c for c in config['cameraIds']}
-    allowed_get = {'/api/bootstrap', '/api/ws/livestream', '/api/tcp/livestream'} | camera_paths
+    readable_ids=set(config['cameraIds'])|set(config.get('readOnlyCameraIds',[]))
+    allowed_get = {'/api/bootstrap', '/api/ws/livestream', '/api/tcp/livestream'} \
+        | {'/api/cameras/'+c for c in readable_ids}
     if re.fullmatch(r'/api/events/[a-f0-9]{24}', endpoint.path):
         allowed_get.add(endpoint.path)
     if method == 'GET':
         need(endpoint.path in allowed_get and body is None, 'connector_api_scope')
         if endpoint.path in {'/api/ws/livestream', '/api/tcp/livestream'}:
             params = urllib.parse.parse_qs(endpoint.query)
-            need(len(params.get('camera', [])) == 1 and params['camera'][0] in config['cameraIds'],
+            need(len(params.get('camera', [])) == 1 and params['camera'][0] in readable_ids,
                  'connector_api_camera_scope')
     elif method == 'PATCH':
         need(path in camera_paths and isinstance(body, dict)
@@ -226,7 +232,8 @@ def dispatch(config, request):
     if action == 'hashes':
         return file_hashes(config, request)
     if action == 'ping':
-        return {'connectorVersion': 1, 'protectVersion': installed_version(), 'cameraCount': 6}
+        return {'connectorVersion': 1, 'protectVersion': installed_version(), 'cameraCount': 6,
+                'readOnlyCameraCount':len(config.get('readOnlyCameraIds',[]))}
     raise ConnectorError('connector_action')
 
 

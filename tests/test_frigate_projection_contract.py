@@ -135,5 +135,17 @@ class ExpansionProjectionContractTests(unittest.TestCase):
         self.assertFalse(result["overall_healthy"])
 
 
+class CanonicalProjectionContractTests(ExpansionProjectionContractTests):
+    """The newly owned sidecar must keep the six-camera consumer contract."""
+    __unittest_skip__ = False
+
+    @classmethod
+    def setUpClass(cls):
+        path = Path(__file__).resolve().parents[1] / 'services/frigate-api/api_proxy.py'
+        spec = importlib.util.spec_from_file_location('canonical_projection_contract', path)
+        cls.proxy = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.proxy)
+
+
 if __name__ == "__main__":
     unittest.main()

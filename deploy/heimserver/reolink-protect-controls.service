@@ -19,6 +19,8 @@ Environment=REOLINK_CONTROLS_SOCKET_MODE=0660
 ExecStart=/usr/bin/python3 -B /srv/cameras/protect/current/controls/worker.py
 Restart=on-failure
 RestartSec=5
+WatchdogSec=40
+NotifyAccess=main
 UMask=0077
 
 [Install]

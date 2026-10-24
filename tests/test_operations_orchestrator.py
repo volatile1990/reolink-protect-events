@@ -266,6 +266,32 @@ class ControllerTests(unittest.TestCase):
         report=Update(self.backend,self.directory,resume=True).run()
         self.assertEqual(report['status'],'rolled-back',report);self.assertIsNone(self.backend.marker)
         self.assertEqual(len(self.modes('apply')),1);self.assertFalse(self.backend.applied)
+    def test_explicit_resume_replaces_retired_lease_without_reusing_operation_owner(self):
+        from reolink_protect_events.operations import maintenance_lease
+        from reolink_protect_events.operations.safety import OperationError
+        root=Path(self.temp.name)/'monitor';root.mkdir(mode=0o700);now=[1000]
+        original=self.backend.udm
+        def dispatch(request,timeout=None):
+            if request['action']!='installer'or request['request'].get('mode')!='maintenance':
+                return original(request,timeout)
+            value=request['request'];self.backend.calls.append(('udm',copy.deepcopy(request),self.backend.marker))
+            try:
+                result=maintenance_lease.change(root,value['owner'],value['enable'],monotonic_ms=now[0],boot_id='boot')
+            except OperationError as error:result={'ok':False,'errorCode':error.code}
+            self.backend.marker=maintenance_lease.status(root,monotonic_ms=now[0],boot_id='boot').get('owner')
+            return result
+        self.backend.udm=dispatch
+        self.backend.fail_decode_ip=IPS[0];self.backend.fail_rollback=True
+        first=self.execute();self.assertEqual(first['status'],'failed')
+        before=json.loads((self.directory/'update.json').read_text());old=before['owner']
+        now[0]=181001;self.backend.fail_rollback=False
+        result=Update(self.backend,self.directory,resume=True).run()
+        self.assertEqual(result['status'],'rolled-back',result);self.assertIsNone(self.backend.marker)
+        after=json.loads((self.directory/'update.json').read_text())
+        self.assertEqual(after['owner'],old);self.assertNotEqual(after['maintenanceOwner'],old)
+        self.assertEqual(after['maintenanceOwnerHistory'][0]['owner'],old)
+        self.assertTrue((root/'retired-maintenance'/(old+'.json')).exists())
+        self.assertEqual(len(self.modes('apply')),1);self.assertFalse(self.backend.applied)
     def test_failed_maintenance_cleanup_retains_marker(self):
         self.backend.fail_clear=True;report=self.execute()
         self.assertFalse(report['ok']);self.assertEqual(report['status'],'failed');self.assertIsNotNone(self.backend.marker)

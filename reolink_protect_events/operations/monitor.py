@@ -8,10 +8,11 @@ import time
 from . import recovery
 from .http import protect_json
 from .media_health import inspect
-from .protect import selected_cameras
+from .protect import selected_cameras,read_only_cameras
 from .safety import OperationError, ensure_root, error_code, maintenance, need, read_json, validate_config, write_json
 from .ubv import probe_ubv
 from .fmp4 import configuration as fmp4_configuration, verify_configuration as verify_fmp4_configuration, probe_fmp4
+from .maintenance_lease import reconcile as reconcile_maintenance,identity as boot_identity
 
 INTERVAL_MS=30000
 STARTUP_GRACE_MS=120000
@@ -22,6 +23,30 @@ URGENT_PROBE_INTERVAL_MS=30000
 REPAIR_COOLDOWN_MS=900000
 REPAIR_WINDOW_MS=86400000
 REPAIR_LIMIT=2
+ABSOLUTE_REPAIR_LIMIT=12
+HEALTHY_REARM_MS=1800000
+RESUME_RETRY_MS=30000
+
+
+def _resume_pending(config,root,state,now_ms,*,allow_repair,marker,api,fetch,probe,resume):
+    path=Path(root)/'recovery.json'
+    if not path.exists():return None
+    receipt=read_json(path)
+    if receipt.get('phase')in('complete','blocked')or marker or not allow_repair:return None
+    boot=boot_identity();due=state.get('resumeNextAtMs',0)
+    if state.get('resumeBootId')!=boot:due=0
+    if type(due)is not int or due>now_ms+300000:due=now_ms
+    if now_ms<due:return None
+    attempts=state.get('resumeRetryCount',0)
+    need(type(attempts)is int and attempts>=0,'monitor_resume_state_invalid')
+    state['resumeRetryCount']=min(attempts+1,10);state['resumeBootId']=boot
+    state['resumeNextAtMs']=now_ms+min(300000,RESUME_RETRY_MS*2**min(attempts,4))
+    write_json(Path(root)/'state.json',state)
+    result=(resume or recovery.resume_pending)(config,root,api=api,fetch=fetch,probe=probe)
+    if not path.exists()or read_json(path).get('phase')=='complete':
+        state['resumeRetryCount']=0;state['resumeNextAtMs']=0
+    state['lastResumeResult']=result
+    return result
 
 
 def _state(root,now_ms,startup_at_ms):
@@ -43,7 +68,7 @@ def _state(root,now_ms,startup_at_ms):
 
 
 def run_once(config,root,*,allow_repair=False,now_ms=None,startup_at_ms=None,api=None,fetch=None,
-             probe=None,recover=None,startup_probe=None):
+             probe=None,recover=None,startup_probe=None,resume=None,monotonic_ms=None,public_status=None):
     """Persist one sample/decision. Dependency hooks keep tests hardware-free."""
     now_ms=int(time.time()*1000)if now_ms is None else now_ms
     root=ensure_root(root);state=None
@@ -54,9 +79,15 @@ def run_once(config,root,*,allow_repair=False,now_ms=None,startup_at_ms=None,api
         if startup_options['enabled']:
             try:verify_fmp4_configuration(startup_options, config)
             except OperationError:startup_configuration_ok=False
-        need(set(state['cameras'])<={b['cameraId']for b in config['bridges']},'monitor_state_scope_changed')
+        known_ids={b['cameraId']for b in config['bridges']}|{b['cameraId']for b in config.get('readOnlyCameras',[])}
+        need(set(state['cameras'])<=known_ids,'monitor_state_scope_changed')
+        lease_state=reconcile_maintenance(root)
         marker=maintenance(root);api=api or protect_json;probe=probe or probe_ubv
+        resumed=_resume_pending(config,root,state,now_ms,allow_repair=allow_repair,marker=marker,
+            api=api,fetch=fetch,probe=probe,resume=resume)
         report,bootstrap=inspect(config,prior=state['cameras'],now_ms=now_ms,api=api,fetch=fetch)
+        report['maintenanceLease']=lease_state;report['resumeRecovery']=resumed
+        if resumed is not None:report['readOnly']=False
         report['maintenanceActive']=marker
         grace_origin=startup_at_ms if startup_at_ms is not None else state['startedAtMs']
         report['startupGraceActive']=now_ms-grace_origin<STARTUP_GRACE_MS
@@ -71,20 +102,25 @@ def run_once(config,root,*,allow_repair=False,now_ms=None,startup_at_ms=None,api
                     'requiresReview':receipt.get('phase')=='blocked'}
         report['pendingRecovery']=pending_recovery
         report['monitorIntervalMs']=INTERVAL_MS
-        report['activeProbePolicy']={'seconds':8,'globalRotationIntervalMs':PROBE_INTERVAL_MS,
+        all_qualities=config.get('allQualityMediaChecks',False)
+        rotation_interval=25000 if all_qualities or config.get('readOnlyCameras')else PROBE_INTERVAL_MS
+        report['activeProbePolicy']={'seconds':8,'globalRotationIntervalMs':rotation_interval,
                                     'maximumConcurrent':1,'onSuspect':True,'resultTtlMs':ACTIVE_PROBE_TTL_MS,
                                     'urgentMinimumIntervalMs':URGENT_PROBE_INTERVAL_MS,
                                     'fmp4StartupEnabled':startup_options['enabled'],
-                                    'fmp4StartupSeconds':12 if startup_options['enabled']else None}
+                                    'fmp4StartupSeconds':12 if startup_options['enabled']else None,
+                                    'allExplicitQualities':all_qualities,'nativeObservationIsReadOnly':True}
         report['fmp4ConfigurationVerified']=startup_configuration_ok
         report['repairPolicy']={'consecutiveFailures':FAILURE_THRESHOLD,'startupGraceMs':STARTUP_GRACE_MS,
-                                'cooldownMs':REPAIR_COOLDOWN_MS,'maximumPerCamera24h':REPAIR_LIMIT}
-        cameras={c['id']:c for c in selected_cameras(config,bootstrap)}
-        rows={r['cameraId']:r for r in report['cameras']}
+                                'cooldownMs':REPAIR_COOLDOWN_MS,'maximumPerCamera24h':ABSOLUTE_REPAIR_LIMIT,
+                                'maximumPerUnhealthyEpisode':REPAIR_LIMIT,'healthyRearmMs':HEALTHY_REARM_MS}
+        cameras={c['id']:c for c in selected_cameras(config,bootstrap)+read_only_cameras(config,bootstrap)}
+        monitored_rows=report['cameras']+report.get('nativeCameras',[])
+        rows={r['cameraId']:r for r in monitored_rows}
         # Rollouts suppress active sessions too, avoiding false camera errors
         # and competition with deliberate deployment media gates.
         epoch_candidates=[]
-        for row in report['cameras']:
+        for row in monitored_rows:
             previous=state['cameras'].setdefault(row['cameraId'],{})
             epoch=row['source'].get('connectionEpoch');old=previous.get('connectionEpoch')
             if epoch is not None and old is not None and epoch!=old:previous['epochProbePending']=True
@@ -94,7 +130,7 @@ def run_once(config,root,*,allow_repair=False,now_ms=None,startup_at_ms=None,api
             previous['connectionEpoch']=epoch
             row['sourceEpochChanged']=previous.get('epochProbePending')is True
             if row['sourceHealthy']and row['sourceEpochChanged']:epoch_candidates.append(row['cameraId'])
-        candidates=[r['cameraId']for r in report['cameras']if r['sourceHealthy']and(
+        candidates=[r['cameraId']for r in monitored_rows if r['sourceHealthy']and(
             not r['protectHealthy']or state['cameras'].get(r['cameraId'],{}).get('lastActiveProbe',{}).get('ok')is False
             or startup_options['enabled']and state['cameras'].get(r['cameraId'],{}).get('lastFmp4StartupProbe',{}).get('ok')is False)]
         selected=None
@@ -103,7 +139,7 @@ def run_once(config,root,*,allow_repair=False,now_ms=None,startup_at_ms=None,api
             # Urgent failures never consume the independent global rotation.
             # A permanently broken camera or exhausted repair budget must not
             # prevent every other camera from receiving fresh media evidence.
-            if now_ms-state.get('lastRotationAtMs',state['lastProbeAtMs'])>=PROBE_INTERVAL_MS:
+            if now_ms-state.get('lastRotationAtMs',state['lastProbeAtMs'])>=rotation_interval:
                 ids=sorted(rows)
                 for offset in range(len(ids)):
                     index=(state['rotation']+offset)%len(ids)
@@ -121,23 +157,38 @@ def run_once(config,root,*,allow_repair=False,now_ms=None,startup_at_ms=None,api
             if selected is not None:
                 state['lastProbeAtMs']=now_ms
                 previous=state['cameras'].setdefault(selected,{})
-                kind=previous.get('nextProbeType','ubv')if startup_options['enabled']else'ubv'
+                native=rows[selected].get('readOnly')is True
+                quality_checks=all_qualities or native
+                channel=rows[selected]['automaticChannel']
+                if quality_checks:
+                    channels=list(dict.fromkeys([channel]+rows[selected]['enabledChannels']))
+                    plan=[('ubv',ch)for ch in channels]
+                    if startup_options['enabled']and not native:plan.append(('fmp4',channel))
+                    index=previous.get('qualityRotation',0)
+                    need(type(index)is int and index>=0,'monitor_quality_state_invalid')
+                    kind,channel=plan[index%len(plan)];previous['qualityRotation']=(index+1)%len(plan)
+                else:kind=previous.get('nextProbeType','ubv')if startup_options['enabled']else'ubv'
                 if kind=='fmp4':
-                    result=(startup_probe or probe_fmp4)(config,cameras[selected],rows[selected]['automaticChannel'],seconds=12) \
+                    result=(startup_probe or probe_fmp4)(config,cameras[selected],channel,seconds=12) \
                         if startup_configuration_ok else {'ok':False,'errorCode':'fmp4_configuration_drift'}
                     previous['lastFmp4StartupProbe']=result;previous['lastFmp4StartupProbeAtMs']=now_ms
                     previous['fmp4ProbeSourceEpoch']=rows[selected]['source'].get('connectionEpoch')
                     previous['nextProbeType']='ubv'
                 else:
-                    result=probe(config,cameras[selected],rows[selected]['automaticChannel'],seconds=8)
-                    previous['lastActiveProbe']=result;previous['lastActiveProbeAtMs']=now_ms
-                    previous['activeProbeSourceEpoch']=rows[selected]['source'].get('connectionEpoch')
+                    result=probe(config,cameras[selected],channel,seconds=8)
+                    if channel==rows[selected]['automaticChannel']:
+                        previous['lastActiveProbe']=result;previous['lastActiveProbeAtMs']=now_ms
+                        previous['activeProbeSourceEpoch']=rows[selected]['source'].get('connectionEpoch')
+                    previous.setdefault('qualityProbes',{})[str(channel)]={'result':result,'atMs':now_ms,
+                        'sourceEpoch':rows[selected]['source'].get('connectionEpoch')}
                     previous['nextProbeType']='fmp4'if startup_options['enabled']else'ubv'
                 previous['lastAnyProbeAtMs']=now_ms
-                if not startup_options['enabled']or kind=='fmp4':previous['epochProbePending']=False
+                if not startup_options['enabled']or kind=='fmp4'or native and previous.get('qualityRotation')==0:
+                    previous['epochProbePending']=False
                 rows[selected]['activeProbePerformed']=True
                 rows[selected]['activeProbeReason']=reason
                 rows[selected]['activeProbeType']=kind
+                rows[selected]['activeProbeChannel']=channel
         repair_candidates=[]
         for cid,row in rows.items():
             previous=state['cameras'].setdefault(cid,{})
@@ -154,16 +205,30 @@ def run_once(config,root,*,allow_repair=False,now_ms=None,startup_at_ms=None,api
             active_bad=row['activeProbeFresh']and isinstance(active,dict)and active.get('ok')is False
             row['activeMediaVerified']=bool(row['sourceHealthy']and row['protectHealthy']and row['activeProbeFresh']
                 and isinstance(active,dict)and active.get('ok')is True)
+            native=row.get('readOnly')is True
+            if all_qualities or native:
+                checks=[]
+                for channel in row['enabledChannels']:
+                    q=previous.get('qualityProbes',{}).get(str(channel),{})
+                    at=q.get('atMs');epoch=row['source'].get('connectionEpoch')
+                    current=type(at)is int and 0<=now_ms-at<=ACTIVE_PROBE_TTL_MS and type(epoch)is int and q.get('sourceEpoch')==epoch
+                    result=q.get('result')or{}
+                    checks.append({'channel':channel,'atMs':at,'fresh':current,'ok':current and result.get('ok')is True,
+                                   'probe':result})
+                    active_bad=active_bad or current and result.get('ok')is False
+                row['qualityMediaChecks']=checks
+                row['activeMediaVerified']=bool(row['sourceHealthy']and row['protectHealthy']and checks and all(q['ok']for q in checks))
             row['lastFmp4StartupProbe']=startup
             row['lastFmp4StartupProbeAtMs']=previous.get('lastFmp4StartupProbeAtMs')
-            row['fmp4StartupProbeFresh']=bool(startup_options['enabled']and startup_configuration_ok
+            fmp4_required=startup_options['enabled']and not native
+            row['fmp4StartupProbeFresh']=bool(fmp4_required and startup_configuration_ok
                 and fresh('lastFmp4StartupProbeAtMs','fmp4ProbeSourceEpoch'))
             startup_bad=row['fmp4StartupProbeFresh']and isinstance(startup,dict)and startup.get('ok')is False
-            row['fmp4StartupVerified']=bool(startup_options['enabled']and startup_configuration_ok
+            row['fmp4StartupVerified']=bool(fmp4_required and startup_configuration_ok
                 and row['sourceHealthy']and row['protectHealthy']and isinstance(startup,dict)and startup.get('ok')is True
                 and row['fmp4StartupProbeFresh'])
             row['allActivePathsVerified']=row['activeMediaVerified']and(
-                not startup_options['enabled']or row['fmp4StartupVerified'])
+                not fmp4_required or row['fmp4StartupVerified'])
             row['recorderAndUbvHealthy']=row['ok']and not active_bad
             row['fmp4StartupNeedsReview']=bool(startup_bad)
             row['ok']=row['recorderAndUbvHealthy']and not startup_bad
@@ -176,14 +241,34 @@ def run_once(config,root,*,allow_repair=False,now_ms=None,startup_at_ms=None,api
             previous['recordingEnds']=row['recordingEnds']
             attempts=[t for t in previous.get('repairAttempts',[])if t>=now_ms-REPAIR_WINDOW_MS]
             previous['repairAttempts']=attempts
+            mono=int(time.monotonic()*1000)if monotonic_ms is None else monotonic_ms
+            boot=boot_identity();last_mono=previous.get('healthyLastMonotonicMs')
+            independent_health=bool(row['sourceHealthy']and row['protectHealthy']and row['activeMediaVerified'])
+            continuity=previous.get('healthyBootId')==boot and type(last_mono)is int and 0<=mono-last_mono<=90000
+            if not independent_health:
+                previous.pop('healthySinceMonotonicMs',None)
+            else:
+                if not continuity or type(previous.get('healthySinceMonotonicMs'))is not int:
+                    previous['healthySinceMonotonicMs']=mono
+                previous['healthyBootId']=boot;previous['healthyLastMonotonicMs']=mono
+                if attempts and mono-previous['healthySinceMonotonicMs']>=HEALTHY_REARM_MS \
+                        and previous.get('budgetEpochAtMs',0)<=attempts[-1]:
+                    previous['budgetEpochAtMs']=now_ms
+                    previous['lastBudgetRearmAtMs']=now_ms
+            epoch=previous.get('budgetEpochAtMs',0)
+            need(type(epoch)is int and epoch>=0,'monitor_budget_state_invalid')
+            episode_attempts=[t for t in attempts if t>=epoch]
             cooldown=bool(attempts)and now_ms-attempts[-1]<REPAIR_COOLDOWN_MS
             row['repairAttempts24h']=len(attempts);row['repairCooldownActive']=cooldown
+            row['repairAttemptsCurrentEpisode']=len(episode_attempts)
+            row['budgetRearmedAtMs']=previous.get('lastBudgetRearmAtMs')
+            row['budgetExhausted']=len(episode_attempts)>=REPAIR_LIMIT or len(attempts)>=ABSOLUTE_REPAIR_LIMIT
             row['confirmedFailure']=count>=FAILURE_THRESHOLD and not report['startupGraceActive']and not marker
-            row['recommendedAction']='nas_watchdog'if row['confirmedFailure']and not row['sourceHealthy']else'rebuild_native_stream'if row['confirmedFailure']else'review_fmp4_startup'if startup_bad else None
+            row['recommendedAction']='review_native_camera'if native and row['confirmedFailure']else'wait_for_bridge_reconnect'if row['confirmedFailure']and not row['sourceHealthy']else'rebuild_native_stream'if row['confirmedFailure']else'review_fmp4_startup'if startup_bad else None
             # A drifted frontend exception is not permission to rebuild a native
             # stream. Configuration review must precede any repair dispatch.
-            row['repairEligible']=bool(allow_repair and startup_configuration_ok and pending_recovery is None and row['confirmedFailure']and row['sourceHealthy']
-                and type(row['source'].get('connectionEpoch'))is int and not cooldown and len(attempts)<REPAIR_LIMIT)
+            row['repairEligible']=bool(not native and allow_repair and startup_configuration_ok and pending_recovery is None and row['confirmedFailure']and row['sourceHealthy']
+                and type(row['source'].get('connectionEpoch'))is int and not cooldown and not row['budgetExhausted'])
             if row['repairEligible']:repair_candidates.append(cid)
         # Persist the cooldown/attempt BEFORE any dispatch. Restarting the
         # service cannot reset rate limits or authorize another uncertain send.
@@ -192,6 +277,9 @@ def run_once(config,root,*,allow_repair=False,now_ms=None,startup_at_ms=None,api
             cid=sorted(repair_candidates)[0]
             state['cameras'][cid]['repairAttempts'].append(now_ms)
             write_json(root/'state.json',state)
+            history=ensure_root(root/'repair-history')
+            write_json(history/(cid+'-'+str(now_ms)+'.json'),{'cameraId':cid,'atMs':now_ms,
+                'sourceEpoch':rows[cid]['source'].get('connectionEpoch'),'reservedBeforeDispatch':True})
             outcome=(recover or recovery.rebuild)(config,root,cid,api=api,fetch=fetch,probe=probe)
             report['recovery']=outcome
             state['cameras'][cid]['lastRecovery']=outcome
@@ -207,20 +295,45 @@ def run_once(config,root,*,allow_repair=False,now_ms=None,startup_at_ms=None,api
                     state['cameras'][cid]['nextProbeType']='fmp4'
                 # The current report retains the triggering failure. The next
                 # sample independently verifies recovery and all recorders.
-        report['quickHealthy']=report['scopeValid']and all(r['recorderAndUbvHealthy']for r in report['cameras'])
+        report['quickHealthy']=report['scopeValid']and all(r['recorderAndUbvHealthy']for r in monitored_rows)
+        report['nativeHealthy']=all(r['recorderAndUbvHealthy']for r in report.get('nativeCameras',[]))
         report['fmp4StartupFailureCameraIds']=[r['cameraId']for r in report['cameras']if r['fmp4StartupNeedsReview']]
-        report['activeCoverageVerified']=all(r['allActivePathsVerified']for r in report['cameras'])
+        report['activeCoverageVerified']=all(r['allActivePathsVerified']for r in monitored_rows)
+        report['alerts']=[]
+        if lease_state.get('requiresReview'):
+            report['alerts'].append({'code':'maintenance_requires_review','actionRequired':True})
+        if lease_state.get('expired')and lease_state.get('waitingForMutation'):
+            report['alerts'].append({'code':'maintenance_expired_mutation_active','actionRequired':True})
+        if pending_recovery is not None:
+            report['alerts'].append({'code':'recovery_requires_review'if pending_recovery['requiresReview']else'recovery_restoration_pending',
+                'cameraId':pending_recovery['cameraId'],'actionRequired':pending_recovery['requiresReview']})
+        for row in monitored_rows:
+            if row['confirmedFailure']and (row.get('readOnly')or not row['sourceHealthy']):
+                report['alerts'].append({'code':'native_media_requires_attention'if row.get('readOnly')else'source_unhealthy',
+                    'cameraId':row['cameraId'],'actionRequired':True})
+            if row['confirmedFailure']and row['budgetExhausted']:
+                report['alerts'].append({'code':'recorder_repair_budget_exhausted','cameraId':row['cameraId'],'actionRequired':True})
+        report['actionRequired']=any(a['actionRequired']for a in report['alerts'])
         report['ok']=report['quickHealthy']and pending_recovery is None and startup_configuration_ok and report['activeCoverageVerified']
-        report['state']='maintenance'if marker else'starting'if report['startupGraceActive']else'attention'if pending_recovery is not None or not startup_configuration_ok else'healthy'if report['ok']else'verifying'if report['quickHealthy']and not report['fmp4StartupFailureCameraIds']else'degraded'
-        report['nextProbeDueAtMs']=state.get('lastRotationAtMs',state['lastProbeAtMs'])+PROBE_INTERVAL_MS if not marker and not report['startupGraceActive']and any(r['sourceHealthy']for r in rows.values())else None
+        report['state']='maintenance'if marker else'starting'if report['startupGraceActive']else'attention'if pending_recovery is not None or not startup_configuration_ok or report['actionRequired']else'healthy'if report['ok']else'verifying'if report['quickHealthy']and not report['fmp4StartupFailureCameraIds']else'degraded'
+        report['nextProbeDueAtMs']=state.get('lastRotationAtMs',state['lastProbeAtMs'])+rotation_interval if not marker and not report['startupGraceActive']and any(r['sourceHealthy']for r in rows.values())else None
         report['atMs']=now_ms;state['lastSampleAtMs']=now_ms
+        report['completedAtMs']=int(time.time()*1000)
         write_json(root/'state.json',state);write_json(root/'health.json',report)
+        if public_status is not None:
+            from .public_status import write
+            write(public_status,report)
         return report
     except Exception as error:
         report={'schemaVersion':1,'atMs':now_ms,'ok':False,'state':'degraded',
                 'errorCode':error_code(error,'monitor_sample_failed'),'repairPerformed':False,
-                'mediaPersisted':False,'readOnly':not allow_repair,'handsetPlaybackVerified':False}
+                'mediaPersisted':False,'readOnly':not allow_repair,'handsetPlaybackVerified':False,
+                'completedAtMs':int(time.time()*1000),'actionRequired':True,
+                'alerts':[{'code':'monitor_sample_failed','actionRequired':True}]}
         write_json(root/'health.json',report)
+        if public_status is not None:
+            from .public_status import write
+            write(public_status,report)
         return report
 
 
@@ -228,7 +341,10 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config',type=Path,required=True);parser.add_argument('--root',type=Path,required=True)
     parser.add_argument('--allow-repair',action='store_true');parser.add_argument('--once',action='store_true')
+    parser.add_argument('--public-status',type=Path)
     args=parser.parse_args()
+    need(args.public_status is None or args.public_status==Path('/srv/cameras/protect/status/monitor.json'),
+         'public_monitor_path_invalid')
     need(not hasattr(os,'geteuid')or os.geteuid()==0,'monitor_root_required')
     os.umask(0o077);root=ensure_root(args.root);config=validate_config(read_json(args.config))
     from .safety import private_path
@@ -240,13 +356,14 @@ def main():
     def stopping(*_):stop[0]=True
     signal.signal(signal.SIGTERM,stopping);signal.signal(signal.SIGINT,stopping)
     startup=int(time.time()*1000)
+    from ..service_liveness import notify
     try:
-        resumed=None
-        if args.allow_repair and not maintenance(root):
-            resumed=recovery.resume_pending(config,root)
+        notify('READY=1\nWATCHDOG=1')
         while not stop[0]:
+            notify('WATCHDOG=1')
             began=time.monotonic()
-            report=run_once(config,root,allow_repair=args.allow_repair,startup_at_ms=startup)
+            report=run_once(config,root,allow_repair=args.allow_repair,startup_at_ms=startup,public_status=args.public_status)
+            notify('WATCHDOG=1')
             print(json.dumps({'atMs':report['atMs'],'state':report['state'],'ok':report['ok'],
                               'errorCode':report.get('errorCode'),'recovery':report.get('recovery')}),flush=True)
             if args.once:return 0 if report['ok']else 1
@@ -257,6 +374,7 @@ def main():
             while not stop[0]:
                 remaining=wait_seconds-(time.monotonic()-began)
                 if remaining<=0:break
+                notify('WATCHDOG=1')
                 time.sleep(min(1,remaining))
     finally:
         os.close(descriptor)

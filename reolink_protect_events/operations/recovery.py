@@ -4,6 +4,7 @@ No global Protect restart, camera adoption, stream profile change or NAS mutatio
 Only forceTcp is patched; an exact settings digest gates every dispatch.
 """
 import time
+from functools import wraps
 from pathlib import Path
 from .http import bridge_metrics, protect_json
 from .media_health import source_health
@@ -18,6 +19,19 @@ MEDIA_PROBE_SECONDS = 8
 # to the source helper's existing four-second total request deadline.
 MEDIA_PROBE_RESERVE_SECONDS = 5 + 8 + MEDIA_PROBE_SECONDS + .1
 SOURCE_READ_RESERVE_SECONDS = 4
+
+
+def _serialized(function):
+    @wraps(function)
+    def call(config,root,*args,**options):
+        from .locking import process_lock
+        try:
+            with process_lock(Path(root)/'mutation.lock'):
+                return function(config,root,*args,**options)
+        except (OSError,RuntimeError):
+            return {'ok':False,'attempted':False,'restoredOriginalTcp':False,
+                    'errorCode':'recovery_mutation_in_progress'}
+    return call
 
 
 def _camera(config, bootstrap, camera_id):
@@ -154,6 +168,7 @@ def _restore(config,root,api,receipt,*,clock,sleep,wait_seconds,maintenance_owne
     raise OperationError('recovery_restore_failed')from last
 
 
+@_serialized
 def resume_pending(config,root,*,api=None,fetch=None,probe=None,clock=None,sleep=None,wait_seconds=30,
                    maintenance_owner=None):
     path=Path(root)/'recovery.json'
@@ -197,6 +212,7 @@ def resume_pending(config,root,*,api=None,fetch=None,probe=None,clock=None,sleep
     return result
 
 
+@_serialized
 def rebuild(config,root,camera_id,*,api=None,fetch=None,probe=None,clock=None,sleep=None,wait_seconds=30,
             maintenance_owner=None):
     """Try one bounded known-version repair; public result contains no settings."""
@@ -209,7 +225,7 @@ def rebuild(config,root,camera_id,*,api=None,fetch=None,probe=None,clock=None,sl
         need(not maintenance_blocks(root,maintenance_owner),'recovery_maintenance_active')
         if path.exists():
             prior=read_json(path)
-            need(prior.get('phase')in('complete','blocked'),'recovery_already_pending')
+            need(prior.get('phase')=='complete','recovery_already_pending')
         before=api(config,'/api/bootstrap');camera=_camera(config,before,camera_id)
         need(before['nvr'].get('isRecordingDisabled')is False,'recovery_global_recording_disabled')
         need(camera.get('state')=='CONNECTED'and camera.get('isProvisioned')is True

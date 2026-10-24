@@ -627,7 +627,7 @@ def _coverage(profiles,rows):
 
 def run_full_decodes(ssh_alias='unifi-dream-machine', *, config_path=DEFAULT_CONFIG, remote_release=None,
                      ips=None, ffmpeg=None, ffprobe=None, duration=5, recording_lag_seconds=30, not_before_ms=None,
-                     architecture='udm'):
+                     architecture='udm',progress=None):
     """Return a projected read-only real-decode gate; missing tools never pass.
 
     A subset can pass its explicitly requested scope, but UPDATE must also
@@ -664,9 +664,12 @@ def run_full_decodes(ssh_alias='unifi-dream-machine', *, config_path=DEFAULT_CON
             code,raw,_=await _run_bytes(ssh,input_data=_remote_source(payload),timeout=150,stdout_limit=MAX_PRIVATE_JSON)
             need(code==0,_remote_error(raw,'decode_discovery_failed'))
             profiles=_private_profiles(json.loads(raw),selected)
+            if progress is not None:progress()
             for profile in profiles:
                 report['rtsp'].append(await _rtsp_decode(profile,exe,duration))
+                if progress is not None:progress()
                 report['recordings'].append(await _recorded_decode(profile,exe,probe,duration,ssh,payload))
+                if progress is not None:progress()
         asyncio.run(execute())
         report['rtspProfileCoverage']=_coverage(profiles,report['rtsp'])
         report['recordedProfileCoverage']=_coverage(profiles,report['recordings'])

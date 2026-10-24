@@ -206,10 +206,11 @@ def validate_packaged_config(release, cfg):
 
 
 def require_owned_maintenance(owner):
+    from .maintenance_lease import blocks
     marker = monitor_root / 'maintenance.json'
     secure(marker)
     if not isinstance(owner, str) or len(owner) != 32 or any(c not in '0123456789abcdef' for c in owner) \
-            or not marker.exists() or json.loads(marker.read_text()).get('owner') != owner:
+            or not marker.exists() or json.loads(marker.read_text()).get('owner') != owner or blocks(monitor_root,owner):
         raise RuntimeError('installer_requires_owned_maintenance')
 
 
@@ -383,21 +384,8 @@ def verified_members(data, digest):
 
 
 def maintenance(owner, enable):
-    if not isinstance(owner, str) or len(owner) != 32 or any(c not in '0123456789abcdef' for c in owner):
-        raise RuntimeError('maintenance_owner_invalid')
-    secure(monitor_root)
-    monitor_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    marker = monitor_root / 'maintenance.json'
-    if marker.exists():
-        secure(marker)
-        current = json.loads(marker.read_text())
-        if current.get('owner') != owner:
-            raise RuntimeError('maintenance_owned_by_other_rollout')
-        if not enable:
-            marker.unlink()
-    elif enable:
-        write(marker, json.dumps({'schemaVersion': 1, 'owner': owner, 'atMs': int(time.time() * 1000)}).encode())
-    return {'ok': True, 'maintenance': enable, 'owner': owner}
+    from .maintenance_lease import change
+    return change(monitor_root,owner,enable)
 
 
 def unit_text(release, monitoring=False, capture=False):
@@ -405,8 +393,8 @@ def unit_text(release, monitoring=False, capture=False):
     target = monitor_root if monitoring else root
     suffix = ' --allow-repair' if monitoring else (' --capture-only' if capture else '')
     return ('[Unit]\nDescription=Reolink Protect ' + ('media monitor' if monitoring else 'native events') + '\n'
-            'After=network-online.target unifi-protect.service\nWants=network-online.target\nStartLimitIntervalSec=300\nStartLimitBurst=5\n'
-            '[Service]\nType=simple\nUser=root\nGroup=root\nWorkingDirectory=' + str(release) + '\n'
+            'After=network-online.target unifi-protect.service\nWants=network-online.target\n'+('StartLimitIntervalSec=0\n'if monitoring else'StartLimitIntervalSec=300\nStartLimitBurst=5\n')+
+            '[Service]\n'+('Type=notify\nNotifyAccess=main\nWatchdogSec=300\n'if monitoring else'Type=simple\n')+'User=root\nGroup=root\nWorkingDirectory=' + str(release) + '\n'
             'ExecStart=/usr/bin/python3 -m ' + module + ' --config ' + str(root / 'config.json') + ' --root ' + str(target) + suffix + '\n'
             'Restart=on-failure\nRestartSec=10\nUMask=0077\nProtectSystem=full\nProtectHome=true\nPrivateTmp=true\nTimeoutStopSec=45\n'
             '[Install]\nWantedBy=multi-user.target\n')

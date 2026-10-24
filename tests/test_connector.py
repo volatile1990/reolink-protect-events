@@ -3,6 +3,8 @@ import subprocess
 import socket
 import threading
 import time
+import stat
+import types
 import unittest
 from unittest.mock import patch
 
@@ -41,6 +43,35 @@ class ConnectorContract(unittest.TestCase):
                         {'method':'GET','path':'/api/ws/livestream?camera='+'b'*24}]:
             with self.subTest(request=request),self.assertRaises(connector.ConnectorError):
                 connector.api_request(self.config,request)
+
+    def test_readonly_native_scope_can_read_media_and_camera_but_never_patch(self):
+        native='6ad623df037f3f03e402c6b4'
+        self.config['readOnlyCameraIds']=[native]
+        for path in ('/api/cameras/'+native,'/api/ws/livestream?camera='+native+'&channel=3',
+                     '/api/tcp/livestream?camera='+native+'&channel=0'):
+            with self.subTest(path=path),patch.object(connector,'DeadlineHTTPSConnection')as connection:
+                response=connection.return_value.getresponse.return_value.__enter__.return_value
+                response.status=200;response.read.return_value=b'{}'
+                self.assertEqual(connector.api_request(self.config,{'path':path}),{})
+        with patch.object(connector,'DeadlineHTTPSConnection')as connection, \
+                patch.object(connector,'installed_version')as version:
+            with self.assertRaisesRegex(connector.ConnectorError,'connector_api_write_scope'):
+                connector.api_request(self.config,{'method':'PATCH','path':'/api/cameras/'+native,
+                  'body':{'thirdPartyCameraInfo':{'forceTcp':True}}})
+            connection.assert_not_called();version.assert_not_called()
+
+    def test_readonly_config_is_optional_separate_and_bounded_to_one_camera(self):
+        value={'cameraIds':['%024x'%n for n in range(210,216)],'protectUserId':'a'*36}
+        class ConfigPath:
+            def lstat(self):return types.SimpleNamespace(st_mode=stat.S_IFREG|0o600,st_uid=0)
+            def read_text(self):return json.dumps(value)
+        self.assertEqual(connector.load_config(ConfigPath()),value)
+        value['readOnlyCameraIds']=['f'*24]
+        self.assertEqual(connector.load_config(ConfigPath())['readOnlyCameraIds'],['f'*24])
+        for invalid in ([value['cameraIds'][0]],['f'*24,'e'*24],['f'*24]*2,['invalid'],[None],'f'*24,None):
+            value['readOnlyCameraIds']=invalid
+            with self.subTest(invalid=invalid),self.assertRaisesRegex(connector.ConnectorError,'connector_readonly_camera_scope'):
+                connector.load_config(ConfigPath())
 
     def test_hashes_cannot_read_arbitrary_path(self):
         with self.assertRaises(connector.ConnectorError):

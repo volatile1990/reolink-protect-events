@@ -2,7 +2,7 @@
 import concurrent.futures
 import time
 from .http import bridge_metrics, protect_json
-from .protect import automatic_channel, qualities, recording_ends, selected_cameras
+from .protect import automatic_channel, qualities, recording_ends, selected_cameras,read_only_cameras
 from .safety import VERSION, OperationError, error_code, need, validate_config
 from .ubv import probe_ubv
 
@@ -70,21 +70,42 @@ def inspect(config, *, prior=None, now_ms=None, api=None, fetch=None, deadline=N
             'cause':None if source['ok'] and connected and recording_ok else 'source_unhealthy'if not source['ok']else'protect_media_unhealthy',
             'ok':source['ok'] and connected and recording_ok})
     scope_ok=expected_count==12 and all(row['enabledChannels']==[0,1,2] for row in rows)
+    native_rows=[]
+    for camera in read_only_cameras(config,bootstrap):
+        connected=camera.get('state')=='CONNECTED'and camera.get('isConnected')is not False
+        ends=recording_ends(camera);previous=(prior or{}).get(camera['id'],{}).get('recordingEnds',{})
+        recordings=[]
+        for quality,end in ends.items():
+            age=now_ms-end if _number(end)else None;old=previous.get(quality)
+            recordings.append({'quality':quality,'endMs':end if _number(end)else None,'ageMs':age,
+                'fresh':age is not None and -5000<=age<=120000,
+                'advanced':end>old if _number(end)and _number(old)else None})
+        healthy=connected and bool(recordings)and all(r['fresh']and r['advanced']is not False for r in recordings)
+        epoch=camera.get('connectedSince')
+        source={'ok':connected,'connectionEpoch':epoch if type(epoch)is int and epoch>=0 else None,'streams':[]}
+        native_rows.append({'cameraId':camera['id'],'host':camera['host'],'readOnly':True,'source':source,
+            'protectConnected':connected,'recordings':recordings,'recordingEnds':ends,
+            'automaticChannel':automatic_channel(camera),'enabledChannels':sorted(c['id']for c in camera.get('channels',[])if c.get('enabled')is True),
+            'sourceHealthy':connected,'protectHealthy':healthy,'cause':None if healthy else'native_media_unhealthy','ok':healthy})
     return {'schemaVersion':1,'atMs':now_ms,'protectVersion':bootstrap['nvr']['version'],
-            'ok':scope_ok and all(r['ok']for r in rows),'expectedRecordingProfiles':expected_count,
-            'scopeValid':scope_ok,'cameras':rows,'readOnly':True,'mediaPersisted':False,
+            'ok':scope_ok and all(r['ok']for r in rows+native_rows),'expectedRecordingProfiles':expected_count,
+            'nativeHealthy':all(r['ok']for r in native_rows),
+            'scopeValid':scope_ok,'cameras':rows,'nativeCameras':native_rows,'readOnly':True,'mediaPersisted':False,
             'handsetPlaybackVerified':False},bootstrap
+
+
+def _rows(report):return report['cameras']+report.get('nativeCameras',[])
 
 
 def _available(report):
     """Only fresh, connected input may wait for cached recorder statistics."""
     return report['scopeValid'] and all(row['sourceHealthy'] and row['protectConnected']
         and bool(row['recordings']) and all(r['fresh'] for r in row['recordings'])
-        for row in report['cameras'])
+        for row in _rows(report))
 
 
 def _progress(report, wanted=None):
-    rows=[row for row in report['cameras'] if wanted is None or row['cameraId'] in wanted]
+    rows=[row for row in _rows(report) if wanted is None or row['cameraId'] in wanted]
     return report['scopeValid'] and bool(rows) and all(bool(row['recordings'])
         and all(r['advanced'] is True for r in row['recordings']) for row in rows)
 
@@ -108,10 +129,10 @@ def run_once(config, root=None, *, mode='quick', prior=None, now_ms=None, api=No
         # Never replace this checkpoint while waiting: different cached profiles
         # may advance in different responses, and all twelve must advance.
         previous=prior if prior is not None else {
-            row['cameraId']:{'recordingEnds':dict(row['recordingEnds'])}for row in report['cameras']}
-        known={row['cameraId']for row in report['cameras']}
+            row['cameraId']:{'recordingEnds':dict(row['recordingEnds'])}for row in _rows(report)}
+        known={row['cameraId']for row in _rows(report)}
         if camera_ids is not None:
-            need(isinstance(camera_ids,(list,tuple))and 1<=len(camera_ids)<=6
+            need(isinstance(camera_ids,(list,tuple))and 1<=len(camera_ids)<=len(known)
                  and all(isinstance(cid,str)for cid in camera_ids)
                  and len(set(camera_ids))==len(camera_ids)and set(camera_ids)<=known,'health_camera_scope_invalid')
         wanted=known if camera_ids is None else set(camera_ids)
@@ -133,24 +154,27 @@ def run_once(config, root=None, *, mode='quick', prior=None, now_ms=None, api=No
         if mode=='full' and report['ok'] and not timeout:
             from .fmp4 import configuration, probe_fmp4
             startup_options=configuration(config)
-            probe=probe or probe_ubv; by_id={c['id']:c for c in selected_cameras(config,bootstrap)}
+            probe=probe or probe_ubv
+            by_id={c['id']:c for c in selected_cameras(config,bootstrap)+read_only_cameras(config,bootstrap)}
             evidence={};startup_evidence={}
-            for row in report['cameras']:
+            for row in _rows(report):
                 if row['cameraId']not in wanted:continue
                 camera=by_id[row['cameraId']]
                 evidence[row['cameraId']]=[]
-                for channel in sorted(set([c for _,_,c in qualities(camera)]+[automatic_channel(camera)])):
+                channels=row['enabledChannels']if row.get('readOnly')else \
+                    sorted(set([c for _,_,c in qualities(camera)]+[automatic_channel(camera)]))
+                for channel in channels:
                     result=probe(config,camera,channel,seconds=8)
                     evidence[row['cameraId']].append(result)
                 # Serialize the optional browser-clock startup read with the
                 # UBV reads. Never create a second concurrent viewer.
-                if startup_options['enabled']:
+                if startup_options['enabled']and not row.get('readOnly'):
                     startup_evidence[row['cameraId']]=(startup_probe or probe_fmp4)(
                         config,camera,automatic_channel(camera),seconds=12)
             # The full sweep can last more than two minutes. Refresh both source
             # and recording age, preserving the original comparison checkpoint.
             report,bootstrap=inspect(config,prior=previous,now_ms=sample_time(),api=api,fetch=fetch)
-            for row in report['cameras']:
+            for row in _rows(report):
                 if row['cameraId']not in evidence:continue
                 row['activeProbes']=evidence[row['cameraId']]
                 active_ok=all(p.get('ok')is True for p in row['activeProbes'])
@@ -158,12 +182,15 @@ def run_once(config, root=None, *, mode='quick', prior=None, now_ms=None, api=No
                     row['fmp4StartupProbe']=startup_evidence[row['cameraId']]
                     active_ok=active_ok and row['fmp4StartupProbe'].get('ok')is True
                 row['ok']=row['ok']and active_ok
-                if not active_ok and row['sourceHealthy']:row['cause']='protect_media_unhealthy'
+                if not active_ok and row['sourceHealthy']:
+                    row['cause']='native_media_unhealthy'if row.get('readOnly')else'protect_media_unhealthy'
             report['activeProbeCameraIds']=sorted(evidence)
             report['fullActiveCoverage']=set(evidence)==known
-            report['fmp4StartupCoverageVerified']=bool(startup_evidence)and set(startup_evidence)==wanted \
+            startup_wanted={r['cameraId']for r in report['cameras']} & wanted
+            report['fmp4StartupCoverageVerified']=bool(startup_evidence)and set(startup_evidence)==startup_wanted \
                 and all(p.get('ok')is True for p in startup_evidence.values())
-            report['ok']=report['scopeValid']and all(row['ok']for row in report['cameras'])
+            report['nativeHealthy']=all(row['ok']for row in report.get('nativeCameras',[]))
+            report['ok']=report['scopeValid']and all(row['ok']for row in _rows(report))
         report['recordingProgressSampleSeconds']=round(clock()-began,3) if observe or mode=='full' else None
         report['recordingProgressObserved']=_progress(report)
         report['scopedRecordingProgressObserved']=_progress(report,wanted)

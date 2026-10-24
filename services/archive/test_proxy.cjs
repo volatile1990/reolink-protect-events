@@ -6,6 +6,7 @@ const crypto = require("node:crypto");
 const { once } = require("node:events");
 const { Readable, Writable } = require("node:stream");
 const { pipeline } = require("node:stream/promises");
+const { deflateSync } = require("node:zlib");
 const candidate = require("./proxy.cjs");
 const { UbvAacClockTransform } = require(candidate.DEFAULT_TRANSFORM_PATH);
 const KEY = "dGhlIHNhbXBsZSBub25jZQ==";
@@ -40,6 +41,14 @@ function binme(command = "status") {
     return Buffer.concat([header, data]);
   }));
 }
+function commandMessage(command, body = {}, compressed = false) {
+  return Buffer.concat([Buffer.from(JSON.stringify({ command })), Buffer.from(JSON.stringify(body))].map((data, index) => {
+    if (compressed) data = deflateSync(data);
+    const header = Buffer.alloc(8); header[0] = index + 1; header[1] = 1; header[2] = Number(compressed);
+    header.writeUInt32BE(data.length, 4); return Buffer.concat([header, data]);
+  }));
+}
+const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 function parseFrames(data) {
   const records = [];
   for (let pos = 0; pos < data.length;) {
@@ -301,6 +310,105 @@ test("long paused responsive peers retain capacity while dead-peer keepalive is 
     const health = JSON.parse(response.subarray(response.indexOf('\r\n\r\n') + 4));
     assert.equal(health.ok, true); assert.equal(health.capacityAvailable, true);
   } finally { client.destroy(); await f.close(); }
+});
+
+test("six unpaused silent viewers are reclaimed even while native status and ping keep TCP responsive", async () => {
+  const timers = [];
+  const f = await fixture(socket => {
+    socket.write(UPGRADE);
+    timers.push(setInterval(() => {
+      if (!socket.destroyed) socket.write(Buffer.concat([frame(2, binme()), frame(9, Buffer.from('native-ping'))]));
+    }, 15));
+  }, { mediaProgressMs: 100 });
+  const clients = [];
+  try {
+    for (let i = 0; i < 6; i++) {
+      const client = f.connect(); client.on('error', () => {}); clients.push(client); client.resume();
+      client.write(request(TARGET + '&autoStart=true')); await once(client, 'data');
+    }
+    assert.equal(f.proxy.activeSessions(), 6);
+    const closed = clients.map(client => once(client, 'close'));
+    await Promise.all(closed);
+    assert.equal(f.proxy.activeSessions(), 0); assert.equal(f.proxy.metrics.mediaProgressTimeouts, 6);
+    const health = await exchange(f, Buffer.from('GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n'));
+    assert(health.includes(Buffer.from('200 OK')));
+  } finally { for (const timer of timers) clearInterval(timer); for (const client of clients) client.destroy(); await f.close(); }
+});
+
+test("explicit pause remains unlimited, retains exact controls, and resumed media must progress again", async () => {
+  const paused = masked(2, commandMessage('pause')), resumed = masked(2, commandMessage('resume'));
+  const received = []; let upstream;
+  const f = await fixture(socket => {
+    upstream = socket; socket.write(Buffer.concat([UPGRADE, frame(2, record(1003, 0xc902, 1000, Buffer.alloc(16, 1)))]));
+    socket.on('data', bytes => received.push(Buffer.from(bytes)));
+  }, { mediaProgressMs: 100 });
+  const client = f.connect(); client.on('error', () => {}); client.resume();
+  try {
+    client.write(request(TARGET + '&autoStart=true')); await once(client, 'data');
+    client.write(paused); await wait(20);
+    // Media already in flight after Pause must not undo the pause intent.
+    upstream.write(frame(2, record(1003, 0xc902, 1100, Buffer.alloc(16, 2))));
+    await wait(180); assert.equal(f.proxy.activeSessions(), 1); assert.equal(f.proxy.metrics.mediaProgressTimeouts, 0);
+    const closed = once(client, 'close'); client.write(resumed); await closed;
+    assert.equal(f.proxy.activeSessions(), 0); assert.equal(f.proxy.metrics.mediaProgressTimeouts, 1);
+    assert.deepEqual(Buffer.concat(received), Buffer.concat([paused, resumed]));
+  } finally { client.destroy(); await f.close(); }
+});
+
+test("autoStart=false and planned native pause survive; resume without fresh video has a deadline", async () => {
+  for (const suffix of ['&autoStart=false', '&autoStart=true&pauseAfter=1000']) {
+    const f = await fixture(socket => socket.write(UPGRADE), { mediaProgressMs: 60 });
+    const client = f.connect(); client.on('error', () => {}); client.resume();
+    try {
+      client.write(request(TARGET + suffix)); await once(client, 'data');
+      await wait(140); assert.equal(f.proxy.activeSessions(), 1);
+      const closed = once(client, 'close'); client.write(masked(2, commandMessage('resume', { pauseAfter: 0 })));
+      await closed; assert.equal(f.proxy.metrics.mediaProgressTimeouts, 1);
+    } finally { client.destroy(); await f.close(); }
+  }
+});
+
+test("only completed advancing video renews progress; audio and repeated timestamps cannot hide a stall", async () => {
+  const timers = []; let mode = 'fresh', timestamp = 1000;
+  const f = await fixture(socket => {
+    socket.write(UPGRADE);
+    timers.push(setInterval(() => {
+      if (socket.destroyed) return;
+      if (mode === 'fresh') timestamp += 50;
+      socket.write(Buffer.concat([frame(2, record(1003, 0xc902, timestamp, Buffer.alloc(16, 3))), frame(2, audio(timestamp))]));
+    }, 25));
+  }, { mediaProgressMs: 100 });
+  const client = f.connect(); client.on('error', () => {}); client.resume();
+  try {
+    client.write(request(TARGET + '&autoStart=true')); await once(client, 'data');
+    await wait(250); assert.equal(f.proxy.activeSessions(), 1);
+    mode = 'repeated'; const closed = once(client, 'close'); await closed;
+    assert.equal(f.proxy.metrics.mediaProgressTimeouts, 1);
+  } finally { for (const timer of timers) clearInterval(timer); client.destroy(); await f.close(); }
+});
+
+test("bounded masked fragmented and compressed native controls are observed without rewriting bytes", () => {
+  const observed = [], observer = new candidate.ClientControlObserver(value => observed.push(value));
+  const pause = commandMessage('pause', {}, true), first = masked(2, pause.subarray(0, 10)), last = masked(0, pause.subarray(10));
+  first[0] &= 127;
+  for (const byte of Buffer.concat([first, masked(9, Buffer.from('ping')), last,
+      masked(2, commandMessage('resume', { pauseAfter: 123 }))])) observer.feed(Buffer.from([byte]));
+  assert.deepEqual(observed, [{ command: 'pause', pauseAfter: 0 }, { command: 'resume', pauseAfter: 123 }]);
+  observer.feed(Buffer.alloc(200000));
+  assert(observer.disabled); assert.equal(observer.buffer.length, 0);
+});
+
+test("systemd watchdog pulses follow the actual Node event loop and stop with shutdown", async () => {
+  let sent = 0;
+  const stop = candidate.startSystemdWatchdog({ NOTIFY_SOCKET: '/fixture', WATCHDOG_USEC: '200000', WATCHDOG_PID: String(process.pid) }, () => sent++);
+  try {
+    assert.equal(sent, 1); await wait(140); assert(sent >= 2);
+    const before = sent, until = performance.now() + 150;
+    while (performance.now() < until) {} // An independent timer thread would falsely keep pulsing.
+    assert.equal(sent, before);
+    await wait(10); assert(sent > before);
+  } finally { stop(); }
+  const before = sent; await wait(120); assert.equal(sent, before);
 });
 
 test("eight half-open rejected or health clients cannot retain connection slots", async () => {

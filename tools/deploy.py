@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from reolink_protect_events.operations import installer
 from reolink_protect_events.operations.release import build_package
-from reolink_protect_events.operations.transport import invoke
+from reolink_protect_events.operations.transport import invoke,MaintenanceLease
 
 REMOTE = Path(installer.__file__).read_text(encoding='utf-8')
 
@@ -54,6 +54,7 @@ def main():
         parser.error('--group-max-span-seconds requires --group-visual-events')
     owner = uuid.uuid4().hex
     request = {'mode': args.mode}
+    lease=None
     if args.mode == 'install':
         request['eventsOnly'] = args.events_only
         request['updateMonitor'] = args.update_monitor
@@ -69,26 +70,31 @@ def main():
         if not args.expected_digest:
             parser.error('Rollback requires the expected current deployment digest')
         request['expectedDigest'] = args.expected_digest
+        request['owner']=owner
     if args.mode in ('install', 'capture'):
         data, manifest = build_package(ROOT, cache=args.dependency_cache, require_clean=True)
         request.update(package=base64.b64encode(data).decode(), digest=manifest['packageSha256'], owner=owner)
-        if not invoke(ROOT, args.host, {'action': 'installer', 'request': {'mode': 'maintenance', 'owner': owner, 'enable': True}}).get('ok'):
-            raise RuntimeError('maintenance_failed')
+        lease=MaintenanceLease(lambda request:invoke(ROOT,args.host,request,timeout=30),owner)
+        lease.start()
+    elif args.mode=='rollback':
+        lease=MaintenanceLease(lambda request:invoke(ROOT,args.host,request,timeout=30),owner)
+        lease.start()
     value = None
     try:
-        value = invoke(ROOT, args.host, {'action': 'installer', 'request': request}, timeout=300)
+        from contextlib import nullcontext
+        with lease.activity(300)if lease else nullcontext():
+            value = invoke(ROOT, args.host, {'action': 'installer', 'request': request}, timeout=300)
     except Exception as error:
         if not args.events_only:
             raise
         value = {'ok': False, 'errorCode': 'deployment_failed', 'errorType': type(error).__name__}
     finally:
-        if args.mode in ('install', 'capture'):
+        if args.mode in ('install', 'capture','rollback'):
             verified = value is not None and (value.get('ok') is True
                 or value.get('recovery', {}).get('healthy') is True)
             if not args.events_only or verified:
                 try:
-                    released = invoke(ROOT, args.host, {'action': 'installer', 'request': {
-                        'mode': 'maintenance', 'owner': owner, 'enable': False}})
+                    released = lease.stop()
                     if args.events_only and not released.get('ok'):
                         raise RuntimeError('maintenance_release_failed')
                 except Exception:
@@ -97,6 +103,7 @@ def main():
                     value.update(ok=False, errorCode='maintenance_release_failed',
                                  maintenanceRetained=True, maintenanceOwner=owner)
             else:
+                lease.stop(release=False)
                 value.update(maintenanceRetained=True, maintenanceOwner=owner)
     print(json.dumps(value))
     return 0 if value.get('ok') else 1

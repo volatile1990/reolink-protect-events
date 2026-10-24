@@ -83,6 +83,10 @@ def write_json(path, value):
         json.dump(value, handle, sort_keys=True, separators=(',', ':'), allow_nan=False)
         handle.write('\n'); handle.flush(); os.fsync(handle.fileno())
     os.replace(str(temporary), str(path))
+    if os.name != 'nt':
+        directory=os.open(str(path.parent),os.O_RDONLY|os.O_DIRECTORY|getattr(os,'O_NOFOLLOW',0))
+        try:os.fsync(directory)
+        finally:os.close(directory)
 
 
 def validate_config(config, *, require_credentials=True):
@@ -94,6 +98,18 @@ def validate_config(config, *, require_credentials=True):
     ids = [row.get('cameraId') for row in bridges]
     need(len(set(ids)) == 6 and all(isinstance(i, str) and re.fullmatch(r'[a-f0-9]{24}', i) for i in ids),
          'monitor_camera_identity_invalid')
+    native=config.get('readOnlyCameras',[])
+    need(isinstance(native,list)and len(native)<=4,'monitor_readonly_scope_invalid')
+    native_ids=[]
+    for row in native:
+        need(isinstance(row,dict)and set(row)<={'cameraId','host','mac'}
+             and isinstance(row.get('cameraId'),str)and re.fullmatch('[a-f0-9]{24}',row['cameraId'])
+             and isinstance(row.get('host'),str)and re.fullmatch(r'192\.168\.30\.[0-9]{1,3}',row['host'])
+             and row['host']not in HOSTS,'monitor_readonly_identity_invalid')
+        need(1<=int(row['host'].rsplit('.',1)[1])<=254,'monitor_readonly_identity_invalid')
+        native_ids.append(row['cameraId'])
+    need(len(set(native_ids))==len(native_ids)and not(set(native_ids)&set(ids)),'monitor_readonly_scope_invalid')
+    need(type(config.get('allQualityMediaChecks',False))is bool,'monitor_quality_policy_invalid')
     if require_credentials:
         for row in bridges:
             user, password = row.get('username'), row.get('password')
@@ -109,21 +125,14 @@ def validate_config(config, *, require_credentials=True):
 
 
 def maintenance(root):
-    path = Path(root) / 'maintenance.json'
-    # Presence suppresses mutations even if an interrupted coordinator leaves a
-    # stale or malformed marker. Removal belongs to the rollout coordinator.
-    return path.exists() or path.is_symlink()
+    from .maintenance_lease import status
+    return status(root)['active']
 
 
 def maintenance_blocks(root, owner=None):
     """Default blocks every marker; an exact private lease can own one repair."""
-    if owner is None:return maintenance(root)
-    need(isinstance(owner,str)and re.fullmatch(r'[a-f0-9]{32}',owner),'maintenance_owner_invalid')
-    path=Path(root)/'maintenance.json'
-    if not path.exists()or path.is_symlink():return True
-    try:value=read_json(path)
-    except Exception:return True
-    return value.get('owner')!=owner
+    from .maintenance_lease import blocks
+    return blocks(root,owner)
 
 
 def error_code(error, fallback='operation_failed'):

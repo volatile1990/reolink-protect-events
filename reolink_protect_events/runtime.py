@@ -15,6 +15,9 @@ import time
 import urllib.error
 import urllib.request
 from .http_deadline import get_bytes
+from .service_liveness import notify as service_notify
+
+WORKER_STALE_SECONDS = 180
 
 OBJECT_CLASSES = frozenset(("person", "vehicle", "animal"))
 AUDIO_CLASSES = frozenset(("babyCry", "bark", "speak", "glassBreak", "siren", "carHorn", "smoke"))
@@ -104,14 +107,18 @@ def fetch_bridge(bridge, after):
     return json.loads(data)
 
 
-def atomic_json(path, value):
+def atomic_json(path, value, mode=0o600):
     temporary = Path(str(path) + ".tmp")
     with temporary.open("w", encoding="utf-8") as output:
-        os.chmod(temporary, 0o600)
+        os.chmod(temporary, mode)
         json.dump(value, output, ensure_ascii=False)
         output.flush()
         os.fsync(output.fileno())
     os.replace(temporary, path)
+    if os.name == 'posix':
+        fd=os.open(Path(path).parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+        try:os.fsync(fd)
+        finally:os.close(fd)
 
 
 def recording_thumbnail(config, interval):
@@ -460,7 +467,7 @@ class Journal:
 
 
 class Runtime:
-    def __init__(self, config, root, capture_only=False, background_native=True):
+    def __init__(self, config, root, capture_only=False, background_native=True, public_status=None):
         self.config = validate_config(config)
         self.root = Path(root)
         self.journal = Journal(self.root / "journal.sqlite3", config.get("bridgeEventStaleSeconds", 120))
@@ -495,9 +502,15 @@ class Runtime:
         self._native_thread = None
         self._stop = threading.Event()
         self._native_state = {}
+        self._native_progress_at = None
+        self._native_media_started = None
         self._state_lock = threading.Lock()
         self.last_poll_duration_ms = 0
         self._closed = False
+        self.public_status = Path(public_status) if public_status else None
+        self._delivery_retry_since = None
+        self._delivery_progress_at = None
+        self._last_delivery_ms = None
 
     def initialize_native(self):
         from .native import adapter_for_config
@@ -695,16 +708,26 @@ class Runtime:
         try:
             worker = Runtime(self.config, self.root, background_native=False)
             worker._stop = self._stop
+            last_media_future = None
             while not self._stop.is_set():
                 began = time.monotonic()
+                self._mark_native_progress()
                 worker.check_native()
+                self._mark_native_progress()
                 if self._stop.is_set():
                     break
                 worker.deliver()
+                self._mark_native_progress()
                 if self._stop.is_set():
                     break
                 worker.deliver_media(int(time.time() * 1000))
                 with self._state_lock:
+                    self._native_progress_at = time.monotonic()
+                    if worker._media_future is None or worker._media_future.done():
+                        self._native_media_started = None
+                    elif worker._media_future is not last_media_future:
+                        self._native_media_started = time.monotonic()
+                    last_media_future = worker._media_future
                     self._native_state = {"atMs": int(time.time() * 1000), "nativeReady": worker.native_ready,
                         "nativeError": worker.native_error, "nativeDurationMs": round((time.monotonic() - began) * 1000, 2),
                         "importErrors": worker.journal.counter("nativeImportErrors")}
@@ -723,8 +746,50 @@ class Runtime:
 
     def _start_native_worker(self):
         if not self.capture_only and self.background_native and self._native_thread is None:
+            self._mark_native_progress()
             self._native_thread = threading.Thread(target=self._native_loop, name="protect-native-outbox", daemon=True)
             self._native_thread.start()
+
+    def _mark_native_progress(self):
+        with self._state_lock:
+            self._native_progress_at = time.monotonic()
+
+    def _watchdog_progress(self, now=None):
+        """A working capture loop must not hide a wedged native/media worker."""
+        now = time.monotonic() if now is None else now
+        with self._state_lock:
+            native = self._native_progress_at
+            media = self._native_media_started
+        if self._native_thread is not None and native is not None and now-native>WORKER_STALE_SECONDS:
+            return False
+        if media is not None and now-media>WORKER_STALE_SECONDS:
+            return False
+        return True
+
+    def _operator_alerts(self, health, now=None):
+        """Successful polling is not proof that the durable outbox drains."""
+        now=time.monotonic()if now is None else now
+        pending=health.get('pending',0)>0
+        retry=pending and health.get('retryIntervals',0)>0
+        if retry:
+            if self._delivery_retry_since is None:self._delivery_retry_since=now
+        else:self._delivery_retry_since=None
+        delivery=health.get('lastNativeDeliveryMs')
+        if not pending:
+            self._delivery_progress_at=None
+        elif self._delivery_progress_at is None or delivery!=self._last_delivery_ms:
+            self._delivery_progress_at=now
+        self._last_delivery_ms=delivery
+        stuck=(self._delivery_progress_at is not None and now-self._delivery_progress_at>=120)
+        retrying=(self._delivery_retry_since is not None and now-self._delivery_retry_since>=120)
+        alerts=[]
+        if not health.get('captureHealthy'):
+            alerts.append({'code':'events_capture_unhealthy','actionRequired':True})
+        if not self.capture_only and(not health.get('nativeReady')or stuck or retrying):
+            alerts.append({'code':'events_delivery_unhealthy','actionRequired':True})
+        if not self._watchdog_progress(now):
+            alerts.append({'code':'events_worker_stalled','actionRequired':True})
+        return alerts
 
     def once(self):
         # Cursor reads occur on this thread because SQLite connections are not
@@ -822,15 +887,22 @@ class Runtime:
             health["healthy"] = health["healthy"] and health["frigateHealthy"]
             health["captureHealthy"] = health["captureHealthy"] and health["frigateHealthy"]
         atomic_json(self.root / "health.json", health)
+        if self.public_status is not None:
+            alerts=self._operator_alerts(health)
+            atomic_json(self.public_status,{'schemaVersion':1,'atMs':now_ms,'completedAtMs':int(time.time()*1000),
+                'state':'attention'if alerts else'healthy','actionRequired':bool(alerts),'alerts':alerts},mode=0o644)
 
     def run(self):
         signal.signal(signal.SIGTERM, lambda *_: self.request_stop())
         signal.signal(signal.SIGINT, lambda *_: self.request_stop())
         self._start_native_worker()
+        service_notify('READY=1')
         try:
             while self.running:
                 began = time.monotonic()
                 self.once()
+                if self._watchdog_progress():
+                    service_notify('WATCHDOG=1')
                 time.sleep(max(0.1, 1 - (time.monotonic() - began)))
         finally:
             self.close()
@@ -865,9 +937,10 @@ def main():
     parser.add_argument("--config", required=True)
     parser.add_argument("--root", required=True)
     parser.add_argument("--capture-only", action="store_true")
+    parser.add_argument("--public-status")
     args = parser.parse_args()
     os.umask(0o077)
-    Runtime(json.loads(Path(args.config).read_text()), args.root, args.capture_only).run()
+    Runtime(json.loads(Path(args.config).read_text()), args.root, args.capture_only,public_status=args.public_status).run()
 
 
 if __name__ == "__main__":
