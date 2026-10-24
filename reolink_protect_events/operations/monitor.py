@@ -28,6 +28,74 @@ HEALTHY_REARM_MS=1800000
 RESUME_RETRY_MS=30000
 
 
+def _generation(previous):
+    value=previous.get('probeGeneration',0)
+    need(type(value)is int and value>=0,'monitor_probe_generation_invalid')
+    return value
+
+
+def _current_probe(at,epoch,generation,row,previous,now_ms):
+    return type(at)is int and 0<=now_ms-at<=ACTIVE_PROBE_TTL_MS \
+        and at>=max(previous.get('repairAttempts',[]),default=0) \
+        and type(row['source'].get('connectionEpoch'))is int and epoch==row['source']['connectionEpoch'] \
+        and generation==_generation(previous)
+
+
+def _bad_channels(row,previous,now_ms,quality_checks):
+    failed=[]
+    if quality_checks:
+        for channel in row['enabledChannels']:
+            value=previous.get('qualityProbes',{}).get(str(channel),{})
+            if (value.get('result')or{}).get('ok')is False and _current_probe(value.get('atMs'),
+                    value.get('sourceEpoch'),value.get('generation',0),row,previous,now_ms):failed.append(channel)
+    channel=row['automaticChannel']
+    if channel not in failed and (previous.get('lastActiveProbe')or{}).get('ok')is False \
+            and _current_probe(previous.get('lastActiveProbeAtMs'),previous.get('activeProbeSourceEpoch'),
+                previous.get('activeProbeGeneration',0),row,previous,now_ms):failed.append(channel)
+    return failed
+
+
+def _failure_count(previous,row,observations):
+    epoch=row['source'].get('connectionEpoch');generation=_generation(previous)
+    if previous.get('failureEvidenceVersion')!=1 or previous.get('failureEvidenceEpoch')!=epoch \
+            or previous.get('failureEvidenceGeneration')!=generation:
+        # Legacy aggregate counts cannot prove independent failed probes.
+        samples=previous.get('sampleFailures',0)if previous.get('failureEvidenceVersion')==1 \
+            and previous.get('failureEvidenceGeneration')==generation else 0
+        previous.update(failureEvidenceVersion=1,failureEvidenceEpoch=epoch,
+                        failureEvidenceGeneration=generation,sampleFailures=samples,mediaFailures={})
+    quick_bad=not(row['sourceHealthy']and row['protectHealthy'])
+    previous['sampleFailures']=previous.get('sampleFailures',0)+1 if quick_bad else 0
+    counts=[previous['sampleFailures']];saved=previous['mediaFailures']
+    need(isinstance(saved,dict),'monitor_failure_evidence_invalid')
+    for channel,at,ok in observations:
+        key=str(channel);prior=saved.get(key,{})
+        need(isinstance(prior,dict)and type(prior.get('count',0))is int,'monitor_failure_evidence_invalid')
+        if ok:
+            saved[key]={'atMs':at,'count':0};continue
+        if prior.get('atMs')==at:count=prior.get('count',1)
+        else:
+            last=prior.get('atMs')
+            count=prior.get('count',0)+1 if type(last)is int and 0<at-last<=ACTIVE_PROBE_TTL_MS else 1
+            saved[key]={'atMs':at,'count':count}
+        counts.append(count)
+    return max(counts)
+
+
+def _invalidate_probe_generation(root,state,cid,now_ms,reason):
+    previous=state['cameras'].setdefault(cid,{})
+    history=ensure_root(Path(root)/'repair-history')
+    write_json(history/(cid+'-'+str(now_ms)+'-'+reason+'.json'),{'cameraId':cid,'atMs':now_ms,
+        'reason':reason,'probeGeneration':_generation(previous),
+        'qualityProbes':previous.get('qualityProbes',{}),'lastActiveProbe':previous.get('lastActiveProbe'),
+        'lastActiveProbeAtMs':previous.get('lastActiveProbeAtMs'),
+        'lastFmp4StartupProbe':previous.get('lastFmp4StartupProbe'),
+        'lastFmp4StartupProbeAtMs':previous.get('lastFmp4StartupProbeAtMs')})
+    previous['probeGeneration']=_generation(previous)+1
+    previous.update(failures=0,sampleFailures=0,mediaFailures={})
+    write_json(Path(root)/'state.json',state)
+
+
 def _resume_pending(config,root,state,now_ms,*,allow_repair,marker,api,fetch,probe,resume):
     path=Path(root)/'recovery.json'
     if not path.exists():return None
@@ -43,6 +111,9 @@ def _resume_pending(config,root,state,now_ms,*,allow_repair,marker,api,fetch,pro
     state['resumeNextAtMs']=now_ms+min(300000,RESUME_RETRY_MS*2**min(attempts,4))
     write_json(Path(root)/'state.json',state)
     result=(resume or recovery.resume_pending)(config,root,api=api,fetch=fetch,probe=probe)
+    if isinstance(result,dict)and result.get('restoredOriginalTcp')is True \
+            and result.get('cameraId')in state['cameras']:
+        _invalidate_probe_generation(root,state,result['cameraId'],now_ms,'resume-restored')
     if not path.exists()or read_json(path).get('phase')=='complete':
         state['resumeRetryCount']=0;state['resumeNextAtMs']=0
     state['lastResumeResult']=result
@@ -130,30 +201,33 @@ def run_once(config,root,*,allow_repair=False,now_ms=None,startup_at_ms=None,api
             previous['connectionEpoch']=epoch
             row['sourceEpochChanged']=previous.get('epochProbePending')is True
             if row['sourceHealthy']and row['sourceEpochChanged']:epoch_candidates.append(row['cameraId'])
+        bad_channels={cid:_bad_channels(row,state['cameras'][cid],now_ms,all_qualities or row.get('readOnly'))for cid,row in rows.items()}
         candidates=[r['cameraId']for r in monitored_rows if r['sourceHealthy']and(
-            not r['protectHealthy']or state['cameras'].get(r['cameraId'],{}).get('lastActiveProbe',{}).get('ok')is False
-            or startup_options['enabled']and state['cameras'].get(r['cameraId'],{}).get('lastFmp4StartupProbe',{}).get('ok')is False)]
+            not r['protectHealthy']or bad_channels[r['cameraId']]
+            or not all_qualities and startup_options['enabled']and state['cameras'][r['cameraId']].get('lastFmp4StartupProbe',{}).get('ok')is False)
+            and not(state['cameras'][r['cameraId']].get('failureEvidenceVersion')==1
+                    and state['cameras'][r['cameraId']].get('failures',0)>=FAILURE_THRESHOLD)]
         selected=None
         if not marker and not report['startupGraceActive']:
             reason='rotation'
             # Urgent failures never consume the independent global rotation.
             # A permanently broken camera or exhausted repair budget must not
             # prevent every other camera from receiving fresh media evidence.
-            if now_ms-state.get('lastRotationAtMs',state['lastProbeAtMs'])>=rotation_interval:
+            urgent=epoch_candidates or candidates
+            ready=[cid for cid in urgent if now_ms-state['cameras'][cid].get('lastAnyProbeAtMs',
+                state['cameras'][cid].get('lastActiveProbeAtMs',0))>=URGENT_PROBE_INTERVAL_MS]
+            if ready and state.get('urgentSinceRotation')is not True:
+                selected=min(ready,key=lambda cid:(state['cameras'][cid].get('lastAnyProbeAtMs',
+                    state['cameras'][cid].get('lastActiveProbeAtMs',0)),cid))
+                reason='source_epoch_changed'if epoch_candidates else'suspect'
+                state['urgentSinceRotation']=True
+            elif now_ms-state.get('lastRotationAtMs',state['lastProbeAtMs'])>=rotation_interval:
                 ids=sorted(rows)
                 for offset in range(len(ids)):
                     index=(state['rotation']+offset)%len(ids)
                     if rows[ids[index]]['sourceHealthy']:
                         selected=ids[index];state['rotation']=(index+1)%len(ids)
-                        state['lastRotationAtMs']=now_ms;break
-            else:
-                urgent=epoch_candidates or candidates
-                ready=[cid for cid in urgent if now_ms-state['cameras'][cid].get('lastAnyProbeAtMs',
-                    state['cameras'][cid].get('lastActiveProbeAtMs',0))>=URGENT_PROBE_INTERVAL_MS]
-                if ready:
-                    selected=min(ready,key=lambda cid:(state['cameras'][cid].get('lastAnyProbeAtMs',
-                        state['cameras'][cid].get('lastActiveProbeAtMs',0)),cid))
-                    reason='source_epoch_changed'if epoch_candidates else'suspect'
+                        state['lastRotationAtMs']=now_ms;state['urgentSinceRotation']=False;break
             if selected is not None:
                 state['lastProbeAtMs']=now_ms
                 previous=state['cameras'].setdefault(selected,{})
@@ -166,21 +240,25 @@ def run_once(config,root,*,allow_repair=False,now_ms=None,startup_at_ms=None,api
                     if startup_options['enabled']and not native:plan.append(('fmp4',channel))
                     index=previous.get('qualityRotation',0)
                     need(type(index)is int and index>=0,'monitor_quality_state_invalid')
-                    kind,channel=plan[index%len(plan)];previous['qualityRotation']=(index+1)%len(plan)
+                    kind,channel=plan[index%len(plan)]
+                    if reason=='rotation':previous['qualityRotation']=(index+1)%len(plan)
                 else:kind=previous.get('nextProbeType','ubv')if startup_options['enabled']else'ubv'
+                if reason!='rotation'and bad_channels[selected]:kind,channel='ubv',bad_channels[selected][0]
                 if kind=='fmp4':
                     result=(startup_probe or probe_fmp4)(config,cameras[selected],channel,seconds=12) \
                         if startup_configuration_ok else {'ok':False,'errorCode':'fmp4_configuration_drift'}
                     previous['lastFmp4StartupProbe']=result;previous['lastFmp4StartupProbeAtMs']=now_ms
                     previous['fmp4ProbeSourceEpoch']=rows[selected]['source'].get('connectionEpoch')
+                    previous['fmp4ProbeGeneration']=_generation(previous)
                     previous['nextProbeType']='ubv'
                 else:
                     result=probe(config,cameras[selected],channel,seconds=8)
                     if channel==rows[selected]['automaticChannel']:
                         previous['lastActiveProbe']=result;previous['lastActiveProbeAtMs']=now_ms
                         previous['activeProbeSourceEpoch']=rows[selected]['source'].get('connectionEpoch')
+                        previous['activeProbeGeneration']=_generation(previous)
                     previous.setdefault('qualityProbes',{})[str(channel)]={'result':result,'atMs':now_ms,
-                        'sourceEpoch':rows[selected]['source'].get('connectionEpoch')}
+                        'sourceEpoch':rows[selected]['source'].get('connectionEpoch'),'generation':_generation(previous)}
                     previous['nextProbeType']='fmp4'if startup_options['enabled']else'ubv'
                 previous['lastAnyProbeAtMs']=now_ms
                 if not startup_options['enabled']or kind=='fmp4'or native and previous.get('qualityRotation')==0:
@@ -196,13 +274,15 @@ def run_once(config,root,*,allow_repair=False,now_ms=None,startup_at_ms=None,api
             startup=previous.get('lastFmp4StartupProbe')
             row['lastActiveProbe']=active
             row['lastActiveProbeAtMs']=previous.get('lastActiveProbeAtMs')
-            def fresh(at_key,epoch_key):
+            def fresh(at_key,epoch_key,generation_key):
                 at=previous.get(at_key)
-                epoch=row['source'].get('connectionEpoch')
-                return type(at)is int and 0<=now_ms-at<=ACTIVE_PROBE_TTL_MS and epoch_key in previous \
-                    and type(epoch)is int and previous[epoch_key]==epoch
-            row['activeProbeFresh']=fresh('lastActiveProbeAtMs','activeProbeSourceEpoch')
+                return epoch_key in previous and _current_probe(at,previous[epoch_key],
+                    previous.get(generation_key,0),row,previous,now_ms)
+            row['activeProbeFresh']=fresh('lastActiveProbeAtMs','activeProbeSourceEpoch','activeProbeGeneration')
             active_bad=row['activeProbeFresh']and isinstance(active,dict)and active.get('ok')is False
+            observations=[]
+            if row['activeProbeFresh']and isinstance(active,dict)and type(active.get('ok'))is bool:
+                observations.append((row['automaticChannel'],previous['lastActiveProbeAtMs'],active['ok']))
             row['activeMediaVerified']=bool(row['sourceHealthy']and row['protectHealthy']and row['activeProbeFresh']
                 and isinstance(active,dict)and active.get('ok')is True)
             native=row.get('readOnly')is True
@@ -211,18 +291,21 @@ def run_once(config,root,*,allow_repair=False,now_ms=None,startup_at_ms=None,api
                 for channel in row['enabledChannels']:
                     q=previous.get('qualityProbes',{}).get(str(channel),{})
                     at=q.get('atMs');epoch=row['source'].get('connectionEpoch')
-                    current=type(at)is int and 0<=now_ms-at<=ACTIVE_PROBE_TTL_MS and type(epoch)is int and q.get('sourceEpoch')==epoch
+                    current=_current_probe(at,q.get('sourceEpoch'),q.get('generation',0),row,previous,now_ms)
                     result=q.get('result')or{}
                     checks.append({'channel':channel,'atMs':at,'fresh':current,'ok':current and result.get('ok')is True,
                                    'probe':result})
                     active_bad=active_bad or current and result.get('ok')is False
+                    if current and type(result.get('ok'))is bool:
+                        observations=[value for value in observations if value[0]!=channel]
+                        observations.append((channel,at,result['ok']))
                 row['qualityMediaChecks']=checks
                 row['activeMediaVerified']=bool(row['sourceHealthy']and row['protectHealthy']and checks and all(q['ok']for q in checks))
             row['lastFmp4StartupProbe']=startup
             row['lastFmp4StartupProbeAtMs']=previous.get('lastFmp4StartupProbeAtMs')
             fmp4_required=startup_options['enabled']and not native
             row['fmp4StartupProbeFresh']=bool(fmp4_required and startup_configuration_ok
-                and fresh('lastFmp4StartupProbeAtMs','fmp4ProbeSourceEpoch'))
+                and fresh('lastFmp4StartupProbeAtMs','fmp4ProbeSourceEpoch','fmp4ProbeGeneration'))
             startup_bad=row['fmp4StartupProbeFresh']and isinstance(startup,dict)and startup.get('ok')is False
             row['fmp4StartupVerified']=bool(fmp4_required and startup_configuration_ok
                 and row['sourceHealthy']and row['protectHealthy']and isinstance(startup,dict)and startup.get('ok')is True
@@ -236,7 +319,7 @@ def run_once(config,root,*,allow_repair=False,now_ms=None,startup_at_ms=None,api
             elif startup_bad and row['recorderAndUbvHealthy']:row['cause']='protect_fmp4_startup_unhealthy'
             # A packaging/clock defect in fMP4 alone is a review finding, not
             # authority to toggle a healthy native recorder or spend its budget.
-            count=previous.get('failures',0)+1 if not row['recorderAndUbvHealthy']else 0
+            count=_failure_count(previous,row,observations)
             previous['failures']=count;row['consecutiveFailures']=count
             previous['recordingEnds']=row['recordingEnds']
             attempts=[t for t in previous.get('repairAttempts',[])if t>=now_ms-REPAIR_WINDOW_MS]
@@ -285,11 +368,14 @@ def run_once(config,root,*,allow_repair=False,now_ms=None,startup_at_ms=None,api
             state['cameras'][cid]['lastRecovery']=outcome
             report['readOnly']=outcome.get('attempted')is not True
             report['configurationWritePerformed']=outcome.get('attempted')is True
+            if outcome.get('ok')is True or outcome.get('attempted')is True and outcome.get('restoredOriginalTcp')is True:
+                _invalidate_probe_generation(root,state,cid,now_ms,'recorder-restored')
             if outcome.get('ok')is True:
                 state['cameras'][cid]['failures']=0
                 state['cameras'][cid]['lastActiveProbe']=outcome['postRepairActiveProbe']
                 state['cameras'][cid]['lastActiveProbeAtMs']=now_ms
                 state['cameras'][cid]['activeProbeSourceEpoch']=rows[cid]['source'].get('connectionEpoch')
+                state['cameras'][cid]['activeProbeGeneration']=_generation(state['cameras'][cid])
                 if startup_options['enabled']:
                     state['cameras'][cid]['lastFmp4StartupProbeAtMs']=0
                     state['cameras'][cid]['nextProbeType']='fmp4'

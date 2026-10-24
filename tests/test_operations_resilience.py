@@ -247,6 +247,7 @@ class RecoveryProgressTests(unittest.TestCase):
         self.assertTrue(all(c['budgetRearmedAtMs']is None for c in report['cameras']))
     def test_absolute_daily_limit_survives_episode_rearming_and_demands_attention(self):
         rows={b['cameraId']:{'failures':2,'repairAttempts':[self.now-7200000+i*1000 for i in range(12)],
+            'failureEvidenceVersion':1,'failureEvidenceEpoch':1,'failureEvidenceGeneration':0,'sampleFailures':2,'mediaFailures':{},
             'budgetEpochAtMs':self.now-1000,'connectionEpoch':1,'failureSourceEpoch':1,
             'lastActiveProbe':{'ok':True},'lastActiveProbeAtMs':self.now,'activeProbeSourceEpoch':1}
             for b in self.config['bridges']}
