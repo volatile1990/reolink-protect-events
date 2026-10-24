@@ -23,12 +23,16 @@ AUTOMATIC_DROPIN_PATH='/etc/systemd/system/unifi-protect.service.d/70-reolink-au
 AUTOMATIC_FILES={
  AUTOMATIC_GUARD_PATH:'919fd11b7f8c711b422c5f663ac5383094886c16e99f67f6be18ea9e531f93c8',
  AUTOMATIC_DROPIN_PATH:'6ab9c89f5d41402ad46f9b7c25fbafcc108414ccf002bc3eb4d880397ba22c7f'}
+AUTOMATIC_ROOT_FILES={
+ '/data/reolink-protect-controls/automatic-quality/nginx-root-restore.py':'8b0474d881c920c5b41149d879b8755596d2f09ed8cda728f98f1a39ff95a740',
+ '/data/reolink-protect-controls/automatic-quality/nginx-root-template.conf':'8e6b5039a16375c112d9a608ef6ba890a2fcc54eded3e13524e4dc30b2a602d4'}
 AUTOMATIC_ADDITIONAL_FILES={
  '/usr/local/lib/reolink-protect-controls/automatic-quality-nginx-guard.py':'1b577898455733e6dadd2ce51added25f8e6004614be86988eae88162613d09c',
- '/etc/systemd/system/unifi-protect.service.d/71-reolink-nginx-compat.conf':'80c9d69f1297acfbd62d2ee61808271c08c6f5189f8affb952a9a9b37f81533d'}
+ '/etc/systemd/system/unifi-protect.service.d/71-reolink-nginx-compat.conf':'80c9d69f1297acfbd62d2ee61808271c08c6f5189f8affb952a9a9b37f81533d',
+ **AUTOMATIC_ROOT_FILES}
 AUTOMATIC_WATCH_FILES={
- '/etc/systemd/system/reolink-protect-nginx-regeneration.service':'8381467f8fed88d11d945d6de263f4704b0564df92b590b5f8acfcb036dce93f',
- '/etc/systemd/system/reolink-protect-nginx-regeneration.path':'3fc436a3815b28a28194e4510af545e8a6186529052aa2415c63958585aecd12'}
+ '/etc/systemd/system/reolink-protect-nginx-regeneration.service':'d8727bb280e1751615029b796b0ba7d84d947f54052850cc72ac913bf12be16e',
+ '/etc/systemd/system/reolink-protect-nginx-regeneration.path':'b706f4f5be49662e0770245df5d5677eab098e2736b8a12d30b902c64e376068'}
 
 
 def _automatic_input_layer(config,bootstrap,file_reader):
@@ -58,12 +62,16 @@ def _automatic_input_layer(config,bootstrap,file_reader):
              and hashlib.sha256(file_reader(name)).hexdigest()==expected,
              'compatibility_auto_startup_layer_changed')
     additional=receipt.get('additionalOwnedFiles')
-    need(isinstance(additional,list)and len(additional)==2
+    need(isinstance(additional,list)and len(additional)==len(AUTOMATIC_ADDITIONAL_FILES)
          and all(isinstance(row,dict)and set(row)=={'path','sha256'}
                  and isinstance(row['path'],str)and isinstance(row['sha256'],str)for row in additional)
-         and len({row['path']for row in additional})==2
+         and len({row['path']for row in additional})==len(AUTOMATIC_ADDITIONAL_FILES)
          and {row['path']:row['sha256']for row in additional}==AUTOMATIC_ADDITIONAL_FILES,
          'compatibility_auto_nginx_ownership_changed')
+    for name in AUTOMATIC_ROOT_FILES:
+        info=private_path(Path(name)).stat()
+        need(stat.S_ISREG(info.st_mode)and info.st_uid==0 and info.st_nlink==1
+             and not info.st_mode&0o077,'compatibility_auto_root_files_not_private')
     for name,expected in AUTOMATIC_ADDITIONAL_FILES.items():
         need(hashlib.sha256(file_reader(name)).hexdigest()==expected,
              'compatibility_auto_nginx_startup_changed')

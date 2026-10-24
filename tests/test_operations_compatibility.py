@@ -45,6 +45,7 @@ class CompatibilityTests(unittest.TestCase):
         self.additional_files={path:('synthetic-nginx-startup:'+path).encode()
                                for path in compatibility.AUTOMATIC_ADDITIONAL_FILES}
         self.additional_expected={path:sha(value)for path,value in self.additional_files.items()}
+        self.root_expected={path:self.additional_expected[path]for path in compatibility.AUTOMATIC_ROOT_FILES}
         self.watch_files={path:('synthetic-event-watch:'+path).encode()
                           for path in compatibility.AUTOMATIC_WATCH_FILES}
         self.watch_expected={path:sha(value)for path,value in self.watch_files.items()}
@@ -63,10 +64,15 @@ class CompatibilityTests(unittest.TestCase):
             'baseline':{'settingsSha256':protect.settings_digest(self.config,self.boot)}}
         self.metadata=types.SimpleNamespace(st_uid=0,st_mode=stat.S_IFREG|0o600,st_nlink=1)
         self.private=types.SimpleNamespace(stat=lambda:self.metadata)
+        self.root_metadata={path:types.SimpleNamespace(st_uid=0,st_mode=stat.S_IFREG|0o600,st_nlink=1)
+                            for path in self.root_expected}
         self.reads=[];self.file_reads=[];self.layers=[{'path':'synthetic-ui-one'},{'path':'synthetic-ui-two'}]
 
     def assess(self, *, receipt=None, private_error=None, boot=None):
         def private(path):
+            name=path.as_posix()if hasattr(path,'as_posix')else str(path)
+            if name in self.root_metadata:
+                return types.SimpleNamespace(stat=lambda:self.root_metadata[name])
             self.assertEqual(path,compatibility.AUTOMATIC_RECEIPT)
             if private_error:raise private_error
             return self.private
@@ -79,6 +85,7 @@ class CompatibilityTests(unittest.TestCase):
              patch.object(compatibility,'AUTOMATIC_SERVICE_SHA256',sha(self.new)), \
              patch.object(compatibility,'AUTOMATIC_FILES',self.auto_expected), \
              patch.object(compatibility,'AUTOMATIC_ADDITIONAL_FILES',self.additional_expected), \
+             patch.object(compatibility,'AUTOMATIC_ROOT_FILES',self.root_expected), \
              patch.object(compatibility,'AUTOMATIC_WATCH_FILES',self.watch_expected), \
              patch.object(compatibility.automatic_profiles,'SCOPE',self.auto_scope), \
              patch.object(compatibility,'private_path',side_effect=private), \
@@ -99,6 +106,16 @@ class CompatibilityTests(unittest.TestCase):
             'a4e546e4a9d7cd82dc130a26cc5e92fa2b69f4cdb6fce1368870a543f0d08a7f')
         self.assertEqual(compatibility.AUTOMATIC_RECEIPT.as_posix(),
             '/data/reolink-protect-controls/automatic-quality/active.json')
+        self.assertEqual(compatibility.AUTOMATIC_ROOT_FILES,{
+            '/data/reolink-protect-controls/automatic-quality/nginx-root-restore.py':
+                '8b0474d881c920c5b41149d879b8755596d2f09ed8cda728f98f1a39ff95a740',
+            '/data/reolink-protect-controls/automatic-quality/nginx-root-template.conf':
+                '8e6b5039a16375c112d9a608ef6ba890a2fcc54eded3e13524e4dc30b2a602d4'})
+        self.assertEqual(compatibility.AUTOMATIC_WATCH_FILES,{
+            '/etc/systemd/system/reolink-protect-nginx-regeneration.service':
+                'd8727bb280e1751615029b796b0ba7d84d947f54052850cc72ac913bf12be16e',
+            '/etc/systemd/system/reolink-protect-nginx-regeneration.path':
+                'b706f4f5be49662e0770245df5d5677eab098e2736b8a12d30b902c64e376068'})
 
     def test_predecessor_remains_accepted_without_new_receipt(self):
         self.data[compatibility.SERVICE_PATH]=self.old
@@ -173,6 +190,27 @@ class CompatibilityTests(unittest.TestCase):
                 report=self.assess();self.assert_drift(report)
                 self.assertEqual(report['errorCode'],'compatibility_auto_nginx_startup_changed')
                 self.data[path]=self.additional_files[path]
+
+    def test_root_recovery_helper_and_template_must_remain_root_private_regular_files(self):
+        for path in self.root_expected:
+            original=self.root_metadata[path]
+            for field,value in(('st_uid',1000),('st_mode',stat.S_IFREG|0o644),
+                                ('st_mode',stat.S_IFLNK|0o600),('st_nlink',2)):
+                with self.subTest(path=path,field=field,value=value):
+                    changed=copy.copy(original);setattr(changed,field,value);self.root_metadata[path]=changed
+                    report=self.assess();self.assert_drift(report)
+                    self.assertEqual(report['errorCode'],'compatibility_auto_root_files_not_private')
+                    self.root_metadata[path]=original
+
+    def test_root_recovery_receipt_cannot_omit_or_forge_either_new_file(self):
+        for path in self.root_expected:
+            for mode in('omit','forge'):
+                with self.subTest(path=path,mode=mode):
+                    receipt=copy.deepcopy(self.receipt)
+                    if mode=='omit':receipt['additionalOwnedFiles']=[r for r in receipt['additionalOwnedFiles']if r['path']!=path]
+                    else:next(r for r in receipt['additionalOwnedFiles']if r['path']==path)['sha256']='0'*64
+                    report=self.assess(receipt=receipt);self.assert_drift(report)
+                    self.assertEqual(report['errorCode'],'compatibility_auto_nginx_ownership_changed')
 
     def test_event_watch_manifest_and_applied_state_are_required(self):
         rows=self.receipt['nginxWatchFiles'];wrong=copy.deepcopy(rows);wrong[0]['path']='/tmp/foreign-watch'
