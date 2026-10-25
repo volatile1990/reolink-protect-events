@@ -1,5 +1,22 @@
 # Own releases and Protect media monitoring
 
+## Event worker CPU behavior
+
+The source poller still runs approximately once per second. A committed source,
+fusion or group update wakes the native outbox worker immediately; thumbnail
+completion and stop also wake it. Idle waits are bounded by retry/media/native
+check deadlines and a one-second external-writer fallback. The worker clears
+its wake signal before selecting durable state, avoiding a lost notification
+between selection and sleep. Enrollment and pending selection retain their
+existing atomic writer lock and thread-owned SQLite connections.
+
+Pending and health predicates run directly against the two exact publication
+branches so SQLite can use their partial indexes, including the additive open
+group index. Health values are freshly queried. Identical cursor updates avoid
+unnecessary writes while still processing source disconnection and epoch
+changes. SQLite FULL synchronization, atomic status-file synchronization,
+durable acknowledgements and worker progress watchdogs remain enabled.
+
 For the current Debian deployment, start with the
 [installed host layout](../deploy/heimserver/README.md),
 [shared server releases](server-release.md) and

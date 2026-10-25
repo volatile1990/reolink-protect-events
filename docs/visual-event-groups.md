@@ -1,5 +1,22 @@
 # Multiple visual types in one Protect event
 
+## Bounded progress optimization
+
+The grouper can reuse an ID/link mapping when only source `last_seen` values
+advance and the grouping is already stable. Transactional shape tokens cover
+all SQLite writers; exact row shape, genuine per-class coverage and persisted
+membership must agree. Sticky evidence, historical gaps, unresolved links,
+future starts, partition deadlines and schema changes retain the complete
+algorithm. Rollback and savepoint invalidation use the same conservative path.
+
+The mapping is limited to 65,536 charged items and 1,048,576 ID characters across
+cameras. It contains no decoded journal payloads. A historical problem component
+can disable the shortcut for its entire camera; exceeding the budget also falls
+back without discarding evidence. This changes neither retention nor event
+identity, revision, provenance, class coverage or native publication semantics.
+Frozen-reference and generated mutation tests compare all publication tables
+against the preceding implementation.
+
 Version 1.5 adds an optional publication layer after the existing per-class
 Reolink/Frigate fusion. Source pushes, independent class lifecycles and their
 SQLite intervals remain authoritative. The new layer changes the events sent

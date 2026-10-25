@@ -18,6 +18,8 @@ from .http_deadline import get_bytes
 from .service_liveness import notify as service_notify
 
 WORKER_STALE_SECONDS = 180
+OUTBOX_IDLE_SECONDS = 1.0
+OUTBOX_BUSY_SECONDS = 0.1
 
 OBJECT_CLASSES = frozenset(("person", "vehicle", "animal"))
 AUDIO_CLASSES = frozenset(("babyCry", "bark", "speak", "glassBreak", "siren", "carHorn", "smoke"))
@@ -328,7 +330,7 @@ class Journal:
                     self._close_camera(camera, int(time.time() * 1000),
                                        "source_disconnect" if not source_state["connected"] else "source_reconnect")
                 current["epoch"] = epoch
-            self.db.execute("INSERT INTO cursors VALUES(?,?,?,?) ON CONFLICT(camera) DO UPDATE SET instance=excluded.instance,seq=excluded.seq,epoch=excluded.epoch",
+            self.db.execute("INSERT INTO cursors VALUES(?,?,?,?) ON CONFLICT(camera) DO UPDATE SET instance=excluded.instance,seq=excluded.seq,epoch=excluded.epoch WHERE cursors.instance IS NOT excluded.instance OR cursors.seq IS NOT excluded.seq OR cursors.epoch IS NOT excluded.epoch",
                             (camera, instance, current["seq"], current["epoch"]))
 
     def expire(self, now_ms, replaying_cameras=()):
@@ -348,7 +350,11 @@ class Journal:
                 if not self.db.in_transaction:
                     self.db.execute("BEGIN IMMEDIATE")
                 self.visual_groups.sync(int(time.time() * 1000))
-                rows = self.db.execute("SELECT i.id,i.camera,i.class,i.start,i.end,i.provenance,i.revision,i.delivered_revision,i.notified_revision,i.classes FROM publication_intervals i LEFT JOIN delivery_failures f ON f.event_id=i.id WHERE (i.delivered_revision<i.revision OR i.notified_revision<i.revision) AND COALESCE(f.next_attempt,0)<=? ORDER BY i.start LIMIT 16", (int(time.time() * 1000),)).fetchall()
+                query = self._publications_sql(
+                    "i.id,i.camera,i.class,i.start,i.end,i.provenance,i.revision,i.delivered_revision,i.notified_revision",
+                    "(i.delivered_revision<i.revision OR i.notified_revision<i.revision) AND COALESCE(f.next_attempt,0)<=?",
+                    join=" LEFT JOIN delivery_failures f ON f.event_id=i.id", include_classes=True)
+                rows = self.db.execute(query + " ORDER BY start LIMIT 16", (int(time.time() * 1000),) * 2).fetchall()
         except Exception:
             self.visual_groups.invalidate()
             raise
@@ -372,6 +378,26 @@ class Journal:
             attempts = (row[0] if row else 0) + 1
             retry = now_ms + min(300000, 1000 * 2 ** min(attempts, 8))
             self.db.execute("INSERT INTO delivery_failures VALUES(?,?,?) ON CONFLICT(event_id) DO UPDATE SET attempts=excluded.attempts,next_attempt=excluded.next_attempt", (event_id, attempts, retry))
+
+    @staticmethod
+    def _publications_sql(columns, predicate, *, join="", include_classes=False):
+        """Push predicates into the two exact branches of publication_intervals.
+
+        A UNION view may materialize the entire publication history before an
+        aggregate or join can filter it. Branch-local predicates let SQLite use
+        the existing pending/open partial indexes. Hidden interval members and
+        all visual groups retain precisely the public view's membership rules.
+        SQL fragments are fixed internal strings, never external input.
+        """
+        branches = []
+        for table in ("intervals", "visual_groups"):
+            selected = columns
+            if include_classes:
+                selected += "," + ("NULL" if table == "intervals" else "i.classes") + " AS classes"
+            membership = " AND NOT EXISTS(SELECT 1 FROM visual_group_members member WHERE member.interval_id=i.id)" if table == "intervals" else ""
+            branches.append("SELECT " + selected + " FROM " + table + " i" + join +
+                            " WHERE " + predicate + membership)
+        return " UNION ALL ".join(branches)
 
     @staticmethod
     def _media_publications_sql(columns, predicate, *, include_classes=False):
@@ -400,13 +426,17 @@ class Journal:
 
     def health(self):
         counters = dict(self.db.execute("SELECT name,value FROM counters"))
-        oldest = self.db.execute("SELECT MIN(start) FROM publication_intervals WHERE delivered_revision<revision OR notified_revision<revision").fetchone()[0]
+        pending_query = self._publications_sql("COUNT(*) AS n,MIN(i.start) AS oldest",
+            "(i.delivered_revision<i.revision OR i.notified_revision<i.revision)")
+        pending, oldest = self.db.execute("SELECT SUM(n),MIN(oldest) FROM (" + pending_query + ")").fetchone()
+        open_query = self._publications_sql("COUNT(*) AS n", "i.end IS NULL")
+        opened = self.db.execute("SELECT SUM(n) FROM (" + open_query + ")").fetchone()[0]
         return {"counters": counters,
                 "lastNativeDeliveryMs": counters.get("lastNativeDeliveryMs"),
                 "oldestPendingStartMs": oldest,
                 "oldestPendingAgeMs": max(0, int(time.time() * 1000) - oldest) if oldest is not None else 0,
-                "pending": self.db.execute("SELECT COUNT(*) FROM publication_intervals WHERE delivered_revision<revision OR notified_revision<revision").fetchone()[0],
-                "openIntervals": self.db.execute("SELECT COUNT(*) FROM publication_intervals WHERE end IS NULL").fetchone()[0],
+                "pending": pending,
+                "openIntervals": opened,
                 "pendingThumbnails": self._media_publication_count("m.done=0 AND m.attempts<20"),
                 "failedThumbnails": self._media_publication_count("m.done=0 AND m.attempts>=20"),
                 "retryIntervals": self.db.execute("SELECT COUNT(*) FROM delivery_failures").fetchone()[0],
@@ -415,6 +445,28 @@ class Journal:
                     self._media_publications_sql("m.error_reason AS error_reason", "m.done=0 AND m.error_reason IS NOT NULL") +
                     ") GROUP BY error_reason")),
                 "visualGroups": self.db.execute("SELECT COUNT(*) FROM visual_groups").fetchone()[0]}
+
+    def outbox_wait_seconds(self, now_ms, *, include_media=True):
+        """Bound an idle wait by real delivery/thumbnail deadlines, without sync.
+
+        A writer's event wakes the in-process worker immediately. This one-second
+        ceiling also notices external journal writers and grouping deadlines.
+        It is not a cache of pending rows: every delivery pass still enrolls and
+        selects its outbox atomically under the original SQLite writer lock.
+        """
+        query = self._publications_sql("MIN(COALESCE(f.next_attempt,0)) AS due",
+            "(i.delivered_revision<i.revision OR i.notified_revision<i.revision)",
+            join=" LEFT JOIN delivery_failures f ON f.event_id=i.id")
+        due = self.db.execute("SELECT MIN(due) FROM (" + query + ")").fetchone()[0]
+        if include_media:
+            query = self._media_publications_sql(
+                "MIN(MAX(m.next_attempt,m.last_attempt+15001,i.start+1501)) AS due",
+                "m.done=0 AND m.attempts<20 AND i.delivered_revision=i.revision")
+            media_due = self.db.execute("SELECT MIN(due) FROM (" + query + ")").fetchone()[0]
+            if media_due is not None:
+                due = media_due if due is None else min(due, media_due)
+        return OUTBOX_IDLE_SECONDS if due is None else min(OUTBOX_IDLE_SECONDS,
+            max(OUTBOX_BUSY_SECONDS, (due - now_ms) / 1000))
 
     def pending_media(self, now_ms):
         query = self._media_publications_sql("i.id,i.camera,i.class,i.start,i.end,i.provenance,i.delivered_revision",
@@ -515,6 +567,7 @@ class Runtime:
         self._media_event_id = None
         self._native_thread = None
         self._stop = threading.Event()
+        self._native_wake = threading.Event()
         self._native_state = {}
         self._native_progress_at = None
         self._native_media_started = None
@@ -665,6 +718,7 @@ class Runtime:
                     self._media_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="recorded-thumbnail")
                 self._media_event_id = interval["eventId"]
                 self._media_future = self._media_pool.submit(recording_thumbnail, self.config, interval)
+                self._media_future.add_done_callback(lambda _: self._native_wake.set())
                 return
         else:
             intervals = self.journal.pending_media(now_ms)
@@ -722,8 +776,12 @@ class Runtime:
         try:
             worker = Runtime(self.config, self.root, background_native=False)
             worker._stop = self._stop
+            worker._native_wake = self._native_wake
             last_media_future = None
             while not self._stop.is_set():
+                # Clear BEFORE reading durable state. A commit during the pass
+                # leaves this set, so wait cannot consume a lost notification.
+                self._native_wake.clear()
                 began = time.monotonic()
                 self._mark_native_progress()
                 worker.check_native()
@@ -745,7 +803,7 @@ class Runtime:
                     self._native_state = {"atMs": int(time.time() * 1000), "nativeReady": worker.native_ready,
                         "nativeError": worker.native_error, "nativeDurationMs": round((time.monotonic() - began) * 1000, 2),
                         "importErrors": worker.journal.counter("nativeImportErrors")}
-                self._stop.wait(0.1)
+                self._native_wake.wait(worker._native_wait_seconds())
         except Exception as error:
             with self._state_lock:
                 self._native_state = {"atMs": int(time.time() * 1000), "nativeReady": False,
@@ -757,6 +815,24 @@ class Runtime:
                 for client in worker.clients.values():
                     client.close()
                 worker.journal.close()
+
+    def _native_wait_seconds(self):
+        now_ms = int(time.time() * 1000)
+        check_delay = 60000 if self.native_ready else 10000
+        wait = min(OUTBOX_IDLE_SECONDS, max(OUTBOX_BUSY_SECONDS,
+            (self.last_native_check + check_delay - now_ms) / 1000))
+        if self.native_ready:
+            wait = min(wait, self.journal.outbox_wait_seconds(now_ms,
+                include_media=self._media_future is None))
+        return wait
+
+    def _commit_and_wake(self, operation, *args):
+        """Notify only after an owner-thread journal operation has committed."""
+        before = self.journal.db.total_changes
+        result = operation(*args)
+        if self.journal.db.total_changes != before and not self.journal.db.in_transaction:
+            self._native_wake.set()
+        return result
 
     def _start_native_worker(self):
         if not self.capture_only and self.background_native and self._native_thread is None:
@@ -836,7 +912,7 @@ class Runtime:
                 health = self.bridge_health.setdefault(bridge["cameraId"], {"consecutiveErrors": 0})
                 try:
                     response, fetch_duration = job.result()
-                    self.journal.ingest(bridge, response)
+                    self._commit_and_wake(self.journal.ingest, bridge, response)
                     sequence = self.journal.cursor(bridge["cameraId"])["seq"]
                     health.update(lastSuccessMs=int(time.time() * 1000), consecutiveErrors=0,
                                   pollDurationMs=fetch_duration,
@@ -854,7 +930,7 @@ class Runtime:
             health = self.frigate_health.setdefault(camera, {"consecutiveErrors": 0})
             try:
                 response = job.result()
-                self.journal.fusion.frigate(camera, response)
+                self._commit_and_wake(self.journal.fusion.frigate, camera, response)
                 health.update(lastSuccessMs=int(time.time() * 1000), consecutiveErrors=0,
                               cursorMs=response["cursor"], backlogMs=response["backlogMs"], requests=response["requests"],
                               historyCompleteness="no_sequence_or_retention_floor_proof")
@@ -865,10 +941,10 @@ class Runtime:
         now_ms = int(time.time() * 1000)
         self.last_poll_duration_ms = round((time.monotonic() - began) * 1000, 2)
         replaying = {camera for camera, value in self.bridge_health.items() if value["consecutiveErrors"] == 0 and value.get("sourceBacklog", 0) > 0}
-        self.journal.expire(now_ms, replaying)
+        self._commit_and_wake(self.journal.expire, now_ms, replaying)
         if self.journal.fusion is not None:
-            self.journal.fusion.sync(now_ms)
-        self.journal.visual_groups.sync(now_ms)
+            self._commit_and_wake(self.journal.fusion.sync, now_ms)
+        self._commit_and_wake(self.journal.visual_groups.sync, now_ms)
         if self._native_thread is None:
             if not self.capture_only:
                 self.check_native()
@@ -924,6 +1000,7 @@ class Runtime:
     def request_stop(self):
         self.running = False
         self._stop.set()
+        self._native_wake.set()
 
     def close(self):
         if self._closed:

@@ -15,6 +15,11 @@ import time
 VISUAL_CLASSES = frozenset(("person", "vehicle", "animal"))
 MANUAL_GROUP_SCHEMA_VERSION = 1
 
+# A progress shortcut may retain only bounded ID/link data, never a second
+# decoded copy of the journal. Exhaustion simply uses the complete algorithm.
+PROGRESS_CACHE_MAX_ITEMS = 65536
+PROGRESS_CACHE_MAX_CHARACTERS = 1048576
+
 # Track grouping-relevant changes through every SQLite connection, including
 # administrative tools. Cursor/counter/media-only commits do not alter grouping.
 # fusion_inputs is optional and can appear after this object.
@@ -87,6 +92,7 @@ class VisualGroups:
         CREATE INDEX IF NOT EXISTS visual_groups_camera ON visual_groups(camera,start);
         CREATE INDEX IF NOT EXISTS visual_groups_pending ON visual_groups(start)
           WHERE delivered_revision<revision OR notified_revision<revision;
+        CREATE INDEX IF NOT EXISTS visual_groups_open ON visual_groups(camera,last_seen) WHERE end IS NULL;
         CREATE INDEX IF NOT EXISTS visual_group_segments_interval ON visual_group_segments(interval_id);
         CREATE VIEW IF NOT EXISTS publication_intervals AS
           SELECT i.id,i.camera,i.class,i.start,i.end,i.last_seen,i.provenance,i.revision,
@@ -111,6 +117,9 @@ class VisualGroups:
         self._input_token = None
         self._camera_tokens = {}
         self._tracking_signature = None
+        self._shape_tokens = {}
+        self._progress_cache = {}
+        self._progress_builders = None
 
     def _schema_signature(self):
         # The schema cookie can be reused after transaction/savepoint rollback.
@@ -134,6 +143,8 @@ class VisualGroups:
                         "id INTEGER PRIMARY KEY CHECK(id=1), token BLOB NOT NULL CHECK(length(token)=16))")
         self.db.execute("INSERT OR IGNORE INTO visual_group_changes VALUES(1,randomblob(16))")
         self.db.execute("CREATE TABLE IF NOT EXISTS visual_group_camera_changes("
+                        "camera TEXT PRIMARY KEY, token BLOB NOT NULL CHECK(length(token)=16))")
+        self.db.execute("CREATE TABLE IF NOT EXISTS visual_group_shape_changes("
                         "camera TEXT PRIMARY KEY, token BLOB NOT NULL CHECK(length(token)=16))")
         tables = {row[0] for row in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         actual = dict(self.db.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger'"))
@@ -175,8 +186,17 @@ class VisualGroups:
                 # override INSERT OR REPLACE's conflict policy inside triggers.
                 changes = (" INSERT INTO visual_group_camera_changes SELECT camera,randomblob(16) FROM (" + lookup + ") WHERE camera IS NOT NULL ON CONFLICT(camera) DO UPDATE SET token=excluded.token;"
                            " INSERT INTO visual_group_camera_changes SELECT '*',randomblob(16) WHERE NOT EXISTS(SELECT 1 FROM (" + lookup + ") WHERE camera IS NOT NULL) ON CONFLICT(camera) DO UPDATE SET token=excluded.token;")
+                # Only interval last_seen is pure progress. Provenance, bounds,
+                # membership, publication edits and acknowledgements of source
+                # intervals can change enrollment or sticky history. Track their
+                # exact transactional identity separately, through ALL writers.
+                shape = "1"
+                if table == "intervals" and action == "UPDATE":
+                    shape = " OR ".join("OLD." + col + " IS NOT NEW." + col for col in columns if col != "last_seen")
+                shapes = (" INSERT INTO visual_group_shape_changes SELECT camera,randomblob(16) FROM (" + lookup + ") WHERE camera IS NOT NULL AND (" + shape + ") ON CONFLICT(camera) DO UPDATE SET token=excluded.token;"
+                          " INSERT INTO visual_group_shape_changes SELECT '*',randomblob(16) WHERE (" + shape + ") AND NOT EXISTS(SELECT 1 FROM (" + lookup + ") WHERE camera IS NOT NULL) ON CONFLICT(camera) DO UPDATE SET token=excluded.token;")
                 sql = ("CREATE TRIGGER " + name + " AFTER " + action + " ON " + table +
-                       condition + " BEGIN UPDATE visual_group_changes SET token=randomblob(16) WHERE id=1;" + changes + " END")
+                       condition + " BEGIN UPDATE visual_group_changes SET token=randomblob(16) WHERE id=1;" + changes + shapes + " END")
                 if actual.get(name) != sql:
                     self.db.execute("DROP TRIGGER IF EXISTS " + name)
                     self.db.execute(sql)
@@ -188,6 +208,8 @@ class VisualGroups:
         # tracked mutation while the first camera's trigger was absent.
         self.db.execute("UPDATE visual_group_changes SET token=randomblob(16) WHERE id=1")
         self.db.execute("INSERT INTO visual_group_camera_changes VALUES('*',randomblob(16)) "
+                        "ON CONFLICT(camera) DO UPDATE SET token=excluded.token")
+        self.db.execute("INSERT INTO visual_group_shape_changes VALUES('*',randomblob(16)) "
                         "ON CONFLICT(camera) DO UPDATE SET token=excluded.token")
 
     def _change_token(self):
@@ -205,12 +227,17 @@ class VisualGroups:
                    if tokens.get(camera) != self._camera_tokens.get(camera)}
         force = (signature != self._tracking_signature or '*' in changed or
                  self._change_token() != self._input_token and not changed)
+        shapes = dict(self.db.execute("SELECT camera,token FROM visual_group_shape_changes"))
+        shape_unchanged = {camera for camera in changed if camera in shapes
+                           and shapes[camera] == self._shape_tokens.get(camera)}
         # Recompute affected history even when only provenance, raw fusion
         # bounds, manual membership or a rolled-back output changed. The prior
         # row-signature shortcut alone cannot distinguish those mutations.
-        self._sync(now, force=force, force_cameras=None if force else changed)
+        self._sync(now, force=force, force_cameras=None if force else changed,
+                   shape_unchanged=shape_unchanged)
         self._input_token = self._change_token()
         self._camera_tokens = dict(self.db.execute("SELECT camera,token FROM visual_group_camera_changes"))
+        self._shape_tokens = dict(self.db.execute("SELECT camera,token FROM visual_group_shape_changes"))
         self._tracking_signature = self._schema_signature()
 
     def _ranges(self, row, meta):
@@ -259,7 +286,7 @@ class VisualGroups:
             self.invalidate()
             raise
 
-    def _sync(self, now, force=False, force_cameras=None):
+    def _sync(self, now, force=False, force_cameras=None, shape_unchanged=()):
         if not self.enabled and not self.db.execute("SELECT 1 FROM visual_group_members LIMIT 1").fetchone():
             return
         targets = None if force_cameras is None else set(force_cameras) | {
@@ -291,6 +318,21 @@ class VisualGroups:
         if force_cameras is not None:
             dirty.update(force_cameras)
         dirty.update(camera for camera, due in self._next_due.items() if now >= due)
+        # Schema/shape tokens make the shortcut conservative even for external
+        # SQL, two connections and rollback ABA. Still compare exact row shape
+        # before using the bounded link cache. Future starts/caps are full work.
+        progress = set()
+        if not force:
+            for camera in dirty & set(shape_unchanged):
+                cached = self._progress_cache.get(camera)
+                before, after = self._camera_signatures.get(camera, ()), signatures.get(camera, ())
+                if (cached is not None and now >= cached['at'] and
+                        now < self._next_due.get(camera, float('inf')) and len(before) == len(after)
+                        and all(left[:5] == right[:5] and left[6:] == right[6:]
+                                for left, right in zip(before, after))):
+                    self._advance_progress(cached, before, after, now)
+                    progress.add(camera)
+        dirty.difference_update(progress)
         if targets is None:
             self._camera_signatures = signatures
         else:
@@ -301,6 +343,11 @@ class VisualGroups:
                     self._camera_signatures.pop(camera, None)
         if not dirty:
             return
+        for camera in dirty:
+            self._progress_cache.pop(camera, None)
+        self._progress_builders = {camera: {'sources': {}, 'open': set(), 'groups': set(),
+                                           'items': 1, 'characters': len(camera), 'at': now}
+                                   for camera in dirty}
         marks = ",".join("?" for _ in dirty)
         parameters = tuple(sorted(dirty))
         rows = self.db.execute("SELECT i.id,i.camera,i.class,i.start,i.end,i.last_seen,i.provenance "
@@ -470,6 +517,79 @@ class VisualGroups:
                 self._next_due[camera] = min(due)
             else:
                 self._next_due.pop(camera, None)
+        for camera, cached in self._progress_builders.items():
+            if cached is not None and cached['groups']:
+                cached['sources'] = {identifier: tuple(groups) for identifier, groups in cached['sources'].items()}
+                cached['open'] = tuple(cached['open'])
+                cached.pop('groups')
+                self._progress_cache[camera] = cached
+        self._progress_builders = None
+        # Per-camera builders are bounded too; the retained aggregate is bounded
+        # across all cameras and evicts whole shortcuts, never journal evidence.
+        while (sum(value['items'] for value in self._progress_cache.values()) > PROGRESS_CACHE_MAX_ITEMS or
+               sum(value['characters'] for value in self._progress_cache.values()) > PROGRESS_CACHE_MAX_CHARACTERS):
+            self._progress_cache.pop(next(iter(self._progress_cache)))
+
+    def _advance_progress(self, cached, before, after, now):
+        targets = {identifier: now for identifier in cached['open']}
+        for left, right in zip(before, after):
+            if left[5] != right[5]:
+                for identifier in cached['sources'].get(right[0], ()):
+                    targets[identifier] = max(targets.get(identifier, right[5]), right[5])
+        self.db.executemany("UPDATE visual_groups SET last_seen=MAX(last_seen,?) WHERE id=? AND last_seen<?",
+                            [(seen, identifier, seen) for identifier, seen in targets.items()])
+        cached['at'] = now
+
+    def _remember_progress(self, camera, identifier, identifiers, sources, left, right, coverage, sticky, existing_links):
+        if self._progress_builders is None:
+            return
+        cached = self._progress_builders[camera]
+        if cached is None:
+            return
+        # A newly acknowledged publication may pin disconnected membership.
+        # Leave every such history on the original algorithm, regardless of its
+        # current acknowledgement flags, rather than infer future stickiness.
+        # A previously sticky marker can also disappear one pass after genuine
+        # coverage becomes continuous; do not freeze that intermediate output.
+        if (sticky or not existing_links <= identifiers or
+                len(_merge(value for ranges in coverage.values() for value in ranges)) > 1 or
+                any(source_id not in sources or sources[source_id]['row'][1] != camera
+                    for source_id in identifiers)):
+            self._progress_builders[camera] = None
+            return
+        # Retained publication evidence can outlive a withdrawn/reclassified
+        # source. An old open class then settles to finite evidence using the
+        # group's observed progress. Only shortcut exact, genuine class ranges;
+        # leave every such sticky envelope on the original reconstruction.
+        genuine = {}
+        for source_id in identifiers:
+            source = sources[source_id]
+            ranges = _clip(source['ranges'], left, right)
+            if ranges:
+                genuine.setdefault(source['row'][2], []).extend(ranges)
+        if ({label: _merge(ranges) for label, ranges in genuine.items()} !=
+                {label: _merge(ranges) for label, ranges in coverage.items()}):
+            self._progress_builders[camera] = None
+            return
+        if identifier not in cached['groups']:
+            cached['groups'].add(identifier)
+            cached['items'] += 1
+            cached['characters'] += len(identifier)
+        if right is None:
+            cached['open'].add(identifier)
+        for source_id in identifiers:
+            if source_id not in sources:
+                continue
+            if source_id not in cached['sources']:
+                cached['sources'][source_id] = set()
+                cached['items'] += 1
+                cached['characters'] += len(source_id)
+            groups = cached['sources'][source_id]
+            if identifier not in groups:
+                groups.add(identifier)
+                cached['items'] += 1
+        if cached['items'] > PROGRESS_CACHE_MAX_ITEMS or cached['characters'] > PROGRESS_CACHE_MAX_CHARACTERS:
+            self._progress_builders[camera] = None
 
     def _recover_anchor(self, group, members, sources):
         """Recognize only the old forward-shift bug from retained evidence.
@@ -608,6 +728,8 @@ class VisualGroups:
             self.db.execute("UPDATE visual_groups SET last_seen=MAX(last_seen,?) WHERE id=?", (last_seen, identifier))
         for source_id in identifiers:
             self.db.execute("INSERT OR IGNORE INTO visual_group_segments VALUES(?,?)", (identifier, source_id))
+        self._remember_progress(camera, identifier, identifiers, sources, left, right, coverage,
+                                meta.get('publishedGroupSticky', False), links.get(identifier, set()))
         return True
 
     def prune(self, cutoff):

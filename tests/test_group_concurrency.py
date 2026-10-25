@@ -66,7 +66,7 @@ class PublicationConcurrencyTests(unittest.TestCase):
         trace_seen = []
 
         def trace(statement):
-            if 'FROM publication_intervals i LEFT JOIN delivery_failures' in statement and not trace_seen:
+            if 'FROM intervals i LEFT JOIN delivery_failures' in statement and not trace_seen:
                 # A trace callback runs immediately before the actual outbox
                 # SELECT. The writer attempts a genuine ingest at that boundary.
                 begin.set()

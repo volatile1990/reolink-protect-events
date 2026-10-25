@@ -159,8 +159,8 @@ class Fusion:
                 if current["epoch"] is not None and (state["connectionEpoch"] != current["epoch"] or not state["connected"]):
                     self.close_source(camera, "reolink", now, "source_disconnect" if not state["connected"] else "source_reconnect")
                 current["epoch"] = state["connectionEpoch"]
-            self.db.execute("INSERT INTO cursors VALUES(?,?,?,?) ON CONFLICT(camera) DO UPDATE SET instance=excluded.instance,seq=excluded.seq,epoch=excluded.epoch", (camera, instance, current["seq"], current["epoch"]))
-            self.db.execute("INSERT INTO fusion_bridge VALUES(?,?,?,?) ON CONFLICT(camera) DO UPDATE SET instance=excluded.instance,seq=excluded.seq,epoch=excluded.epoch", (camera, instance, current["seq"], current["epoch"]))
+            self.db.execute("INSERT INTO cursors VALUES(?,?,?,?) ON CONFLICT(camera) DO UPDATE SET instance=excluded.instance,seq=excluded.seq,epoch=excluded.epoch WHERE cursors.instance IS NOT excluded.instance OR cursors.seq IS NOT excluded.seq OR cursors.epoch IS NOT excluded.epoch", (camera, instance, current["seq"], current["epoch"]))
+            self.db.execute("INSERT INTO fusion_bridge VALUES(?,?,?,?) ON CONFLICT(camera) DO UPDATE SET instance=excluded.instance,seq=excluded.seq,epoch=excluded.epoch WHERE fusion_bridge.instance IS NOT excluded.instance OR fusion_bridge.seq IS NOT excluded.seq OR fusion_bridge.epoch IS NOT excluded.epoch", (camera, instance, current["seq"], current["epoch"]))
 
     def poll_state(self, camera):
         row = self.db.execute("SELECT cursor FROM fusion_poll WHERE camera=?", (camera,)).fetchone()
