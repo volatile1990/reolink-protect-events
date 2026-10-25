@@ -35,6 +35,17 @@ value. Metadata updates preserve the existing event, object and thumbnail IDs,
 recorded pixels and timestamp. Source diagnostic lists are bounded separately
 from the full set of detail evidence.
 
+Set `frigate.includeClassificationDetails` to `false` to publish future Frigate
+inputs only as their generic person, vehicle or animal class. It defaults to
+`true` and accepts only a JSON boolean. The choice is recorded when a Frigate
+event ID first contributes a supported class. Refreshes, class corrections and
+restarts preserve that choice, even after the setting changes. Existing inputs
+without the recorded flag retain the former enabled behavior; historical
+subtypes, native identities and acknowledgements are not removed. If an old
+detail-bearing input and a new generic input overlap in the same event, the old
+input's genuine detail remains. This changes publication metadata, not the
+object model, video decoding or detection workload.
+
 After audio inputs have entered the journal, keep version 1.4 or later. Disable
 audio capture and capability flags for a scoped rollback; retain the journal,
 existing native events and the union-aware binary. Do not blindly downgrade to
@@ -56,7 +67,8 @@ The existing root-owned mode-0600 configuration may contain:
     "historySeconds": 300,
     "overlapSeconds": 30,
     "staleSeconds": 120,
-    "finalizeSeconds": 4
+    "finalizeSeconds": 4,
+    "includeClassificationDetails": true
   }
 }
 ```

@@ -62,6 +62,10 @@ def settings(config):
             for name, camera in mapping.items()) or len(set(mapping.values())) != len(mapping):
         raise ValueError("invalid_frigate_camera_map")
     result = dict(value, url=value["url"].rstrip("/"))
+    include_details = value.get("includeClassificationDetails", True)
+    if type(include_details) is not bool:
+        raise ValueError("invalid_frigate_includeClassificationDetails")
+    result["includeClassificationDetails"] = include_details
     for name, default, low, high in (("pollSeconds", 2, 1, 30), ("historySeconds", 300, 30, 86400),
                                     ("overlapSeconds", 30, 5, 300), ("staleSeconds", 120, 10, 600),
                                     ("finalizeSeconds", 4, 1, 30)):

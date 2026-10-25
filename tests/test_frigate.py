@@ -127,6 +127,74 @@ class FusionTests(unittest.TestCase):
         self.assertEqual(len(value["provenance"]["sourceIntervals"]), 16)
         self.assertEqual(value["provenance"]["classificationDetails"], {"vehicleType": ["bike", "bus", "motorcycle"]})
 
+    def test_new_generic_inputs_keep_their_policy_after_restart_and_class_change(self):
+        self.j.fusion.options["includeClassificationDetails"] = False
+        self.j.fusion.frigate(CAMERA, batch([item("generic", label="dog", end=8000)]))
+        before = self.sync()[0]
+        self.assertEqual(before["classes"], ["animal"])
+        self.assertNotIn("classificationDetails", before["provenance"])
+        self.j.close()
+        self.j = Journal(self.path)
+        self.addCleanup(self.j.close)
+        self.j.enable_fusion([CAMERA], options())  # Default is enabled again.
+        self.j.fusion.frigate(CAMERA, batch([item("generic", label="cat", end=8000)], at=40000))
+        refreshed = self.sync(40000)[0]
+        self.assertEqual(refreshed["eventId"], before["eventId"])
+        self.assertNotIn("classificationDetails", refreshed["provenance"])
+        self.j.fusion.frigate(CAMERA, batch([
+            item("generic", label="bus", end=8000),
+            item("new-detailed", label="bird", start=20000, end=28000)], at=50000))
+        values = self.sync(50000)
+        vehicle = next(value for value in values if value["classes"] == ["vehicle"])
+        self.assertNotIn("classificationDetails", vehicle["provenance"])
+        detailed = next(value for value in values if value["start"] == START + 20000)
+        self.assertEqual(detailed["provenance"]["classificationDetails"], {"animalType": ["bird"]})
+        policies = [json.loads(row[0])["includeClassificationDetails"] for row in self.j.db.execute(
+            "SELECT provenance FROM fusion_inputs WHERE source='frigate' AND source_id='generic'")]
+        self.assertEqual(policies, [False, False])
+
+    def test_disabling_future_details_preserves_legacy_history_and_delivery(self):
+        self.j.fusion.frigate(CAMERA, batch([item("legacy", label="cat", end=8000)]))
+        value = self.sync()[0]
+        # Represent a journal produced before the policy field existed.
+        raw = json.loads(self.j.db.execute("SELECT provenance FROM fusion_inputs WHERE source_id='legacy'").fetchone()[0])
+        del raw["includeClassificationDetails"]
+        meta = copy.deepcopy(value["provenance"])
+        del meta["sourceIntervals"][0]["details"]["includeClassificationDetails"]
+        with self.j.db:
+            self.j.db.execute("UPDATE fusion_inputs SET provenance=? WHERE source_id='legacy'", (json.dumps(raw),))
+            self.j.db.execute("UPDATE intervals SET provenance=? WHERE id=?", (json.dumps(meta), value["eventId"]))
+        self.j.acknowledge(value["eventId"], value["revision"], "delivered")
+        self.j.acknowledge(value["eventId"], value["revision"], "notified")
+        columns = "id,start,end,provenance,revision,delivered_revision,notified_revision"
+        before = self.j.db.execute("SELECT " + columns + " FROM intervals WHERE id=?", (value["eventId"],)).fetchone()
+        self.j.fusion.options["includeClassificationDetails"] = False
+        self.j.fusion.frigate(CAMERA, batch([
+            item("legacy", label="cat", end=8000),
+            item("new-generic", label="dog", start=20000, end=28000)], at=50000))
+        self.j.fusion.dirty(CAMERA, "animal", START)  # Rebuild old history too.
+        values = self.sync(50000)
+        after = self.j.db.execute("SELECT " + columns + " FROM intervals WHERE id=?", (value["eventId"],)).fetchone()
+        self.assertEqual(after, before)
+        new = next(row for row in values if row["start"] == START + 20000)
+        self.assertEqual(new["classes"], ["animal"])
+        self.assertNotIn("classificationDetails", new["provenance"])
+        self.j.fusion.frigate(CAMERA, batch([item("legacy", label="bus", end=8000)], at=60000))
+        changed = self.sync(60000)
+        vehicle = next(row for row in changed if row["classes"] == ["vehicle"])
+        self.assertEqual(vehicle["provenance"]["classificationDetails"], {"vehicleType": ["bus"]})
+
+    def test_new_generic_member_does_not_strip_existing_component_details(self):
+        self.j.fusion.frigate(CAMERA, batch([item("old-cat", label="cat", end=20000)]))
+        before = self.sync()[0]
+        self.j.fusion.options["includeClassificationDetails"] = False
+        self.j.fusion.frigate(CAMERA, batch([item("new-dog", label="dog", start=5000, end=10000)], at=40000))
+        after = self.sync(40000)[0]
+        self.assertEqual((after["eventId"], after["start"], after["end"]),
+                         (before["eventId"], before["start"], before["end"]))
+        self.assertEqual(after["provenance"]["classificationDetails"], {"animalType": ["cat"]})
+        self.assertEqual(after["provenance"]["sourceIntervalCount"], 2)
+
     def test_historical_detail_refresh_does_not_change_any_source_watermark(self):
         self.j.fusion.frigate(CAMERA, batch([item(label="bird", end=8000)]))
         before = self.sync()[0]
@@ -458,6 +526,18 @@ class FrigateHttpTests(unittest.TestCase):
             value = config()
             value["frigate"] = dict(options(), **change)
             with self.assertRaises(ValueError):
+                validate_config(value)
+
+    def test_classification_detail_setting_defaults_on_and_requires_boolean(self):
+        self.assertIs(options()["includeClassificationDetails"], True)
+        for enabled in (True, False):
+            value = config()
+            value["frigate"] = dict(options(), includeClassificationDetails=enabled)
+            self.assertIs(settings(value)["includeClassificationDetails"], enabled)
+        for invalid in (None, 0, 1, "false", [], {}):
+            value = config()
+            value["frigate"] = dict(options(), includeClassificationDetails=invalid)
+            with self.assertRaisesRegex(ValueError, "invalid_frigate_includeClassificationDetails"):
                 validate_config(value)
 
 

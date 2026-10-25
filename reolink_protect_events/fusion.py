@@ -194,6 +194,18 @@ class Fusion:
                         "acceptanceBasis": item["acceptanceBasis"], "classificationInferred": True,
                         "timeBasis": "frigate_event_utc", "endIsTimeoutEstimate": False,
                         "closureReason": "frigate_end" if item["end"] is not None else None}
+                # Latch the policy when this source ID first contributes a
+                # supported class. Refreshes and class corrections retain it.
+                # Legacy inputs implicitly enabled details; leave their absent
+                # field absent so history reconstruction stays byte-stable.
+                prior_policy = self.db.execute("SELECT provenance FROM fusion_inputs WHERE camera=? AND source='frigate' AND source_id=? ORDER BY rowid LIMIT 1",
+                                               (camera, item["id"])).fetchone()
+                if prior_policy is None:
+                    meta["includeClassificationDetails"] = self.options.get("includeClassificationDetails", True)
+                else:
+                    prior_meta = json.loads(prior_policy[0])
+                    if "includeClassificationDetails" in prior_meta:
+                        meta["includeClassificationDetails"] = prior_meta["includeClassificationDetails"]
                 for row in self.db.execute("SELECT camera,source,source_id,class,start,last_seen,provenance FROM fusion_inputs WHERE camera=? AND source='frigate' AND source_id=? AND class<>? AND end IS NULL", (camera, item["id"], item["class"])).fetchall():
                     self._close(row, at, "frigate_classification_changed")
                 prior = self.db.execute("SELECT start,end FROM fusion_inputs WHERE camera=? AND source='frigate' AND source_id=? AND class=?", (camera, item["id"], item["class"])).fetchone()
@@ -294,7 +306,7 @@ class Fusion:
                         if not audio:
                             for item in relevant:
                                 details = json.loads(item[4])
-                                if item[0] == "frigate":
+                                if item[0] == "frigate" and details.get("includeClassificationDetails", True):
                                     for key, values in classification_details(details.get("sourceLabel")).items():
                                         detail_values.setdefault(key, set()).update(values)
                         if detail_values:
