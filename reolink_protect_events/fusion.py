@@ -68,7 +68,7 @@ class Fusion:
                     from .runtime import source_classes, timestamp_ms
                     rows = self.db.execute("SELECT seq,payload FROM sources WHERE camera=? AND instance=? AND seq>? ORDER BY seq", (camera, current["instance"], saved[1] if saved[0] == current["instance"] else 0)).fetchall()
                     events = [json.loads(row[1]) for row in rows]
-                    validated = [(row[0], timestamp_ms(item["timestampUtc"]), item["source"]["connectionEpoch"], item, source_classes(item)) for row, item in zip(rows, events)]
+                    validated = [(row[0], timestamp_ms(item["timestampUtc"]), item["source"]["connectionEpoch"], item, source_classes(item) & self.journal.reolink_classes) for row, item in zip(rows, events)]
                     replay = {"instanceId": current["instance"], "oldestSeq": rows[0][0] if rows else current["seq"] + 1,
                               "currentSeq": current["seq"], "events": events}
                     if current["epoch"] is not None:

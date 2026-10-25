@@ -74,6 +74,14 @@ The existing root-owned mode-0600 configuration may contain:
 ```
 
 This is a partial configuration, retaining the existing bridges and credentials.
+The optional top-level `reolinkClasses` setting restricts future camera-AI imports,
+for example `"reolinkClasses": ["person", "animal", "vehicle"]` omits Reolink
+baby-cry imports. It accepts a unique list of supported generic class names;
+an explicit empty list omits all new Reolink classifications. Omitting the
+setting preserves all formerly supported classes. Original camera pushes,
+sequence cursors and clear messages are still consumed and retained. Closed
+historical intervals and their existing native events are not rewritten. This
+does not change the camera's own detection configuration or Frigate classes.
 Every target camera must already be in the bridge list. The interface uses
 numeric HTTP(S) hosts, no redirects, no proxy environment and no credentials in
 URLs. Tokens never enter event provenance, logs or command arguments. Use a

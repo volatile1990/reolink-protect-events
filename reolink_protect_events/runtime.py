@@ -51,6 +51,17 @@ def source_classes(event):
         RAW_CLASSES[x.strip().lower()] for x in raw if isinstance(x, str) and x.strip().lower() in RAW_CLASSES}
 
 
+def reolink_class_settings(config):
+    """Optional publication allowlist; original camera pushes remain intact."""
+    if "reolinkClasses" not in config:
+        return CLASSES
+    value = config["reolinkClasses"]
+    if (type(value) is not list or any(type(label) is not str or label not in CLASSES for label in value)
+            or len(set(value)) != len(value)):
+        raise ValueError("invalid_reolink_classes")
+    return frozenset(value)
+
+
 def grouping_settings(config):
     """Explicit opt-in, bounded visual presentation; audio stays independent."""
     value = config.get("eventGrouping")
@@ -93,6 +104,7 @@ def validate_config(config):
     from .frigate import settings as frigate_settings
     frigate_settings(config)
     grouping_settings(config)
+    reolink_class_settings(config)
     from .remote import settings as remote_settings
     remote_settings(config)
     return config
@@ -144,12 +156,13 @@ def recording_thumbnail(config, interval):
 
 
 class Journal:
-    def __init__(self, path, stale_seconds=120):
+    def __init__(self, path, stale_seconds=120, *, reolink_classes=None):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(str(path), timeout=10)
         os.chmod(path, 0o600)
         self.stale_ms = stale_seconds * 1000
+        self.reolink_classes = CLASSES if reolink_classes is None else frozenset(reolink_classes)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.executescript("""
@@ -248,7 +261,7 @@ class Journal:
             epoch = event.get("source", {}).get("connectionEpoch")
             if type(epoch) is not int or epoch < 0:
                 raise ValueError("invalid_source_epoch")
-            validated.append((sequence, at, epoch, event, source_classes(event)))
+            validated.append((sequence, at, epoch, event, source_classes(event) & self.reolink_classes))
             prior_seq = sequence
         if self.fusion is not None and camera in self.fusion.cameras:
             self.fusion.reolink(bridge, response, validated)
@@ -470,7 +483,8 @@ class Runtime:
     def __init__(self, config, root, capture_only=False, background_native=True, public_status=None):
         self.config = validate_config(config)
         self.root = Path(root)
-        self.journal = Journal(self.root / "journal.sqlite3", config.get("bridgeEventStaleSeconds", 120))
+        self.journal = Journal(self.root / "journal.sqlite3", config.get("bridgeEventStaleSeconds", 120),
+                               reolink_classes=reolink_class_settings(config))
         from .frigate import settings as frigate_settings
         self.frigate_config = frigate_settings(config)
         if self.frigate_config is not None:
