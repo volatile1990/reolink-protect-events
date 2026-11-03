@@ -39,3 +39,11 @@ The motivating incident on 3 November 2026 was a Protect 7.3.70 to 7.3.74 update
 Seven cameras and all fourteen recording ranges continued to advance, while old
 version checks stopped monitor samples and native event delivery. The checks
 above replace those version-based operational gates.
+
+Validation for source `262d277`: the full local Windows suite passed; Linux
+discovered 813 Python cases (31 expected skips), compilation, both archive syntax
+checks and 24 archive tests passed on the existing household server. Additional
+read-only live checks verified 22 UBV profiles, fourteen advancing recording
+ranges, twelve new recordings with actual video/PCM decoding, twelve Controls
+GETs and thirteen checks of an actually published native event. Media and decoder
+logs stayed in RAM. Tests ran locally or on existing owned hosts.
