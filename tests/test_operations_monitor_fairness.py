@@ -107,7 +107,7 @@ class FairMonitorTests(unittest.TestCase):
 
     def test_pin_drift_does_not_override_successful_startup_probes(self):
         self.config['fmp4Startup']={'enabled':True}
-        with patch.object(monitor,'verify_fmp4_configuration',side_effect=OperationError('fmp4_configuration_drift')):
+        with patch('reolink_protect_events.operations.fmp4.verify_configuration',side_effect=OperationError('fmp4_configuration_drift')):
             for i in range(13):
                 self.at=self.now+i*50000
                 report=self.sample(allow_repair=True,recover=lambda *_a,**_kw:self.fail('config drift cannot repair'))

@@ -54,7 +54,7 @@ def movie_metadata(payload):
     tracks, defaults = {}, {}
     for kind, body in boxes(payload):
         if kind == b"trak":
-            track_id, scale, handler = None, None, None
+            track_id, scale, handler, codec, sample_rate = None, None, None, None, None
             for child, value in boxes(body):
                 if child == b"tkhd":
                     if not value or value[0] not in (0, 1):
@@ -70,10 +70,27 @@ def movie_metadata(payload):
                             if len(md) < 12:
                                 raise ProbeError("invalid_bmff_metadata")
                             handler = bytes(md[8:12])
+                        elif media == b"minf":
+                            for table, table_body in boxes(md):
+                                if table != b"stbl":continue
+                                for description, description_body in boxes(table_body):
+                                    if description != b"stsd":continue
+                                    if len(description_body) < 8:
+                                        raise ProbeError('invalid_sample_description')
+                                    entries = list(boxes(description_body[8:]))
+                                    if u32(description_body, 4) != len(entries):
+                                        raise ProbeError('invalid_sample_description')
+                                    if len(entries) == 1 and entries[0][0] == b"mp4a":
+                                        entry = entries[0][1]
+                                        # Version-0 AudioSampleEntry has a 16.16
+                                        # sample rate at byte24 of its body.
+                                        if len(entry) >= 28 and bytes(entry[8:10]) == b'\0\0':
+                                            codec = 'mp4a';sample_rate = u32(entry, 24) >> 16
             if track_id is not None and scale and handler in (b"vide", b"soun"):
                 if len(tracks) >= 16 or track_id in tracks:
                     raise ProbeError("invalid_track_table")
-                tracks[track_id] = {"timescale": scale, "video": handler == b"vide"}
+                tracks[track_id] = {"timescale": scale, "video": handler == b"vide",
+                                    "codec": codec, "sampleRate": sample_rate}
         elif kind == b"mvex":
             for child, value in boxes(body):
                 if child == b"trex":
@@ -129,6 +146,7 @@ def fragment_metadata(payload, defaults):
         else:
             raise ProbeError("unsupported_tfdt")
         total_duration, sample_bytes, samples = 0, 0, 0
+        minimum_duration, maximum_duration = None, 0
         presentation_first, presentation_min, presentation_end = None, None, None
         for child, value in children:
             if child != b"trun":
@@ -173,6 +191,8 @@ def fragment_metadata(payload, defaults):
                 presentation_min = presentation if presentation_min is None else min(presentation_min, presentation)
                 presentation_end = presentation + duration if presentation_end is None else max(presentation_end, presentation + duration)
                 total_duration += duration
+                minimum_duration = duration if minimum_duration is None else min(minimum_duration,duration)
+                maximum_duration = max(maximum_duration,duration)
                 sample_bytes += size
                 samples += 1
             if offset != len(value):
@@ -182,6 +202,7 @@ def fragment_metadata(payload, defaults):
             fragments.append({"trackId": track_id, "decodeStart": decode_start,
                               "decodeEnd": decode_start + total_duration,
                               "duration": total_duration, "samples": samples, "declaredSampleBytes": sample_bytes,
+                              "minimumSampleDuration": minimum_duration, "maximumSampleDuration": maximum_duration,
                               "presentationFirst": presentation_first, "presentationMin": presentation_min,
                               "presentationEnd": presentation_end})
     return fragments
@@ -524,14 +545,24 @@ class StartupClock:
                 state = self.stats.setdefault(tid, {'trackId': tid, 'kind': 'video' if info['video'] else 'audio',
                     'timescale': scale, 'fragments': 0, 'samples': 0, 'first': fragment['decodeStart'],
                     'end': fragment['decodeStart'], 'duration': 0, 'firstWall': now, 'lastWall': now,
-                    'clockGaps': 0, 'clockOverlaps': 0, 'maximumFragmentDurationSeconds': 0})
+                    'clockGaps': 0, 'clockOverlaps': 0, 'maximumFragmentDurationSeconds': 0,
+                    'maximumGap': 0, 'maximumOverlap': 0, 'clockShift': 0,
+                    'maximumClockShift': 0, 'absoluteCorrections': 0,
+                    'minimumSampleDuration': fragment['minimumSampleDuration'], 'maximumSampleDuration': 0})
                 if state['fragments']:
                     delta = fragment['decodeStart'] - state['end']
                     state['clockGaps'] += int(delta > 0)
                     state['clockOverlaps'] += int(delta < 0)
+                    state['maximumGap'] = max(state['maximumGap'],delta)
+                    state['maximumOverlap'] = max(state['maximumOverlap'],-delta)
+                    state['clockShift'] += delta
+                    state['maximumClockShift'] = max(state['maximumClockShift'],abs(state['clockShift']))
+                    state['absoluteCorrections'] += abs(delta)
                 state['fragments'] += 1; state['samples'] += fragment['samples']
                 state['end'] = fragment['decodeEnd']; state['duration'] += fragment['duration']
                 state['lastWall'] = now
+                state['minimumSampleDuration'] = min(state['minimumSampleDuration'],fragment['minimumSampleDuration'])
+                state['maximumSampleDuration'] = max(state['maximumSampleDuration'],fragment['maximumSampleDuration'])
                 state['maximumFragmentDurationSeconds'] = max(state['maximumFragmentDurationSeconds'],fragment['duration']/scale)
             self.pending = None
 
@@ -539,11 +570,39 @@ class StartupClock:
         rows = []
         for state in self.stats.values():
             scale = state['timescale']; span = (state['end'] - state['first']) / scale
+            info = self.tracks[state['trackId']]
+            duration = state['minimumSampleDuration'];rate = info.get('sampleRate')
+            aac_blocks = (state['kind'] == 'audio' and info.get('codec') == 'mp4a'
+                and type(rate) is int and 8000 <= rate <= 192000
+                and duration == state['maximumSampleDuration']
+                and duration * rate in (960 * scale,1024 * scale))
+            # Only small sub-block AAC timestamp corrections are tolerated for
+            # functional health. At16kHz/1024 samples:4ms per edge,8ms drift,
+            # 20ms total movement. Video/unknown audio retain zero tolerance.
+            edge_limit = min(scale * .005,duration / 16) if aac_blocks else 0
+            drift_limit = min(scale * .010,duration / 8) if aac_blocks else 0
+            movement_limit = min(scale * .020,duration / 2) if aac_blocks else 0
             rows.append({k: state[k] for k in ('trackId', 'kind', 'timescale', 'fragments', 'samples',
                                                'clockGaps', 'clockOverlaps', 'maximumFragmentDurationSeconds')})
             rows[-1].update(initialClockOrigin='epoch' if state['first'] / scale >= 1_000_000_000 else 'relative',
                 firstDecodeSeconds=state['first'] / scale, mediaSpanSeconds=span,
                 summedDurationSeconds=state['duration'] / scale,
+                audioCodec=info.get('codec')if state['kind']=='audio'else None,
+                audioSampleRate=rate if state['kind']=='audio'else None,
+                minimumSampleDurationSeconds=duration / scale,
+                maximumSampleDurationSeconds=state['maximumSampleDuration'] / scale,
+                maximumClockGapSeconds=state['maximumGap'] / scale,
+                maximumClockOverlapSeconds=state['maximumOverlap'] / scale,
+                cumulativeClockShiftSeconds=state['clockShift'] / scale,
+                maximumCumulativeClockShiftSeconds=state['maximumClockShift'] / scale,
+                totalAbsoluteClockCorrectionsSeconds=state['absoluteCorrections'] / scale,
+                correctionLimitSeconds=edge_limit / scale,
+                cumulativeDriftLimitSeconds=drift_limit / scale,
+                totalCorrectionLimitSeconds=movement_limit / scale,
+                functionalClockCorrectionsValid=bool(state['maximumGap'] <= edge_limit
+                    and state['maximumOverlap'] <= edge_limit
+                    and state['maximumClockShift'] <= drift_limit
+                    and state['absoluteCorrections'] <= movement_limit),
                 observedSpanSeconds=state['lastWall'] - state['firstWall'],
                 lastFragmentAgeSeconds=max(0, ended - state['lastWall']),
                 freshnessBudgetSeconds=max(3,min(5,state['maximumFragmentDurationSeconds']+1))if self.full_gop else 3)
@@ -565,6 +624,11 @@ class StartupClock:
                 and 2 <= s['mediaSpanSeconds'] <= 20
                 and abs(s['mediaSpanSeconds'] - s['summedDurationSeconds']) <= 1 / s['timescale'] + 1e-6
                 for s in rows),
+            'functionalTimeline': bool(rows) and all(s['fragments'] >= 2 and s['samples'] >= 5
+                and s['initialClockOrigin'] == self.expected_origin and 2 <= s['mediaSpanSeconds'] <= 20
+                and s['functionalClockCorrectionsValid']
+                and abs(s['mediaSpanSeconds'] - s['summedDurationSeconds'] - s['cumulativeClockShiftSeconds'])
+                    <= 1 / s['timescale'] + 1e-6 for s in rows),
             'freshProgress': bool(rows) and all(s['observedSpanSeconds'] >= 2 and s['lastFragmentAgeSeconds'] <= s['freshnessBudgetSeconds']
                                                for s in rows),
             'overlappingTrackClocks': not expected_audio or bool(video and audio) and
@@ -645,10 +709,13 @@ def probe_fmp4(config, camera, channel, *, seconds=12, api=None, connector=None,
     ended = observed_ended if observed_ended is not None else clock()
     tracks, checks = collector.result(ended, camera.get('thirdPartyCameraInfo', {}).get('enableRtspAudio') is True) \
         if collector else ([], {'video': False, 'audio': False, 'samplePayloadSizes': False, 'continuousFromFirstFragment': False,
-                              'freshProgress': False, 'overlappingTrackClocks': False})
+                              'functionalTimeline': False, 'freshProgress': False, 'overlappingTrackClocks': False})
     checks['transport'] = failure is None
     checks['effectiveFlags'] = returned == flags
-    return {'ok': all(checks.values()), 'channel': channel, 'requestedSeconds': seconds,
+    # Exact continuity remains visible for diagnostics. Functional media health
+    # separately rejects malformed, stale, misclocked or materially jumping media.
+    return {'ok': all(value for name,value in checks.items()if name!='continuousFromFirstFragment'),
+        'channel': channel, 'requestedSeconds': seconds,
         'checks': checks, 'errorCode': failure, 'tracks': tracks, 'effectiveBrowserFlags': flags,
         'nativePlayFlags': returned, 'firstByteSeconds': first - started if first is not None else None,
         'receivedBytesDiscardedOrMetadataParsed': received,

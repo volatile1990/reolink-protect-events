@@ -32,7 +32,7 @@ class MediaConfigurationAlert(unittest.TestCase):
     def test_hash_drift_alone_stays_healthy_without_operator_alarm(self):
         def startup(*_args,**_kwargs):
             self.startup_calls.append(True);return {'ok':True}
-        with patch.object(monitor,'verify_fmp4_configuration',side_effect=OperationError('fmp4_configuration_drift')) as pins:
+        with patch('reolink_protect_events.operations.fmp4.verify_configuration',side_effect=OperationError('fmp4_configuration_drift')) as pins:
             for index in range(13):
                 self.at=self.now+index*50000;report=self.sample(startup)
         self.assertEqual(report['state'],'healthy');self.assertFalse(report['actionRequired'])
@@ -59,35 +59,42 @@ class MediaConfigurationAlert(unittest.TestCase):
         projected=public_status.projection(report)
         self.assertFalse(projected['actionRequired']);self.assertEqual(projected['alerts'],[])
 
-    def test_pin_verification_remains_at_actual_recovery_boundary(self):
+    def test_unrelated_nginx_hashes_do_not_gate_confirmed_force_tcp_recovery(self):
         boot=copy.deepcopy(self.boot)
         for camera in boot['cameras']:
             camera['stats']['video']={'recordingEnd':self.now-600000,'recordingEndLQ':self.now-600000}
-        with patch.object(monitor,'verify_fmp4_configuration',side_effect=OperationError('fmp4_configuration_drift')) as pins:
-            for index in range(4):
+        repairs=[]
+        def recover(_config,_root,camera_id,**_kwargs):
+            repairs.append(camera_id)
+            return {'ok':False,'attempted':False,'restoredOriginalTcp':False,'errorCode':'fixture_contract_not_ready'}
+        with patch('reolink_protect_events.operations.fmp4.verify_configuration',side_effect=OperationError('fmp4_configuration_drift')) as pins:
+            for index in range(3):
                 report=monitor.run_once(self.config,self.root,now_ms=self.now+index*30000,
                     startup_at_ms=self.now-120000,api=lambda *_a,**_k:copy.deepcopy(boot),fetch=metrics,
                     probe=lambda *_a,**_kw:{'ok':True},allow_repair=True,
-                    recover=lambda *_a,**_kw:self.fail('unverified mutation contract cannot dispatch'))
-        self.assertTrue(pins.called)
-        self.assertFalse(report['fmp4ConfigurationVerified'])
-        self.assertFalse(report['quickHealthy']);self.assertEqual(report['state'],'attention')
+                    recover=recover)
+        pins.assert_not_called()
+        self.assertIsNone(report['fmp4ConfigurationVerified'])
+        self.assertEqual(len(repairs),1)
+        self.assertIn(repairs[0],{row['cameraId']for row in report['cameras']})
+        self.assertFalse(report['quickHealthy'])
         self.assertTrue(any(row['confirmedFailure']for row in report['cameras']))
-        self.assertFalse(any(row['repairEligible']for row in report['cameras']))
+        self.assertTrue(any(row['repairEligible']for row in report['cameras']))
         self.assertNotIn('media_configuration_requires_review',[value['code']for value in report['alerts']])
-        self.assertTrue(report['actionRequired'])
-        self.assertIn('recorder_media_requires_attention',[value['code']for value in report['alerts']])
+        state=json.loads((self.root/'state.json').read_text())
+        self.assertEqual(len(state['cameras'][repairs[0]]['repairAttempts']),1)
 
-    def test_confirmed_ubv_failure_alerts_when_hash_gate_blocks_recovery(self):
+    def test_confirmed_ubv_failure_alerts_when_recovery_is_disabled(self):
         bad=self.config['bridges'][0]['cameraId']
-        with patch.object(monitor,'verify_fmp4_configuration',side_effect=OperationError('fmp4_configuration_drift')):
+        with patch('reolink_protect_events.operations.fmp4.verify_configuration',side_effect=OperationError('fmp4_configuration_drift')) as pins:
             for index in range(25):
                 self.at=self.now+index*30000
                 report=monitor.run_once(self.config,self.root,now_ms=self.at,startup_at_ms=self.now-120000,
                     api=self.api,fetch=metrics,
                     probe=lambda _config,camera,_channel,**_kwargs:{'ok':camera['id']!=bad},
-                    startup_probe=lambda *_a,**_kw:{'ok':True},allow_repair=True,
-                    recover=lambda *_a,**_kw:self.fail('unverified recovery must not dispatch'))
+                    startup_probe=lambda *_a,**_kw:{'ok':True},allow_repair=False,
+                    recover=lambda *_a,**_kw:self.fail('disabled recovery must not dispatch'))
+        pins.assert_not_called()
         row=next(row for row in report['cameras']if row['cameraId']==bad)
         self.assertTrue(row['protectHealthy'])
         self.assertTrue(row['sourceHealthy'])

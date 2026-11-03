@@ -15,8 +15,8 @@ versions. A Protect update or changed vendor-file hash is not a camera failure.
   remain available as `legacyPatchOwnership` diagnostics without disabling an
   otherwise functional event adapter.
 - Recovery requires real, repeated media failures and retains its identity,
-  settings, lease, restoration and attempt-budget checks. Read-only media checks
-  remain available when a recovery-specific mutation prerequisite is absent.
+  settings, lease, restoration and attempt-budget checks. Complete nginx-file
+  hashes do not authorize or block the narrowly scoped `forceTcp` transaction.
 - Reapplying an owned vendor adaptation requires one unambiguous original or
   already-applied anchor per transformation. Whole vendor-file hashes and package
   versions do not determine whether that local transformation applies. Ambiguous
@@ -25,6 +25,15 @@ versions. A Protect update or changed vendor-file hash is not a camera failure.
 An actual stream failure, stalled recorder, failed event publication or broken
 control request is reported for its affected function. A healthy function is not
 marked failed merely because another integration component is unavailable.
+
+Strict fMP4 continuity remains visible as `checks.continuousFromFirstFragment`.
+Operational health uses `checks.functionalTimeline` together with real video,
+audio, payload-size, freshness, overlapping-clock, transport and effective-flag
+checks. Only proven `mp4a` audio with consistent 960/1024-sample blocks permits
+small timestamp corrections. At 16 kHz with 1024 samples the bounds are 4 ms per
+correction, 8 ms maximum accumulated drift and 20 ms total corrections in the
+bounded probe. Video and unknown audio retain exact continuity. Large or repeated
+jumps, wrong clock origin, missing audio, stalls and malformed payloads fail.
 
 The motivating incident on 3 November 2026 was a Protect 7.3.70 to 7.3.74 update.
 Seven cameras and all fourteen recording ranges continued to advance, while old

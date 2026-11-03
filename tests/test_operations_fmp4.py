@@ -49,6 +49,34 @@ def stream(*,extended=True,audio=True,first_relative=False,relative=False,backwa
         else:values.append(moof+mdat)
     return values
 
+
+def aac_stream(shifts_ms,*,rate=16000,extended=True,audio_codec=b'mp4a',video_shifts_ms=None):
+    """Real AAC-block durations; shifts describe absolute fragment clock offsets."""
+    audio_count=round(rate/1024);tracks=[];defaults=[]
+    for tid,kind,scale,duration in ((1,b'vide',90000,4500),(2,b'soun',rate,1024)):
+        tkhd=box(b'tkhd',struct.pack('!IIII',0,0,0,tid))
+        media=box(b'mdhd',struct.pack('!IIII',0,0,0,scale))+box(b'hdlr',struct.pack('!II4s',0,0,kind))
+        if tid==2:
+            entry=b'\0'*24+struct.pack('!I',rate<<16)
+            media+=box(b'minf',box(b'stbl',box(b'stsd',struct.pack('!II',0,1)+box(audio_codec,entry))))
+        tracks.append(box(b'trak',tkhd+box(b'mdia',media)))
+        defaults.append(box(b'trex',struct.pack('!IIIIII',0,tid,1,duration,1,0)))
+    init=box(b'moov',b''.join(tracks)+box(b'mvex',b''.join(defaults)))
+    values=[frame(250,init)if extended else init]
+    for index in range(12):
+        trafs=[]
+        for tid,scale,count,elapsed,offset in (
+                (1,90000,20,index*90000,(video_shifts_ms or [0]*12)[index]),
+                (2,rate,audio_count,index*audio_count*1024,shifts_ms[index])):
+            start=EPOCH*scale//1000+elapsed+round(offset*scale/1000)
+            trafs.append(box(b'traf',box(b'tfhd',struct.pack('!II',0,tid))+
+                box(b'tfdt',struct.pack('!IQ',0x01000000,start))+
+                box(b'trun',struct.pack('!II',0,count))))
+        moof=box(b'moof',b''.join(trafs));mdat=box(b'mdat',b'x'*(20+audio_count))
+        values.append((frame(249,b'')+frame(251,moof)+frame(254,mdat[:8])+
+                       frame(252,mdat[8:])+frame(255,b''))if extended else moof+mdat)
+    return values
+
 class Clock:
     def __init__(self):self.now=0.
     def __call__(self):return self.now
@@ -105,6 +133,65 @@ class StartupProbeTests(unittest.TestCase):
         result,_,_=self.check(stream(first_relative=True))
         self.assertFalse(result['ok']);self.assertFalse(result['checks']['continuousFromFirstFragment'])
         self.assertTrue(any(t['clockGaps'] for t in result['tracks']))
+        self.assertFalse(result['checks']['functionalTimeline'])
+
+    def test_small_aac_corrections_are_diagnostic_without_failing_functional_media(self):
+        for extended in (True,False):
+            for shift in (-4,4):
+                with self.subTest(extended=extended,shift=shift):
+                    offsets=[0,0,0]+[shift]*9
+                    result,_,_=self.check(aac_stream(offsets,extended=extended))
+                    self.assertTrue(result['ok'],result)
+                    self.assertTrue(result['checks']['functionalTimeline'])
+                    self.assertFalse(result['checks']['continuousFromFirstFragment'])
+                    audio=next(row for row in result['tracks']if row['kind']=='audio')
+                    self.assertEqual(audio['audioCodec'],'mp4a')
+                    self.assertEqual(audio['audioSampleRate'],16000)
+                    self.assertEqual(audio['minimumSampleDurationSeconds'],.064)
+                    self.assertEqual(audio['correctionLimitSeconds'],.004)
+                    self.assertEqual(audio['cumulativeDriftLimitSeconds'],.008)
+                    self.assertEqual(audio['totalCorrectionLimitSeconds'],.020)
+                    self.assertEqual(audio['cumulativeClockShiftSeconds'],shift/1000)
+                    self.assertEqual(audio['totalAbsoluteClockCorrectionsSeconds'],.004)
+
+    def test_balanced_small_aac_jitter_preserves_strict_diagnostics(self):
+        result,_,_=self.check(aac_stream([0,0,4,0]+[0]*8))
+        self.assertTrue(result['ok'],result)
+        self.assertFalse(result['checks']['continuousFromFirstFragment'])
+        audio=next(row for row in result['tracks']if row['kind']=='audio')
+        self.assertEqual((audio['clockGaps'],audio['clockOverlaps']),(1,1))
+        self.assertEqual(audio['maximumClockGapSeconds'],.004)
+        self.assertEqual(audio['maximumClockOverlapSeconds'],.004)
+        self.assertEqual(audio['cumulativeClockShiftSeconds'],0)
+        self.assertEqual(audio['totalAbsoluteClockCorrectionsSeconds'],.008)
+
+    def test_large_single_or_accumulated_aac_corrections_fail_functional_health(self):
+        examples={'single_large':[0,0,0]+[100]*9,
+                  'above_block_fraction':[0,0,0]+[5]*9,
+                  'cumulative_excursion':[0,4,8,12,8]+[8]*7,
+                  'balanced_but_excessive_movement':[0,4]*6}
+        for label,offsets in examples.items():
+            with self.subTest(label=label):
+                result,_,_=self.check(aac_stream(offsets))
+                self.assertFalse(result['ok'])
+                self.assertFalse(result['checks']['functionalTimeline'])
+                self.assertTrue(result['checks']['video'])
+                self.assertTrue(result['checks']['audio'])
+                self.assertTrue(result['checks']['freshProgress'])
+
+    def test_aac_tolerance_scales_with_block_length_and_never_applies_to_video_or_unknown_audio(self):
+        offsets=[0,0,0]+[4]*9
+        result,_,_=self.check(aac_stream(offsets,rate=48000))
+        self.assertFalse(result['ok']);self.assertFalse(result['checks']['functionalTimeline'])
+        audio=next(row for row in result['tracks']if row['kind']=='audio')
+        self.assertAlmostEqual(audio['correctionLimitSeconds'],1024/48000/16)
+        result,_,_=self.check(aac_stream([0,0,0]+[1]*9,rate=48000))
+        self.assertTrue(result['ok'],result)
+        self.assertFalse(result['checks']['continuousFromFirstFragment'])
+        result,_,_=self.check(aac_stream(offsets,audio_codec=b'zzzz'))
+        self.assertFalse(result['ok']);self.assertFalse(result['checks']['functionalTimeline'])
+        result,_,_=self.check(aac_stream([0]*12,video_shifts_ms=offsets))
+        self.assertFalse(result['ok']);self.assertFalse(result['checks']['functionalTimeline'])
 
     def test_relative_partial_startup_requires_effective_flags_and_full_continuity(self):
         for extended in (True,False):

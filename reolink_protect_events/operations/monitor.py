@@ -11,7 +11,7 @@ from .media_health import inspect
 from .protect import selected_cameras,read_only_cameras
 from .safety import OperationError, ensure_root, error_code, maintenance, need, read_json, validate_config, write_json
 from .ubv import probe_ubv
-from .fmp4 import configuration as fmp4_configuration, verify_configuration as verify_fmp4_configuration, probe_fmp4
+from .fmp4 import configuration as fmp4_configuration, probe_fmp4
 from .maintenance_lease import reconcile as reconcile_maintenance,identity as boot_identity
 
 INTERVAL_MS=30000
@@ -146,8 +146,6 @@ def run_once(config,root,*,allow_repair=False,now_ms=None,startup_at_ms=None,api
     try:
         validate_config(config);state=_state(root,now_ms,startup_at_ms)
         startup_options=fmp4_configuration(config)
-        startup_configuration_ok=True
-        startup_configuration_checked=False
         known_ids={b['cameraId']for b in config['bridges']}|{b['cameraId']for b in config.get('readOnlyCameras',[])}
         need(set(state['cameras'])<=known_ids,'monitor_state_scope_changed')
         lease_state=reconcile_maintenance(root)
@@ -349,14 +347,10 @@ def run_once(config,root,*,allow_repair=False,now_ms=None,startup_at_ms=None,api
             row['recommendedAction']='review_native_camera'if native and row['confirmedFailure']else'wait_for_bridge_reconnect'if row['confirmedFailure']and not row['sourceHealthy']else'rebuild_native_stream'if row['confirmedFailure']else'review_fmp4_startup'if startup_bad else None
             eligible=bool(not native and allow_repair and pending_recovery is None and row['confirmedFailure']and row['sourceHealthy']
                 and type(row['source'].get('connectionEpoch'))is int and not cooldown and not row['budgetExhausted'])
-            # Read installation pins only at an actual mutation boundary. A
-            # failed metadata read must not delay or falsify healthy observation.
-            if eligible and startup_options['enabled']and not startup_configuration_checked:
-                startup_configuration_checked=True
-                try:verify_fmp4_configuration(startup_options, config)
-                except OperationError:startup_configuration_ok=False
-                report['fmp4ConfigurationVerified']=startup_configuration_ok
-            row['repairEligible']=eligible and startup_configuration_ok
+            # A forceTcp rebuild changes no Nginx configuration. Its actual
+            # identity/settings CAS, source/media checks and maintenance lease
+            # are enforced by recovery.rebuild in addition to these budgets.
+            row['repairEligible']=eligible
             if row['repairEligible']:repair_candidates.append(cid)
         # Persist the cooldown/attempt BEFORE any dispatch. Restarting the
         # service cannot reset rate limits or authorize another uncertain send.
