@@ -360,23 +360,46 @@ class FeaturePatch:
         self.guard_version()
         path = Path(manifest_path).resolve()
         manifest = json.loads(path.read_text(encoding="utf-8"))
-        if manifest.get("schemaVersion") != 1:
+        if not isinstance(manifest, dict) or type(manifest.get("schemaVersion")) is not int or manifest["schemaVersion"] != 1:
             raise FeatureError("Unknown patch manifest format")
-        allowed = {str(item.resolve()) for item in self.ui_paths + [self.service_path]}
+        try:
+            selected = camera_ids(manifest.get("cameraIds"))
+        except ValueError:
+            raise FeatureError("Patch manifest camera scope is invalid") from None
+        allowed = {"ui": {str(item.resolve()) for item in self.ui_paths},
+                   "all_ui_alarm_scope": {str(self.service_path.resolve())}}
+        files = manifest.get("files")
+        if not isinstance(files, list) or not files or len(files) > sum(len(paths) for paths in allowed.values()):
+            raise FeatureError("Patch manifest file scope is invalid")
         prepared = []
-        for item in manifest["files"]:
+        targets = set()
+        for item in files:
+            if not isinstance(item, dict) or item.get("kind") not in allowed:
+                raise FeatureError("Patch manifest kind is invalid")
             target = Path(item["path"])
             backup = (path.parent / item["backup"]).resolve()
-            if str(target.resolve()) not in allowed or backup.parent != path.parent or target.is_symlink():
+            identity = str(target.resolve())
+            if (identity not in allowed[item["kind"]] or identity in targets
+                    or backup.parent != path.parent or target.is_symlink()):
                 raise FeatureError("Patch manifest target or backup is outside the allowed paths")
+            targets.add(identity)
             original = backup.read_bytes()
             if sha256(original) != item["beforeSha256"]:
                 raise FeatureError("Patch backup differs from its owned receipt")
+            if sha256(patched_bytes(original, selected, item["kind"])) != item["afterSha256"]:
+                raise FeatureError("Patch receipt does not describe the owned transformation")
             current_hash = sha256(target.read_bytes())
             if current_hash not in (item["beforeSha256"], item["afterSha256"]):
                 raise FeatureError("Protect file changed; rollback must not overwrite it")
-            prepared.append((item, original))
-        for item, original in prepared:
+            info = target.stat()
+            if (type(item.get("mode")) is not int or item["mode"] != stat.S_IMODE(info.st_mode)
+                    or item.get("uid") != getattr(info, "st_uid", None)
+                    or item.get("gid") != getattr(info, "st_gid", None)):
+                raise FeatureError("Protect file ownership changed; rollback must not overwrite it")
+            prepared.append((item, original, current_hash))
+        for item, original, expected_hash in prepared:
+            if Path(item["path"]).is_symlink() or sha256(Path(item["path"]).read_bytes()) != expected_hash:
+                raise FeatureError("Protect patch target changed after rollback preflight")
             _atomic_write(item["path"], original, item["mode"], item["uid"], item["gid"])
         manifest["state"] = "rolled_back"
         _atomic_write(path, json.dumps(manifest, indent=2).encode(), 0o600)

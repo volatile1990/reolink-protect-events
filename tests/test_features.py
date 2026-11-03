@@ -1,3 +1,4 @@
+import copy
 import json
 from pathlib import Path
 import tempfile
@@ -75,6 +76,46 @@ class FeatureTests(unittest.TestCase):
         # Rollback preflights every target before restoring any target.
         self.assertNotEqual(self.ui.read_bytes(), self.ui_original)
         self.assertEqual(self.ui_alias.read_bytes(), b"later package update")
+
+    def test_rollback_requires_the_exact_owned_transformation_not_self_declared_hashes(self):
+        manifest = Path(self.patch.apply(IDS, self.root / "backups"))
+        parsed = json.loads(manifest.read_text())
+        before = {path: path.read_bytes() for path in (self.ui, self.ui_alias, self.service)}
+        item = parsed["files"][0]
+        forged = b"unrelated vendor bytes must never replace the current UI"
+        (manifest.parent / item["backup"]).write_bytes(forged)
+        item["beforeSha256"] = sha256(forged)
+        item["afterSha256"] = sha256(self.ui.read_bytes())
+        manifest.write_text(json.dumps(parsed))
+        with self.assertRaises(FeatureError):
+            self.patch.rollback(manifest)
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+
+    def test_rollback_rejects_changed_camera_scope_kind_duplicate_target_and_metadata(self):
+        manifest = Path(self.patch.apply(IDS, self.root / "backups"))
+        original = json.loads(manifest.read_text())
+        before = {path: path.read_bytes() for path in (self.ui, self.ui_alias, self.service)}
+        mutations = [lambda value: value.update(cameraIds=["f" * 24]),
+                     lambda value: value.update(cameraIds=[]),
+                     lambda value: value["files"][0].update(kind="unknown"),
+                     lambda value: value["files"][0].update(kind="all_ui_alarm_scope"),
+                     lambda value: value["files"].__setitem__(1, copy.deepcopy(value["files"][0])),
+                     lambda value: value["files"][0].update(mode=0o777)]
+        for mutate in mutations:
+            value = copy.deepcopy(original); mutate(value)
+            manifest.write_text(json.dumps(value))
+            with self.subTest(mutation=mutate), self.assertRaises(FeatureError):
+                self.patch.rollback(manifest)
+            self.assertEqual({path: path.read_bytes() for path in before}, before)
+
+    def test_equivalent_new_vendor_bundle_can_apply_and_rollback_without_version_pin(self):
+        updated = self.ui_original.replace(b"qq=", b"q0=") + b";let unrelated=1;"
+        for target in (self.ui, self.ui_alias):target.write_bytes(updated)
+        self.patch.version_reader = lambda: "8.0.0"
+        manifest = self.patch.apply(IDS, self.root / "backups")
+        self.patch.rollback(manifest)
+        self.assertEqual(self.ui.read_bytes(), updated)
+        self.assertEqual(self.ui_alias.read_bytes(), updated)
 
     def test_invalid_identity_and_manifest_paths_fail(self):
         for ids in ([], IDS + [IDS[0]], ["not-an-id"], ["a\"].includes(e.id)||true"]):
