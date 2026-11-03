@@ -62,6 +62,37 @@ class DeadlineTests(unittest.TestCase):
                     else:
                         with self.assertRaises(w.ControlError):w.read_body(reply,deadline,limit)
 
+    def test_complete_connection_close_json_does_not_reuse_closed_socket(self):
+        body=json.dumps({'schemaVersion':1,'values':{'description':'x'*22700}}).encode()
+        head=b'HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: '+str(len(body)).encode()+b'\r\n\r\n'
+        with backend([head+body],0)as url:
+            with w.backend_reply(urllib.request.Request(url),1)as(reply,deadline):
+                self.assertTrue(reply.will_close)
+                self.assertEqual(w.read_body(reply,deadline),body)
+
+    def test_truncated_connection_close_response_is_rejected(self):
+        body=b'{"schemaVersion":1,"values":{}}'
+        head=b'HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: '+str(len(body)+10).encode()+b'\r\n\r\n'
+        with backend([head+body],0)as url:
+            with w.backend_reply(urllib.request.Request(url),1)as(reply,deadline):
+                with self.assertRaises(w.ControlError)as error:w.read_body(reply,deadline)
+                self.assertEqual(error.exception.code,'camera_control_truncated_response')
+
+    def test_complete_chunked_connection_close_response_succeeds(self):
+        body=b'{"schemaVersion":1,"values":{}}'
+        head=b'HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n'
+        framed=format(len(body),'x').encode()+b'\r\n'+body+b'\r\n0\r\n\r\n'
+        with backend([head+framed],0)as url:
+            with w.backend_reply(urllib.request.Request(url),1)as(reply,deadline):
+                self.assertEqual(w.read_body(reply,deadline),body)
+
+    def test_truncated_chunked_response_is_rejected(self):
+        head=b'HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n'
+        with backend([head+b'20\r\n{}\r\n'],0)as url:
+            with w.backend_reply(urllib.request.Request(url),1)as(reply,deadline):
+                with self.assertRaises((w.ControlError,http.client.HTTPException,OSError)):
+                    w.read_body(reply,deadline)
+
     def test_incoming_stalls_are_bounded_and_handler_slots_reclaimed(self):
         class Echo(socketserver.BaseRequestHandler):
             def handle(self):

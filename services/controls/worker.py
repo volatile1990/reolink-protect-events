@@ -139,10 +139,20 @@ def read_body(response,deadline,limit=MAX_RESPONSE):
     read=getattr(response,'read1',response.read)
     while True:
         if time.monotonic()>=deadline:raise ControlError('camera_control_timeout',504)
+        # HTTPResponse closes its file (and a Connection: close socket) once
+        # Content-Length has been consumed. Do not touch that retired socket
+        # just to discover EOF on the following iteration.
+        if getattr(response,'isclosed',lambda:False)():
+            if getattr(response,'length',None) not in(None,0):
+                raise ControlError('camera_control_truncated_response',502)
+            return bytes(output)
         if getattr(response,'_control_socket',None)is not None:
             response._control_socket.settimeout(max(.001,deadline-time.monotonic()))
         part=read(min(65536,limit+1-len(output)))
-        if not part:return bytes(output)
+        if not part:
+            if getattr(response,'length',None) not in(None,0):
+                raise ControlError('camera_control_truncated_response',502)
+            return bytes(output)
         output.extend(part)
         if len(output)>limit:raise ControlError('camera_control_response_too_large',502)
 
