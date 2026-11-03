@@ -1,6 +1,5 @@
 """Pure success criteria for the read-only native API/graph audit."""
 
-VERSION = "7.3.70"
 OWNER = "reolink-protect-events"
 CLASSES = {"person", "vehicle", "animal"}
 
@@ -63,7 +62,6 @@ def verify_checks(report, event_id, expected_classes, camera_ids):
         event.get("classificationOrigin") == union_origin and event.get("source") == union_source and
         event.get("mergePolicy") == ("camera_visual_positive_overlap" if grouped else "camera_class_time_union") and event.get("objectIdentityMatched") is False)
     checks = {
-        "version": report.get("protectVersion") == VERSION,
         "bootstrap": report.get("bootstrapApiStatus") == 200,
         "eventApi": report.get("eventApiStatus") == 200 and event.get("id") == event_id,
         "eventCameraScope": camera in selected and set(c.get("id") for c in cameras) == selected and len(cameras) == len(selected),

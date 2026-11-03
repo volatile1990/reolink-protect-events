@@ -147,9 +147,7 @@ def run_once(config,root,*,allow_repair=False,now_ms=None,startup_at_ms=None,api
         validate_config(config);state=_state(root,now_ms,startup_at_ms)
         startup_options=fmp4_configuration(config)
         startup_configuration_ok=True
-        if startup_options['enabled']:
-            try:verify_fmp4_configuration(startup_options, config)
-            except OperationError:startup_configuration_ok=False
+        startup_configuration_checked=False
         known_ids={b['cameraId']for b in config['bridges']}|{b['cameraId']for b in config.get('readOnlyCameras',[])}
         need(set(state['cameras'])<=known_ids,'monitor_state_scope_changed')
         lease_state=reconcile_maintenance(root)
@@ -181,7 +179,7 @@ def run_once(config,root,*,allow_repair=False,now_ms=None,startup_at_ms=None,api
                                     'fmp4StartupEnabled':startup_options['enabled'],
                                     'fmp4StartupSeconds':12 if startup_options['enabled']else None,
                                     'allExplicitQualities':all_qualities,'nativeObservationIsReadOnly':True}
-        report['fmp4ConfigurationVerified']=startup_configuration_ok
+        report['fmp4ConfigurationVerified']=None
         report['repairPolicy']={'consecutiveFailures':FAILURE_THRESHOLD,'startupGraceMs':STARTUP_GRACE_MS,
                                 'cooldownMs':REPAIR_COOLDOWN_MS,'maximumPerCamera24h':ABSOLUTE_REPAIR_LIMIT,
                                 'maximumPerUnhealthyEpisode':REPAIR_LIMIT,'healthyRearmMs':HEALTHY_REARM_MS}
@@ -245,8 +243,9 @@ def run_once(config,root,*,allow_repair=False,now_ms=None,startup_at_ms=None,api
                 else:kind=previous.get('nextProbeType','ubv')if startup_options['enabled']else'ubv'
                 if reason!='rotation'and bad_channels[selected]:kind,channel='ubv',bad_channels[selected][0]
                 if kind=='fmp4':
-                    result=(startup_probe or probe_fmp4)(config,cameras[selected],channel,seconds=12) \
-                        if startup_configuration_ok else {'ok':False,'errorCode':'fmp4_configuration_drift'}
+                    # File fingerprints describe the installation. Only the
+                    # actual media/flags exchange establishes playback health.
+                    result=(startup_probe or probe_fmp4)(config,cameras[selected],channel,seconds=12)
                     previous['lastFmp4StartupProbe']=result;previous['lastFmp4StartupProbeAtMs']=now_ms
                     previous['fmp4ProbeSourceEpoch']=rows[selected]['source'].get('connectionEpoch')
                     previous['fmp4ProbeGeneration']=_generation(previous)
@@ -304,10 +303,10 @@ def run_once(config,root,*,allow_repair=False,now_ms=None,startup_at_ms=None,api
             row['lastFmp4StartupProbe']=startup
             row['lastFmp4StartupProbeAtMs']=previous.get('lastFmp4StartupProbeAtMs')
             fmp4_required=startup_options['enabled']and not native
-            row['fmp4StartupProbeFresh']=bool(fmp4_required and startup_configuration_ok
+            row['fmp4StartupProbeFresh']=bool(fmp4_required
                 and fresh('lastFmp4StartupProbeAtMs','fmp4ProbeSourceEpoch','fmp4ProbeGeneration'))
             startup_bad=row['fmp4StartupProbeFresh']and isinstance(startup,dict)and startup.get('ok')is False
-            row['fmp4StartupVerified']=bool(fmp4_required and startup_configuration_ok
+            row['fmp4StartupVerified']=bool(fmp4_required
                 and row['sourceHealthy']and row['protectHealthy']and isinstance(startup,dict)and startup.get('ok')is True
                 and row['fmp4StartupProbeFresh'])
             row['allActivePathsVerified']=row['activeMediaVerified']and(
@@ -348,10 +347,16 @@ def run_once(config,root,*,allow_repair=False,now_ms=None,startup_at_ms=None,api
             row['budgetExhausted']=len(episode_attempts)>=REPAIR_LIMIT or len(attempts)>=ABSOLUTE_REPAIR_LIMIT
             row['confirmedFailure']=count>=FAILURE_THRESHOLD and not report['startupGraceActive']and not marker
             row['recommendedAction']='review_native_camera'if native and row['confirmedFailure']else'wait_for_bridge_reconnect'if row['confirmedFailure']and not row['sourceHealthy']else'rebuild_native_stream'if row['confirmedFailure']else'review_fmp4_startup'if startup_bad else None
-            # A drifted frontend exception is not permission to rebuild a native
-            # stream. Configuration review must precede any repair dispatch.
-            row['repairEligible']=bool(not native and allow_repair and startup_configuration_ok and pending_recovery is None and row['confirmedFailure']and row['sourceHealthy']
+            eligible=bool(not native and allow_repair and pending_recovery is None and row['confirmedFailure']and row['sourceHealthy']
                 and type(row['source'].get('connectionEpoch'))is int and not cooldown and not row['budgetExhausted'])
+            # Read installation pins only at an actual mutation boundary. A
+            # failed metadata read must not delay or falsify healthy observation.
+            if eligible and startup_options['enabled']and not startup_configuration_checked:
+                startup_configuration_checked=True
+                try:verify_fmp4_configuration(startup_options, config)
+                except OperationError:startup_configuration_ok=False
+                report['fmp4ConfigurationVerified']=startup_configuration_ok
+            row['repairEligible']=eligible and startup_configuration_ok
             if row['repairEligible']:repair_candidates.append(cid)
         # Persist the cooldown/attempt BEFORE any dispatch. Restarting the
         # service cannot reset rate limits or authorize another uncertain send.
@@ -386,8 +391,6 @@ def run_once(config,root,*,allow_repair=False,now_ms=None,startup_at_ms=None,api
         report['fmp4StartupFailureCameraIds']=[r['cameraId']for r in report['cameras']if r['fmp4StartupNeedsReview']]
         report['activeCoverageVerified']=all(r['allActivePathsVerified']for r in monitored_rows)
         report['alerts']=[]
-        if not startup_configuration_ok:
-            report['alerts'].append({'code':'media_configuration_requires_review','actionRequired':True})
         if lease_state.get('requiresReview'):
             report['alerts'].append({'code':'maintenance_requires_review','actionRequired':True})
         if lease_state.get('expired')and lease_state.get('waitingForMutation'):
@@ -399,11 +402,18 @@ def run_once(config,root,*,allow_repair=False,now_ms=None,startup_at_ms=None,api
             if row['confirmedFailure']and (row.get('readOnly')or not row['sourceHealthy']):
                 report['alerts'].append({'code':'native_media_requires_attention'if row.get('readOnly')else'source_unhealthy',
                     'cameraId':row['cameraId'],'actionRequired':True})
+            if (row['confirmedFailure']and not row.get('readOnly')and row['sourceHealthy']
+                    and not row['recorderAndUbvHealthy']and not row['repairEligible']
+                    and not row['budgetExhausted']and pending_recovery is None):
+                # An installation pin is not an alarm. A separately confirmed
+                # recorder/media failure that cannot be repaired still is.
+                report['alerts'].append({'code':'recorder_media_requires_attention',
+                    'cameraId':row['cameraId'],'actionRequired':True})
             if row['confirmedFailure']and row['budgetExhausted']:
                 report['alerts'].append({'code':'recorder_repair_budget_exhausted','cameraId':row['cameraId'],'actionRequired':True})
         report['actionRequired']=any(a['actionRequired']for a in report['alerts'])
-        report['ok']=report['quickHealthy']and pending_recovery is None and startup_configuration_ok and report['activeCoverageVerified']
-        report['state']='maintenance'if marker else'starting'if report['startupGraceActive']else'attention'if pending_recovery is not None or not startup_configuration_ok or report['actionRequired']else'healthy'if report['ok']else'verifying'if report['quickHealthy']and not report['fmp4StartupFailureCameraIds']else'degraded'
+        report['ok']=report['quickHealthy']and pending_recovery is None and report['activeCoverageVerified']
+        report['state']='maintenance'if marker else'starting'if report['startupGraceActive']else'attention'if pending_recovery is not None or report['actionRequired']else'healthy'if report['ok']else'verifying'if report['quickHealthy']and not report['fmp4StartupFailureCameraIds']else'degraded'
         report['nextProbeDueAtMs']=state.get('lastRotationAtMs',state['lastProbeAtMs'])+rotation_interval if not marker and not report['startupGraceActive']and any(r['sourceHealthy']for r in rows.values())else None
         report['atMs']=now_ms;state['lastSampleAtMs']=now_ms
         report['completedAtMs']=int(time.time()*1000)

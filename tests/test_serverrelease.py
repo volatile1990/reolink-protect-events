@@ -152,7 +152,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
         elif request["mode"] == "rollback":
             if request["expectedCurrent"] != self.current: return {"ok": False}
             self.current = self.old
-        elif self.fail_postcheck and self.current == self.new and "digest" not in request:
+        elif (self.fail_postcheck and request['mode'] == 'check'
+              and self.current == self.new and "digest" not in request):
             return {"ok": False}
         return {"ok": True, "deployment": {"digest": self.current}}
 
@@ -176,6 +177,23 @@ class ReleaseWorkflowTests(unittest.TestCase):
             self.update(expected_current="d" * 64)
         self.assertEqual([row["mode"] for row in self.calls], ["check"])
         self.assertEqual(self.current, self.old)
+
+    def test_contract_repair_still_checks_candidate_and_requires_reviewed_current(self):
+        with self.assertRaisesRegex(release.ReleaseError, "repair_requires_expected_current"):
+            self.update(repair_current_contract=True)
+        self.assertEqual(self.calls, [])
+        result = self.update(repair_current_contract=True, expected_current=self.old)
+        self.assertTrue(result['activated'])
+        self.assertEqual([row['mode'] for row in self.calls],
+                         ['status', 'stage', 'check', 'activate', 'check'])
+        self.assertEqual(self.calls[2], {'mode': 'check', 'digest': self.new})
+
+    def test_contract_repair_cannot_skip_verification_of_identical_current_release(self):
+        self.current = self.new
+        self.fail_postcheck = True
+        with self.assertRaisesRegex(release.ReleaseError, "final_check_failed"):
+            self.update(repair_current_contract=True, expected_current=self.new)
+        self.assertEqual(self.calls, [{'mode': 'status'}, {'mode': 'check'}])
 
     def test_failed_tests_or_different_tested_commit_never_touch_server(self):
         def fail(*args, **kwargs): raise release.ReleaseError("server_release_tests_failed")

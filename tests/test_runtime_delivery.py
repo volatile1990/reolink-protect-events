@@ -390,6 +390,7 @@ class RuntimeDeliveryTests(unittest.TestCase):
         self.assertTrue(all(client.closed for client in abandoned), "partial retry leaked an old DS client")
 
     def test_collect_deliver_health_and_shutdown_preserve_replay_cursor(self):
+        self.native.protect_version = "7.3.74"
         self.runtime.background_native = False  # Exercise deterministic delivery boundary in this fixture.
         self.runtime.last_native_check = self.now_ms
         self.now_ms = START + 2000
@@ -409,7 +410,9 @@ class RuntimeDeliveryTests(unittest.TestCase):
         self.restart()
         self.assertEqual(self.runtime.journal.cursor(CAMERA)["seq"], 1)
         self.assertEqual(self.runtime.journal.health()["pending"], 0)
-        self.assertTrue(json.loads((self.path / "health.json").read_text())["healthy"])
+        health = json.loads((self.path / "health.json").read_text())
+        self.assertTrue(health["healthy"])
+        self.assertEqual(health["protectVersion"], "7.3.74")
 
 
 if __name__ == "__main__":

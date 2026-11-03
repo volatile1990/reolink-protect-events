@@ -2,8 +2,8 @@
 import concurrent.futures
 import time
 from .http import bridge_metrics, protect_json
-from .protect import automatic_channel, qualities, recording_ends, selected_cameras,read_only_cameras
-from .safety import VERSION, OperationError, error_code, need, validate_config
+from .protect import automatic_channel, enabled_channels, observed_version, qualities, recording_ends, selected_cameras,read_only_cameras
+from .safety import OperationError, error_code, need, validate_config
 from .ubv import probe_ubv
 
 PROGRESS_WAIT_SECONDS = 45
@@ -65,7 +65,7 @@ def inspect(config, *, prior=None, now_ms=None, api=None, fetch=None, deadline=N
         recording_ok=bool(recordings) and all(r['fresh'] and r['advanced'] is not False for r in recordings)
         rows.append({'cameraId':camera['id'],'host':camera['host'],'source':source,
             'protectConnected':connected,'recordings':recordings,'recordingEnds':ends,
-            'automaticChannel':automatic_channel(camera),'enabledChannels':sorted(c['id'] for c in camera.get('channels',[])if c.get('enabled') is True),
+            'automaticChannel':automatic_channel(camera),'enabledChannels':enabled_channels(camera),
             'sourceHealthy':source['ok'],'protectHealthy':connected and recording_ok,
             'cause':None if source['ok'] and connected and recording_ok else 'source_unhealthy'if not source['ok']else'protect_media_unhealthy',
             'ok':source['ok'] and connected and recording_ok})
@@ -85,9 +85,9 @@ def inspect(config, *, prior=None, now_ms=None, api=None, fetch=None, deadline=N
         source={'ok':connected,'connectionEpoch':epoch if type(epoch)is int and epoch>=0 else None,'streams':[]}
         native_rows.append({'cameraId':camera['id'],'host':camera['host'],'readOnly':True,'source':source,
             'protectConnected':connected,'recordings':recordings,'recordingEnds':ends,
-            'automaticChannel':automatic_channel(camera),'enabledChannels':sorted(c['id']for c in camera.get('channels',[])if c.get('enabled')is True),
+            'automaticChannel':automatic_channel(camera),'enabledChannels':enabled_channels(camera),
             'sourceHealthy':connected,'protectHealthy':healthy,'cause':None if healthy else'native_media_unhealthy','ok':healthy})
-    return {'schemaVersion':1,'atMs':now_ms,'protectVersion':bootstrap['nvr']['version'],
+    return {'schemaVersion':1,'atMs':now_ms,'protectVersion':observed_version(bootstrap),
             'ok':scope_ok and all(r['ok']for r in rows+native_rows),'expectedRecordingProfiles':expected_count,
             'nativeHealthy':all(r['ok']for r in native_rows),
             'scopeValid':scope_ok,'cameras':rows,'nativeCameras':native_rows,'readOnly':True,'mediaPersisted':False,

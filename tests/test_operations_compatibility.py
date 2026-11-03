@@ -1,4 +1,4 @@
-"""Exact owned Automatic input compatibility; no infrastructure or media."""
+"""Runtime capabilities remain independent of historical byte-patch ownership."""
 import copy
 import hashlib
 import json
@@ -68,7 +68,7 @@ class CompatibilityTests(unittest.TestCase):
                             for path in self.root_expected}
         self.reads=[];self.file_reads=[];self.layers=[{'path':'synthetic-ui-one'},{'path':'synthetic-ui-two'}]
 
-    def assess(self, *, receipt=None, private_error=None, boot=None):
+    def assess(self, *, receipt=None, private_error=None, boot=None, schema=None, schema_error=None):
         def private(path):
             name=path.as_posix()if hasattr(path,'as_posix')else str(path)
             if name in self.root_metadata:
@@ -81,6 +81,9 @@ class CompatibilityTests(unittest.TestCase):
             self.reads.append('fixed-private-receipt')
             return copy.deepcopy(self.receipt if receipt is None else receipt)
         def read_file(path):self.file_reads.append(path);return self.data[path]
+        def read_schema():
+            if schema_error:raise schema_error
+            return {'schemaVerified':True}if schema is None else schema
         with patch.object(compatibility,'ACTIVE_FILES',self.expected), \
              patch.object(compatibility,'AUTOMATIC_SERVICE_SHA256',sha(self.new)), \
              patch.object(compatibility,'AUTOMATIC_FILES',self.auto_expected), \
@@ -91,13 +94,14 @@ class CompatibilityTests(unittest.TestCase):
              patch.object(compatibility,'private_path',side_effect=private), \
              patch.object(compatibility,'read_json',side_effect=read):
             return compatibility.assess(self.config,api=lambda *_:copy.deepcopy(self.boot if boot is None else boot),
-                file_reader=read_file,schema_reader=lambda:{'schemaVerified':True},
+                file_reader=read_file,schema_reader=read_schema,
                 layer_reader=lambda *_:copy.deepcopy(self.layers))
 
     def assert_drift(self, report):
-        self.assertFalse(report['ok'],report)
-        self.assertFalse(report['certified'])
-        self.assertFalse(report['nativeWritesAllowed'])
+        self.assertFalse(report['legacyPatchOwnership']['verified'],report)
+        self.assertEqual(report['nativeWritesAllowed'],report['ok'])
+        self.assertEqual(report['certified'],report['ok'])
+        if report['ok']:self.assertNotIn('errorCode',report)
 
     def test_fixed_production_chain_matches_audited_final_source(self):
         self.assertEqual(compatibility.AUTOMATIC_SERVICE_SHA256,
@@ -123,19 +127,19 @@ class CompatibilityTests(unittest.TestCase):
         self.data[compatibility.SERVICE_PATH]=self.old
         report=self.assess(private_error=AssertionError('must-not-read-a-receipt'))
         self.assertTrue(report['certified'],report);self.assertTrue(report['nativeWritesAllowed'])
-        self.assertNotIn('automaticInputLayer',report);self.assertEqual(self.reads,[])
+        self.assertNotIn('automaticInputLayer',report['legacyPatchOwnership']);self.assertEqual(self.reads,[])
 
     def test_exact_owned_applied_layer_is_accepted_with_settings_and_startup_proof(self):
         report=self.assess()
         self.assertTrue(report['certified'],report);self.assertTrue(report['nativeWritesAllowed'])
-        self.assertTrue(report['checks']['serviceAndAacLayers'])
-        self.assertTrue(report['checks']['automaticInputLayerOwnership'])
-        self.assertTrue(report['automaticInputLayer']['currentProfileContractVerified'])
-        self.assertEqual(report['automaticInputLayer']['currentProfileContract']['automaticReuseCameraCount'],6)
-        self.assertEqual(report['automaticInputLayer']['currentProfileContract']['recordingProfileCount'],12)
-        self.assertTrue(report['automaticInputLayer']['historicalSettingsBaselineMatches'])
-        self.assertTrue(report['automaticInputLayer']['nginxRegenerationGuardVerified'])
-        self.assertTrue(report['automaticInputLayer']['nginxEventWatchFilesVerified'])
+        self.assertTrue(report['legacyPatchOwnership']['checks']['serviceAndAacLayers'])
+        self.assertTrue(report['legacyPatchOwnership']['checks']['automaticInputLayerOwnership'])
+        self.assertTrue(report['legacyPatchOwnership']['automaticInputLayer']['currentProfileContractVerified'])
+        self.assertEqual(report['legacyPatchOwnership']['automaticInputLayer']['currentProfileContract']['automaticReuseCameraCount'],6)
+        self.assertEqual(report['legacyPatchOwnership']['automaticInputLayer']['currentProfileContract']['recordingProfileCount'],12)
+        self.assertTrue(report['legacyPatchOwnership']['automaticInputLayer']['historicalSettingsBaselineMatches'])
+        self.assertTrue(report['legacyPatchOwnership']['automaticInputLayer']['nginxRegenerationGuardVerified'])
+        self.assertTrue(report['legacyPatchOwnership']['automaticInputLayer']['nginxEventWatchFilesVerified'])
         self.assertEqual(self.reads,['fixed-private-receipt'])
 
     def test_metadata_only_scope_needs_no_dummy_or_real_bridge_credentials(self):
@@ -147,12 +151,51 @@ class CompatibilityTests(unittest.TestCase):
             validate_config(self.config)
         report = self.assess()
         self.assertTrue(report['ok'], report)
-        self.assertTrue(report['automaticInputLayer']['currentProfileContractVerified'])
+        self.assertTrue(report['legacyPatchOwnership']['automaticInputLayer']['currentProfileContractVerified'])
 
     def test_unknown_service_cannot_be_authorized_by_a_forged_matching_receipt(self):
         unknown=b'synthetic-unknown-service';self.data[compatibility.SERVICE_PATH]=unknown
         receipt=copy.deepcopy(self.receipt);receipt['afterSha256']=sha(unknown)
         self.assert_drift(self.assess(receipt=receipt));self.assertEqual(self.reads,[])
+
+    def test_new_release_and_changed_vendor_bytes_do_not_disable_verified_native_runtime(self):
+        for version in ('7.3.74','9.0.0',None,'unavailable'):
+            with self.subTest(version=version):
+                boot=copy.deepcopy(self.boot);boot['nvr']['version']=version
+                self.data[compatibility.SERVICE_PATH]=b'new-vendor-service'
+                self.layers=[]
+                before=copy.deepcopy(self.receipt)
+                report=self.assess(boot=boot)
+                self.assertTrue(report['ok'],report)
+                self.assertTrue(report['nativeWritesAllowed'])
+                self.assertEqual(report['state'],'compatible')
+                self.assertFalse(report['legacyPatchOwnership']['verified'])
+                self.assertNotIn('errorCode',report)
+                self.assertEqual(self.receipt,before)
+
+    def test_failed_actual_database_or_camera_contract_never_allows_native_writes(self):
+        for schema in ({'schemaVerified':False},{},None):
+            with self.subTest(schema=schema):
+                report=self.assess(schema=schema if schema is not None else [],
+                                   schema_error=None)
+                self.assertFalse(report['ok'],report)
+                self.assertFalse(report['nativeWritesAllowed'])
+                self.assertEqual(report['errorCode'],'compatibility_database_contract_failed')
+        report=self.assess(schema_error=RuntimeError('PRIVATE_SQL_SECRET'))
+        self.assertFalse(report['nativeWritesAllowed'])
+        self.assertNotIn('PRIVATE_SQL_SECRET',json.dumps(report))
+        boot=copy.deepcopy(self.boot);boot['cameras'][0]['host']='192.168.30.99'
+        report=self.assess(boot=boot)
+        self.assertFalse(report['nativeWritesAllowed'])
+        self.assertEqual(report['errorCode'],'camera_mapping_changed')
+
+    def test_unreadable_historical_files_do_not_imply_a_runtime_failure(self):
+        self.data.clear()
+        report=self.assess()
+        self.assertTrue(report['ok'],report)
+        self.assertTrue(report['nativeWritesAllowed'])
+        self.assertFalse(report['legacyPatchOwnership']['verified'])
+        self.assertNotIn('errorCode',report)
 
     def test_applied_receipt_owner_schema_state_version_and_operation_are_required(self):
         for field,value in (('schemaVersion',True),('schemaVersion',2),('owner','other'),
@@ -190,7 +233,7 @@ class CompatibilityTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.data[path]=b'changed-nginx-persistence-file'
                 report=self.assess();self.assert_drift(report)
-                self.assertEqual(report['errorCode'],'compatibility_auto_nginx_startup_changed')
+                self.assertEqual(report['legacyPatchOwnership']['reason'],'compatibility_auto_nginx_startup_changed')
                 self.data[path]=self.additional_files[path]
 
     def test_root_recovery_helper_and_template_must_remain_root_private_regular_files(self):
@@ -201,7 +244,7 @@ class CompatibilityTests(unittest.TestCase):
                 with self.subTest(path=path,field=field,value=value):
                     changed=copy.copy(original);setattr(changed,field,value);self.root_metadata[path]=changed
                     report=self.assess();self.assert_drift(report)
-                    self.assertEqual(report['errorCode'],'compatibility_auto_root_files_not_private')
+                    self.assertEqual(report['legacyPatchOwnership']['reason'],'compatibility_auto_root_files_not_private')
                     self.root_metadata[path]=original
 
     def test_root_recovery_receipt_cannot_omit_or_forge_either_new_file(self):
@@ -212,7 +255,7 @@ class CompatibilityTests(unittest.TestCase):
                     if mode=='omit':receipt['additionalOwnedFiles']=[r for r in receipt['additionalOwnedFiles']if r['path']!=path]
                     else:next(r for r in receipt['additionalOwnedFiles']if r['path']==path)['sha256']='0'*64
                     report=self.assess(receipt=receipt);self.assert_drift(report)
-                    self.assertEqual(report['errorCode'],'compatibility_auto_nginx_ownership_changed')
+                    self.assertEqual(report['legacyPatchOwnership']['reason'],'compatibility_auto_nginx_ownership_changed')
 
     def test_event_watch_manifest_and_applied_state_are_required(self):
         rows=self.receipt['nginxWatchFiles'];wrong=copy.deepcopy(rows);wrong[0]['path']='/tmp/foreign-watch'
@@ -230,7 +273,7 @@ class CompatibilityTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.data[path]=b'foreign-event-watch-unit'
                 report=self.assess();self.assert_drift(report)
-                self.assertEqual(report['errorCode'],'compatibility_auto_nginx_watch_changed')
+                self.assertEqual(report['legacyPatchOwnership']['reason'],'compatibility_auto_nginx_watch_changed')
                 self.data[path]=self.watch_files[path]
 
     def test_aac_modules_and_both_owned_ui_layers_remain_required(self):
@@ -241,7 +284,7 @@ class CompatibilityTests(unittest.TestCase):
                 self.assert_drift(self.assess());self.data[path]=self.old_files[path]
         self.layers=self.layers[:1]
         report=self.assess();self.assert_drift(report)
-        self.assertFalse(report['checks']['uiLayerOwnership'])
+        self.assertFalse(report['legacyPatchOwnership']['checks']['uiLayerOwnership'])
 
     def test_normal_user_or_motion_capability_changes_do_not_repin_historical_receipt(self):
         changed=copy.deepcopy(self.boot)
@@ -253,8 +296,8 @@ class CompatibilityTests(unittest.TestCase):
         before=copy.deepcopy(self.receipt)
         report=self.assess(boot=changed)
         self.assertTrue(report['ok'],report)
-        self.assertFalse(report['automaticInputLayer']['historicalSettingsBaselineMatches'])
-        self.assertFalse(report['automaticInputLayer']['historicalSettingsBaselineEnforced'])
+        self.assertFalse(report['legacyPatchOwnership']['automaticInputLayer']['historicalSettingsBaselineMatches'])
+        self.assertFalse(report['legacyPatchOwnership']['automaticInputLayer']['historicalSettingsBaselineEnforced'])
         self.assertNotEqual(report['currentSettingsSha256'],self.receipt['baseline']['settingsSha256'])
         self.assertEqual(self.receipt,before)
 
@@ -290,7 +333,7 @@ class CompatibilityTests(unittest.TestCase):
                 mismatch['cameras'][-1]['thirdPartyCameraInfo'][field]=value
                 report=self.assess(boot=mismatch)
                 self.assert_drift(report)
-                self.assertEqual(report['errorCode'],'compatibility_auto_source_profile_changed')
+                self.assertEqual(report['legacyPatchOwnership']['reason'],'compatibility_auto_source_profile_changed')
 
     def test_previous_main_only_sixth_camera_is_rejected(self):
         changed=copy.deepcopy(self.boot);camera=changed['cameras'][-1]
@@ -298,7 +341,7 @@ class CompatibilityTests(unittest.TestCase):
         camera['thirdPartyCameraInfo'].update(rtspUrlLQ=None,profileTokenLQ=None)
         report=self.assess(boot=changed)
         self.assert_drift(report)
-        self.assertEqual(report['errorCode'],'compatibility_auto_channels_changed')
+        self.assertEqual(report['legacyPatchOwnership']['reason'],'compatibility_auto_channels_changed')
 
     def test_receipt_is_root_private_regular_and_single_link(self):
         for field,value in (('st_uid',1000),('st_mode',stat.S_IFREG|0o644),

@@ -189,6 +189,7 @@ class RuntimeCpuTests(unittest.TestCase):
                 parent._native_wake.set()
         worker = SimpleNamespace(check_native=lambda: None, deliver=deliver,
             deliver_media=lambda _: None, native_ready=True, native_error=None,
+            native=SimpleNamespace(protect_version='7.3.74'),
             _native_wait_seconds=lambda: 1.0, _media_future=None, _media_pool=None,
             clients={}, journal=SimpleNamespace(counter=lambda _: 0, close=lambda: None))
         with patch('reolink_protect_events.runtime.Runtime', return_value=worker):
@@ -196,6 +197,7 @@ class RuntimeCpuTests(unittest.TestCase):
         self.assertEqual(calls, ['select', 'select'])
         self.assertEqual(observed, [(True, 1.0), (False, 1.0)])
         self.assertTrue(parent._native_state['nativeReady'])
+        self.assertEqual(parent._native_state['protectVersion'], '7.3.74')
 
     def test_thumbnail_future_completion_and_stop_wake_idle_worker(self):
         self.runtime.config = dict(CONFIG, thumbnailSelection={'mode': 'automatic'})

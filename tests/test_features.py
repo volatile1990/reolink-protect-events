@@ -56,12 +56,12 @@ class FeatureTests(unittest.TestCase):
         self.patch.rollback(manifest)
         self.assertEqual(self.service.read_bytes(), self.service_original)
 
-    def test_refuses_package_upgrade_modified_hash_and_ambiguous_anchor(self):
+    def test_package_version_and_unrelated_bytes_do_not_block_exact_contract(self):
         self.patch.version_reader = lambda: "7.3.71"
-        with self.assertRaises(FeatureError):
-            self.patch.plan(IDS)
-        self.patch.version_reader = lambda: "7.3.70"
-        self.ui.write_bytes(self.ui_original + b"changed")
+        self.assertEqual(len(self.patch.plan(IDS)), 2)
+        self.ui.write_bytes(self.ui_original.replace(b'qq=', b'q0=') + b';let unrelated=1;')
+        self.assertEqual(len(self.patch.plan(IDS)), 2)
+        self.ui.write_bytes(self.ui_original.replace(b'isThirdPartyCamera', b'changedCameraContract'))
         with self.assertRaises(FeatureError):
             self.patch.plan(IDS)
         with self.assertRaises(FeatureError):

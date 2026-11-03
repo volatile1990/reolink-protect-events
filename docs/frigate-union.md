@@ -10,7 +10,8 @@ in provenance. A missing flag, malformed nullable object data or an explicit tru
 flag cannot become a supported detection. Generic motion,
 manual timeline entries, unknown types and unsupported labels cannot
 create a supported class. Inference and video decoding remain in Frigate, not
-on the Protect console. The native adapter remains pinned to Protect 7.3.70.
+on the Protect console. The native adapter verifies the required database
+capabilities instead of gating delivery on a particular Protect version.
 
 The supported label map is `person` to person; car, bus, truck, motorcycle and
 bicycle to vehicle; dog, cat, bird, horse, sheep, cow, elephant, bear, zebra and

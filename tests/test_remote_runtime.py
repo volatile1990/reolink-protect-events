@@ -35,22 +35,38 @@ class RemoteNativeTests(unittest.TestCase):
         local_sql, expected_event = NativeAdapter().build_interval_sql(INTERVAL)
         def request(cfg, action, payload=None, timeout=15):
             calls.append((action, payload, timeout))
-            if action == "version": return "7.3.70"
+            if action == "version": return "7.3.74"
             if "information_schema.columns" in payload["sql"]: return json.dumps(schema_fixture())
             self.assertEqual(payload["sql"], local_sql)
             return json.dumps(expected_event)
         with patch("reolink_protect_events.remote.rpc", side_effect=request):
             adapter = adapter_for_config(configured())
             self.assertEqual(adapter.upsert_interval(INTERVAL), expected_event)
-        self.assertEqual([row[0] for row in calls], ["version", "sql", "sql"])
+        self.assertEqual([row[0] for row in calls], ["version", "sql", "version", "sql"])
+        self.assertEqual(adapter.protect_version, "7.3.74")
         self.assertEqual(calls[0][2], 5)
 
-    def test_remote_version_mismatch_prevents_any_database_request(self):
-        with patch("reolink_protect_events.remote.rpc", return_value="7.3.71") as request:
-            with self.assertRaises(SchemaError):
-                adapter_for_config(configured()).upsert_interval(INTERVAL)
-        self.assertEqual(request.call_count, 1)
-        self.assertEqual(request.call_args.args[1], "version")
+    def test_remote_package_metadata_failure_does_not_block_verified_database_capability(self):
+        actions=[]
+        def request(_, action, payload=None, timeout=15):
+            actions.append(action)
+            if action == "version": raise RemoteError("protect_remote_rpc_timeout")
+            return json.dumps(schema_fixture() if "information_schema" in payload["sql"] else {"id":INTERVAL["eventId"]})
+        with patch("reolink_protect_events.remote.rpc", side_effect=request):
+            db=adapter_for_config(configured())
+            db.upsert_interval(INTERVAL)
+        self.assertEqual(actions,["version","sql","version","sql"])
+        self.assertIsNone(db.protect_version)
+
+    def test_legacy_config_pin_never_replaces_live_version_or_schema_check(self):
+        cfg = configured()
+        cfg["protectVersion"] = "7.3.70"
+        with patch("reolink_protect_events.remote.rpc", side_effect=lambda _, action, payload=None, timeout=15:
+                   "9.1.0" if action == "version" else json.dumps(schema_fixture())):
+            db = adapter_for_config(cfg)
+            self.assertEqual(db.guard_schema()["protectVersion"], "9.1.0")
+        cfg["protectVersion"] = "9.1.0"
+        self.assertEqual(validate_config(cfg)["protectVersion"], "9.1.0")
 
     def test_remote_retired_code_is_terminal_and_other_errors_are_sanitized(self):
         adapter = adapter_for_config(configured())
@@ -62,7 +78,7 @@ class RemoteNativeTests(unittest.TestCase):
         for invalid in ({"private": "output"}, None):
             with patch("reolink_protect_events.remote.rpc", return_value=invalid):
                 with self.assertRaises(NativeError): adapter.execute("SELECT 1;")
-                with self.assertRaises(SchemaError): adapter.version_reader()
+                self.assertIsNone(adapter.version_reader())
 
 
 class RemoteRuntimeTests(unittest.TestCase):

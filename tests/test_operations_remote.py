@@ -124,42 +124,35 @@ class RemoteMediaTests(unittest.TestCase):
                 fmp4.verify_configuration(options, value)
         self.assertEqual(caught.exception.code, 'fmp4_configuration_drift')
 
-    def test_fmp4_remote_setup_and_final_pin_reads_preserve_viewer_budget(self):
+    def test_fmp4_functional_probe_has_independent_setup_and_viewer_budgets(self):
         value = config(); value['fmp4Startup'] = {'enabled': True}
         cid = value['bridges'][0]['cameraId']
         camera = {'id': cid, 'channels': [{'id': 1, 'enabled': True}],
                   'thirdPartyCameraInfo': {'enableRtspAudio': True}}
         clock = Fmp4Clock(); sock = Fmp4Socket(clock, stream()); timeouts = []
-        def pins(_options, _config, **_kwargs):
-            if not timeouts:
-                clock.now += 6
-            else:
-                self.assertTrue(sock.closed)
-                clock.now += 8
-            return True
         def api(_config, _path, **kwargs):
             timeouts.append(kwargs['timeout']); clock.now += 1
             flags = fmp4.browser_flags(fmp4.configuration(value), cid)
             body = json.dumps({'cmd': 'play', 'params': {'channel': 1, 'type': 'fmp4', **flags}}).encode()
             return {'uri': 'tcp://127.0.0.1:7447',
                     'data': {'type': 'Buffer', 'data': list(len(body).to_bytes(4, 'big') + body)}}
-        with patch.object(fmp4, 'verify_configuration', side_effect=pins), \
+        with patch.object(fmp4, 'verify_configuration', side_effect=AssertionError('metadata must not gate media')) as pins, \
              patch.object(fmp4, 'remote_open_socket', return_value=sock) as opened:
             result = fmp4.probe_fmp4(value, camera, 1, clock=clock, api=api)
         self.assertTrue(result['ok'], result)
-        self.assertEqual(timeouts, [2])
-        opened.assert_called_once_with(value, 7447, 1)
+        self.assertEqual(timeouts, [5])
+        opened.assert_called_once_with(value, 7447, 7)
+        pins.assert_not_called()
         self.assertTrue(all(row['lastFragmentAgeSeconds'] <= 3 for row in result['tracks']))
 
-    def test_fmp4_exhausted_remote_setup_never_starts_api_or_viewer(self):
+    def test_fmp4_exhausted_metadata_setup_never_starts_viewer(self):
         value = config(); value['fmp4Startup'] = {'enabled': True}
         camera = {'id': value['bridges'][0]['cameraId'], 'channels': [{'id': 1, 'enabled': True}]}
         clock = Fmp4Clock()
-        def pins(*_args, **_kwargs):
+        def metadata(*_args, **_kwargs):
             clock.now += 8
-            return True
-        with patch.object(fmp4, 'verify_configuration', side_effect=pins), \
-             patch.object(fmp4, 'protect_json', side_effect=AssertionError('API after deadline')), \
+            return {}
+        with patch.object(fmp4, 'protect_json', side_effect=metadata), \
              patch.object(fmp4, 'remote_open_socket') as opened:
             result = fmp4.probe_fmp4(value, camera, 1, clock=clock)
         self.assertFalse(result['ok'])

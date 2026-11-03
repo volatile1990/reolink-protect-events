@@ -1,4 +1,4 @@
-"""Narrow, reversible UI gate patch for the inspected Protect 7.3.70 build.
+"""Narrow, reversible UI gate patch for a verified feature-gate contract.
 
 Find Anything excludes unpaired third-party cameras even when native detection
 data and camera feature flags exist. This patch admits only explicitly selected
@@ -68,7 +68,9 @@ def camera_ids(ids):
 def patched_bytes(original, ids, kind):
     selected = json.dumps(camera_ids(ids), separators=(",", ":"))
     if kind == "ui":
-        before = UI_ORIGINAL
+        # The bundled identifier (qq, q0, ...) is unrelated to the predicate.
+        # Require the exact predicate body and preserve its current identifier.
+        before = UI_ORIGINAL.split("=", 1)[1]
         after = before[:-1] + "||(" + selected + ".includes(e.id)&&e.featureFlags.hasSmartDetect))"
     elif kind == "all_ui_alarm_scope":
         before = SCOPE_ORIGINAL
@@ -276,18 +278,26 @@ class FeaturePatch:
     def __init__(self, version_reader=None, ui_paths=None, service_path=SERVICE,
                  ui_hash=UI_HASH, service_hash=SERVICE_HASH):
         self.version_reader = version_reader or _version
-        self.ui_paths = [Path(value) for value in (ui_paths or [UI_ROOT + "/swai-7.3.26.js", UI_ROOT + "/swai.js"])]
+        self.ui_paths = [Path(value) for value in (ui_paths if ui_paths is not None else
+            sorted(path for path in Path(UI_ROOT).glob('swai*.js')
+                   if re.fullmatch(r'swai(?:-[A-Za-z0-9_.-]+)?\.js', path.name)))]
         self.service_path = Path(service_path)
         self.expected = {"ui": ui_hash, "all_ui_alarm_scope": service_hash}
 
     def guard_version(self):
-        if self.version_reader() != VERSION:
-            raise FeatureError("Only the inspected Protect 7.3.70 package is supported")
+        """Version is diagnostic metadata; the actual patch contract is below."""
+        try:
+            value = self.version_reader()
+            return value if isinstance(value, str) and 0 < len(value) <= 64 else None
+        except Exception:
+            return None
 
     def plan(self, ids, include_alarm_scope=False):
         self.guard_version()
         selected = camera_ids(ids)
         files = [(path, "ui") for path in self.ui_paths]
+        if not files:
+            raise FeatureError("Protect UI patch targets are absent")
         if include_alarm_scope:
             files.append((self.service_path, "all_ui_alarm_scope"))
         plan = []
@@ -296,8 +306,6 @@ class FeaturePatch:
                 raise FeatureError("Protect patch target must be a regular, non-symlink file")
             content = path.read_bytes()
             before = sha256(content)
-            if before != self.expected[kind]:
-                raise FeatureError("Protect file differs from the inspected package hash")
             patched = patched_bytes(content, selected, kind)
             info = path.stat()
             plan.append({"path": str(path.resolve()), "kind": kind, "beforeSha256": before,
@@ -352,8 +360,8 @@ class FeaturePatch:
         self.guard_version()
         path = Path(manifest_path).resolve()
         manifest = json.loads(path.read_text(encoding="utf-8"))
-        if manifest.get("schemaVersion") != 1 or manifest.get("protectVersion") != VERSION:
-            raise FeatureError("Unknown patch manifest format or Protect version")
+        if manifest.get("schemaVersion") != 1:
+            raise FeatureError("Unknown patch manifest format")
         allowed = {str(item.resolve()) for item in self.ui_paths + [self.service_path]}
         prepared = []
         for item in manifest["files"]:
@@ -362,8 +370,8 @@ class FeaturePatch:
             if str(target.resolve()) not in allowed or backup.parent != path.parent or target.is_symlink():
                 raise FeatureError("Patch manifest target or backup is outside the allowed paths")
             original = backup.read_bytes()
-            if sha256(original) != item["beforeSha256"] or item["beforeSha256"] != self.expected[item["kind"]]:
-                raise FeatureError("Patch backup differs from the inspected package")
+            if sha256(original) != item["beforeSha256"]:
+                raise FeatureError("Patch backup differs from its owned receipt")
             current_hash = sha256(target.read_bytes())
             if current_hash not in (item["beforeSha256"], item["afterSha256"]):
                 raise FeatureError("Protect file changed; rollback must not overwrite it")

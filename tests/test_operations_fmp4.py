@@ -1,6 +1,5 @@
 """Synthetic native TCP startup framing, clocks, flags and secret-safe failures."""
 import hashlib
-import contextlib
 import json
 import socket
 import struct
@@ -87,8 +86,7 @@ class StartupProbeTests(unittest.TestCase):
         def connector(*_):
             if connector_error:raise OSError('PRIVATE_CREDENTIAL')
             return sock
-        with patch.object(fmp4,'verify_configuration',return_value=True)if relative else contextlib.nullcontext():
-            result=fmp4.probe_fmp4(config,camera,1,api=api,connector=connector,clock=clock)
+        result=fmp4.probe_fmp4(config,camera,1,api=api,connector=connector,clock=clock)
         self.assertNotIn('PRIVATE_',json.dumps(result));self.assertFalse(result['mediaSaved'])
         self.assertFalse(result['frontdoorAuthenticationVerified'])
         if not connector_error and not flags_change:self.assertTrue(sock.closed)
@@ -120,6 +118,14 @@ class StartupProbeTests(unittest.TestCase):
         self.assertEqual(result['errorCode'],'fmp4_effective_flags_mismatch');self.assertFalse(sock.sent)
         result,_,_=self.check(stream(),relative=True)
         self.assertFalse(result['checks']['continuousFromFirstFragment'])
+
+    def test_successful_media_probe_does_not_depend_on_nginx_file_hashes(self):
+        with patch.object(fmp4,'verify_configuration',side_effect=OperationError('fmp4_configuration_drift')) as pins:
+            result,_,_=self.check(stream(relative=True),relative=True)
+        self.assertTrue(result['ok'],result)
+        self.assertTrue(result['checks']['effectiveFlags'])
+        self.assertTrue(result['checks']['continuousFromFirstFragment'])
+        pins.assert_not_called()
 
     def test_relative_partial_exception_is_disjoint_scoped_and_hash_bound(self):
         cid='6ac8ae7001ab6d03e4006410'

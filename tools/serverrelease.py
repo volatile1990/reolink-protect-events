@@ -45,7 +45,7 @@ def run_tests(repo, node="node"):
 
 
 def update(repo=ROOT, output_dir=None, *, expected_current=None, node="node",
-           tests=None, builder=None, remote=None, source_revision=None):
+           tests=None, builder=None, remote=None, source_revision=None, repair_current_contract=False):
     """No state copying/restores: only stage public bytes and use the owned CAS."""
     tests = tests or run_tests
     builder = builder or build
@@ -54,6 +54,8 @@ def update(repo=ROOT, output_dir=None, *, expected_current=None, node="node",
     repo = Path(repo).resolve()
     if expected_current is not None:
         need(valid_digest(expected_current), "server_release_expected_digest_invalid")
+    need(not repair_current_contract or expected_current is not None,
+         "server_release_repair_requires_expected_current")
     tested, _ = source_revision(repo, require_clean=True)
     tests(repo, node=node)
     release = builder(repo, output_dir, require_clean=True)
@@ -67,7 +69,11 @@ def update(repo=ROOT, output_dir=None, *, expected_current=None, node="node",
             raise ReleaseError(failure, result if isinstance(result, dict) else None)
         return result
 
-    before = request({"mode": "check"}, "server_release_current_unhealthy")
+    # Repairing an obsolete runtime guard must not require that same guard to
+    # pass. Still verify the installed source/receipt/services and require an
+    # explicit reviewed digest; the candidate gets the full live contract gate.
+    before = request({"mode": "status" if repair_current_contract else "check"},
+                     "server_release_current_unhealthy")
     previous = before.get("deployment", {}).get("digest")
     need(valid_digest(previous), "server_release_current_identity_invalid")
     need(expected_current is None or previous == expected_current, "server_release_current_changed")
@@ -75,6 +81,8 @@ def update(repo=ROOT, output_dir=None, *, expected_current=None, node="node",
               "sourceRevision": tested, "bundle": release["bundle"],
               "privateConfigsIncluded": False, "privateStateRestoreRequested": False}
     if previous == target:
+        if repair_current_contract:
+            request({"mode": "check"}, "server_release_final_check_failed")
         return dict(common, alreadyCurrent=True, activated=False, checked=True)
 
     path = Path(release["bundle"])
@@ -113,13 +121,16 @@ def main(argv=None):
     deploy_parser = modes.add_parser("update", help="Test committed code, stage, CAS-activate and check")
     deploy_parser.add_argument("--output-dir", type=Path)
     deploy_parser.add_argument("--expected-current")
+    deploy_parser.add_argument("--repair-current-contract", action="store_true",
+                               help="Repair a failing old contract guard; requires --expected-current")
     deploy_parser.add_argument("--node", default="node", help="Local Node binary used for JS syntax checks")
     args = parser.parse_args(argv)
     try:
         if args.mode == "build":
             result = build(output_dir=args.output_dir, require_clean=args.require_clean)
         else:
-            result = update(output_dir=args.output_dir, expected_current=args.expected_current, node=args.node)
+            result = update(output_dir=args.output_dir, expected_current=args.expected_current, node=args.node,
+                            repair_current_contract=args.repair_current_contract)
     except Exception as error:
         result = {"ok": False, "errorCode": error.code if isinstance(error, (ReleaseError, BuildError))
                   else "server_release_failed"}

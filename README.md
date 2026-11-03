@@ -21,7 +21,14 @@ rebuilding the full `publication_intervals` view on SQLite 3.34 for each media
 poll and thumbnail status count. Source history, manual groups, audio events,
 retry deadlines, notification rules and polling intervals remain unchanged.
 
-This implementation is pinned to **Protect 7.3.70** and its shipped UI **7.3.26**. It uses private console internals because Protect's published integration API does not provide Smart Detection ingestion. A version/schema mismatch stops native delivery while the source journal keeps collecting; applying the frontend patch additionally requires the exact known UI hashes. Supporting another Protect release requires inspecting and testing that release.
+This implementation checks the interfaces it actually uses rather than accepting
+only one Protect version. Package versions and vendor-file hashes alone do not
+raise camera alarms or stop a working integration. Monitoring checks live media
+and advancing recordings; native event delivery verifies the database contract,
+camera identity and ownership. A real failure affects the corresponding function.
+The source journal keeps collecting while event delivery is unavailable. Owned
+vendor-code adaptations still require unambiguous patch anchors before writing.
+See [functional compatibility](docs/functional-compatibility.md).
 
 ## Remote operation on the Debian server
 
@@ -57,7 +64,7 @@ SSH stdin, never in command arguments. Bounded `stream:<port>` SSH sessions also
 carry native media; UBV TLS and media parsing terminate on the server. Nothing
 opens Protect's PostgreSQL or internal DS/API ports to the LAN.
 
-Native event IDs, schema/version guards, journal revisions, deletion protection
+Native event IDs, schema guards, journal revisions, deletion protection
 and the existing at-least-once notification boundary remain unchanged. Move one
 consistent journal, including any WAL and all cursor/outbox/group/media state;
 never run old and new publishers concurrently. Preserve the monitor's repair

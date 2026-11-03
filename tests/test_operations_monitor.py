@@ -146,13 +146,14 @@ class MonitorTests(unittest.TestCase):
         report=self.sample(self.now+30000,allow_repair=True)
         row=next(r for r in report['cameras']if r['cameraId']==cid)
         self.assertTrue(row['confirmedFailure']);self.assertFalse(row['repairEligible']);self.assertFalse(self.repairs)
-    def test_invalid_state_and_unknown_version_never_dispatch(self):
+    def test_invalid_state_never_dispatches_but_version_label_does_not_block_observation(self):
         write_json(self.root/'state.json',{'schemaVersion':2,'repairAttempts':[]})
         report=self.sample(allow_repair=True);self.assertFalse(report['ok']);self.assertFalse(self.repairs)
         self.assertEqual(report['errorCode'],'monitor_state_invalid')
-        self.api.boot['nvr']['version']='future'
+        self.api.boot['nvr']['version']='8.0.0-preview'
         report=media_health.run_once(self.config,api=self.api,fetch=metrics)
-        self.assertEqual(report['errorCode'],'unsupported_protect_version')
+        self.assertTrue(report['ok'],report)
+        self.assertEqual(report['protectVersion'],'8.0.0-preview')
     def test_upstream_secrets_are_not_emitted(self):
         def bad(_):raise RuntimeError('rtsp://PRIVATE_URL_SECRET@upstream bearer-token')
         report=media_health.run_once(self.config,api=self.api,fetch=bad,now_ms=self.now)
@@ -164,11 +165,14 @@ class MonitorTests(unittest.TestCase):
         report=self.sample(allow_repair=True)
         self.assertFalse(report['ok']);self.assertEqual(report['state'],'attention')
         self.assertTrue(report['pendingRecovery']['requiresReview']);self.assertFalse(self.repairs)
-    def test_assessment_cannot_certify_future_matching_schema(self):
+    def test_assessment_reads_real_schema_on_future_releases(self):
         self.api.boot['nvr']['version']='7.3.71';called=[]
-        report=compatibility.assess(self.config,api=self.api,schema_reader=lambda:called.append(True))
-        self.assertEqual(report['state'],'unsupported');self.assertFalse(report['certified'])
-        self.assertFalse(report['nativeWritesAllowed']);self.assertFalse(called)
+        def schema():called.append(True);return {'schemaVerified':True}
+        report=compatibility.assess(self.config,api=self.api,schema_reader=schema,
+            file_reader=lambda _:b'changed-vendor-file',layer_reader=lambda *_:[])
+        self.assertEqual(report['state'],'compatible');self.assertTrue(report['certified'])
+        self.assertTrue(report['nativeWritesAllowed']);self.assertTrue(called)
+        self.assertFalse(report['legacyPatchOwnership']['verified'])
 
 
 class HealthProgressTests(unittest.TestCase):

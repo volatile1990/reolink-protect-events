@@ -193,8 +193,10 @@ exact marker; no successful installation is reported in this case.
 1. Require clean committed source trees. Freeze UTF-8 sources with LF line endings
    and record the exact archive/package hashes and Git revisions. Binary bytes
    remain unchanged. Freeze the actual remote worker source for restoration too.
-2. Run both repositories' offline contracts. Check the currently audited Protect
-   7.3.70 database, camera scope and owned UI/AAC layers without changing them.
+2. Run both repositories' offline contracts. Check the required database contract,
+   camera scope and actual media/functions without changing them. Version and
+   vendor-file hash changes alone are not runtime failures. Historical UI/AAC
+   ownership evidence is reported separately from functional readiness.
 3. Verify six fresh video sources, twelve advancing recording profiles, all native
    High/Low/Automatic modes and real video/audio decoding of all twelve live and
    recorded profiles. Missing decoders or incomplete coverage stop the update.

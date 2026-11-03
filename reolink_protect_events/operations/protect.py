@@ -1,6 +1,7 @@
 """Known Protect camera scope and immutable settings projection."""
 import copy
-from .safety import VERSION, digest, need, validate_config
+import re
+from .safety import digest, need, validate_config
 
 CAMERA_FIELDS = ('id','name','host','mac','uuid','isAdopted','isThirdPartyCamera','isPairedWithAiPort',
  'recordingSettings','recordingSchedules','recordingSchedulesV2','recordingPathSettings',
@@ -14,15 +15,30 @@ NVR_FIELDS = ('id','version','isRecordingDisabled','isRecordingMotionOnly','smar
 OBSERVED_THIRD = frozenset(('availableProfiles','mediaVersion','errors'))
 
 
-def selected_cameras(config, bootstrap, *, require_version=True):
-    validate_config(config, require_credentials=False)
+def _camera_list(bootstrap):
+    """Validate the identity contract, independently of the package label."""
     need(isinstance(bootstrap, dict), 'bootstrap_invalid')
-    if require_version:
-        need(bootstrap.get('nvr', {}).get('version') == VERSION, 'unsupported_protect_version')
     cameras = bootstrap.get('cameras')
     need(isinstance(cameras, list) and all(isinstance(row, dict) for row in cameras), 'camera_list_invalid')
+    need(all(isinstance(row.get('id'), str) and re.fullmatch('[a-f0-9]{24}', row['id'])
+             for row in cameras), 'camera_identity_changed')
     by_id = {row.get('id'): row for row in cameras}
     need(len(by_id) == len(cameras), 'camera_identity_changed')
+    return by_id
+
+
+def observed_version(bootstrap):
+    """The version is diagnostic metadata, never evidence of a capability."""
+    value = bootstrap.get('nvr', {}).get('version')
+    # Keep this standalone operations bundle independent of the native SQL
+    # adapter; use the same bounded package-metadata syntax.
+    return value if isinstance(value, str) and re.fullmatch(r'[0-9][0-9A-Za-z.+:~_-]{0,63}', value) else None
+
+
+def selected_cameras(config, bootstrap):
+    validate_config(config, require_credentials=False)
+    by_id = _camera_list(bootstrap)
+    need(isinstance(bootstrap.get('nvr'), dict), 'protect_nvr_contract_invalid')
     result = []
     for bridge in sorted(config['bridges'], key=lambda row: row['host']):
         camera = by_id.get(bridge['cameraId'])
@@ -36,21 +52,33 @@ def selected_cameras(config, bootstrap, *, require_version=True):
     return result
 
 
-def qualities(camera):
-    enabled = {c.get('id') for c in camera.get('channels', []) if isinstance(c, dict) and c.get('enabled') is True}
+def enabled_channels(camera):
+    channels = camera.get('channels')
+    need(isinstance(channels, list) and 1 <= len(channels) <= 32
+         and all(isinstance(channel, dict) and type(channel.get('id')) is int
+                 and 0 <= channel['id'] <= 31 and type(channel.get('enabled')) is bool
+                 for channel in channels), 'camera_channels_invalid')
+    ids = [channel['id'] for channel in channels]
+    need(len(ids) == len(set(ids)), 'camera_channels_invalid')
+    enabled = {channel['id'] for channel in channels if channel['enabled']}
     allowed={0,1,2,3}if camera.get('isThirdPartyCamera')is False else{0,1,2}
     need(0 in enabled and enabled <= allowed, 'camera_channels_invalid')
+    return sorted(enabled)
+
+
+def qualities(camera):
+    enabled = enabled_channels(camera)
     return [('high', 'recordingEnd', 0)] + ([('low', 'recordingEndLQ', 2)] if 2 in enabled else [])
 
 
 def read_only_cameras(config,bootstrap):
     """An explicit native identity adds observation, never a recovery target."""
     validate_config(config,require_credentials=False)
+    by_id = _camera_list(bootstrap)
     rows=[]
     for expected in config.get('readOnlyCameras',[]):
-        matches=[c for c in bootstrap.get('cameras',[])if c.get('id')==expected['cameraId']]
-        need(len(matches)==1,'readonly_camera_identity_changed')
-        c=matches[0]
+        c=by_id.get(expected['cameraId'])
+        need(c is not None,'readonly_camera_identity_changed')
         need(c.get('host')==expected['host']and c.get('isAdopted')is True
              and c.get('isThirdPartyCamera')is False,'readonly_camera_mapping_changed')
         if expected.get('mac'):
@@ -61,9 +89,7 @@ def read_only_cameras(config,bootstrap):
 
 
 def automatic_channel(camera):
-    enabled = {c.get('id') for c in camera.get('channels', []) if isinstance(c, dict) and c.get('enabled') is True}
-    allowed={0,1,2,3}if camera.get('isThirdPartyCamera')is False else{0,1,2}
-    need(0 in enabled and enabled <= allowed, 'camera_channels_invalid')
+    enabled = enabled_channels(camera)
     return 1 if 1 in enabled else 0
 
 

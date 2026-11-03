@@ -58,6 +58,14 @@ python tools/protect_server.py check
 python tools/protect_server.py rollback --expected-current DIGEST
 ```
 
+Wenn der laufende Code wegen eines veralteten Kompatibilitätsgates nicht mehr
+prüfbar ist, erlaubt `serverrelease.py update --repair-current-contract
+--expected-current DIGEST` die gezielte Reparatur. Der ausdrücklich angegebene
+Ausgangsdigest, sämtliche installierten Dateien und aktiven Dienste werden
+weiterhin geprüft. Der neue Kandidat muss vor Aktivierung seinen vollständigen
+aktuellen Schnittstellenvertrag bestehen; die abschließende Prüfung bleibt
+ebenfalls zwingend. Konfiguration und Zustand werden dabei nicht ersetzt.
+
 ## Getrennte Push-Hooks
 
 Die Installation der Hookdateien ist ein eigener, ausdrücklich auszuführender

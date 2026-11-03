@@ -1,12 +1,12 @@
-"""Read-only compatibility assessment; unknown versions are never certified."""
+"""Separate verified runtime capabilities from historical patch ownership."""
 import hashlib
 import json
 from pathlib import Path
 import re
 import stat
-from ..native import NativeAdapter
+from ..native import adapter_for_config
 from .http import protect_json
-from .protect import selected_cameras, settings_digest
+from .protect import observed_version, selected_cameras, settings_digest
 from . import automatic_profiles
 from .safety import VERSION, OperationError, error_code, need, private_path, read_json, validate_config
 
@@ -141,36 +141,42 @@ def assess(config,events_root='/data/reolink-protect-events',*,api=None,file_rea
            layer_reader=None):
     validate_config(config, require_credentials=False);api=api or protect_json
     result={'schemaVersion':1,'readOnly':True,'certified':False,'nativeWritesAllowed':False,
-            'autoUpgradeAllowed':False,'fullDatabaseRollbackAllowed':False,'checks':{}}
+            'autoUpgradeAllowed':False,'fullDatabaseRollbackAllowed':False,'checks':{},
+            'legacyPatchOwnership':{'verified':False,'checks':{}}}
     try:
-        bootstrap=api(config,'/api/bootstrap');version=bootstrap.get('nvr',{}).get('version')
-        result['observedProtectVersion']=version if isinstance(version,str)and len(version)<=40 else None
-        if version!=VERSION:
-            result.update(ok=False,state='unsupported',errorCode='unsupported_protect_version',
-                          nextAction='inspect_and_test_new_release_contracts');return result
+        bootstrap=api(config,'/api/bootstrap')
+        result['observedProtectVersion']=observed_version(bootstrap)
         cameras=selected_cameras(config,bootstrap);ids=[c['id']for c in cameras]
         result['checks']['cameraScope']=True
         result['currentSettingsSha256']=settings_digest(config,bootstrap)
-        schema=(schema_reader or (lambda:NativeAdapter().guard_schema()))()
-        result['checks']['databaseContract']=schema.get('schemaVerified')is True
+        schema=(schema_reader or (lambda:adapter_for_config(config).guard_schema()))()
+        need(isinstance(schema,dict)and schema.get('schemaVerified')is True,
+             'compatibility_database_contract_failed')
+        result['checks']['databaseContract']=True
+        result.update(ok=True,state='compatible',certified=True,nativeWritesAllowed=True,
+                      certificationBasis='verified-camera-and-database-capabilities')
+    except Exception as error:
+        result.update(ok=False,state='incompatible',errorCode=error_code(error,'compatibility_assessment_failed'))
+        return result
+
+    # These receipts authorize changing/reversing our old byte patches. They do
+    # not prove current playback or event delivery, and an upgraded vendor file
+    # is not a runtime failure. Never rewrite a historical receipt to certify it.
+    ownership=result['legacyPatchOwnership']
+    try:
         file_reader=file_reader or (lambda path:Path(path).read_bytes())
         hashes={path:hashlib.sha256(file_reader(path)).hexdigest()for path in ACTIVE_FILES}
-        result['activeFileHashes']=hashes
+        ownership['activeFileHashes']=hashes
         recognized=hashes==ACTIVE_FILES
         if hashes[SERVICE_PATH]==AUTOMATIC_SERVICE_SHA256 and all(
                 hashes[path]==expected for path,expected in ACTIVE_FILES.items()if path!=SERVICE_PATH):
-            result['automaticInputLayer']=_automatic_input_layer(config,bootstrap,file_reader)
-            result['checks']['automaticInputLayerOwnership']=True
+            ownership['automaticInputLayer']=_automatic_input_layer(config,bootstrap,file_reader)
+            ownership['checks']['automaticInputLayerOwnership']=True
             recognized=True
-        result['checks']['serviceAndAacLayers']=recognized
+        ownership['checks']['serviceAndAacLayers']=recognized
         layers=(layer_reader or _layers)(events_root,ids,file_reader)
-        result['uiLayers']=layers;result['checks']['uiLayerOwnership']=len(layers)==2
-        result['ok']=all(result['checks'].values())
-        result['state']='compatible'if result['ok']else'drift'
-        # This reports an already audited contract, never approval of an
-        # unknown version based only on apparently matching schema columns.
-        result['certified']=result['ok'];result['nativeWritesAllowed']=result['ok']
-        result['certificationBasis']='existing-audited-7.3.70-contract'
+        ownership['uiLayers']=layers;ownership['checks']['uiLayerOwnership']=len(layers)==2
+        ownership['verified']=all(ownership['checks'].values())
     except Exception as error:
-        result.update(ok=False,state='drift',errorCode=error_code(error,'compatibility_assessment_failed'))
+        ownership['reason']=error_code(error,'historical_patch_ownership_unverified')
     return result

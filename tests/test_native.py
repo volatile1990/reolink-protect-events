@@ -134,13 +134,30 @@ class NativeContractTests(unittest.TestCase):
         self.assertIn("ROLLBACK", seen[0])
         self.assertNotIn("INSERT ", seen[0])
 
-    def test_version_or_schema_drift_prevents_write(self):
-        for version in ("7.3.71", "8.0.0", "7.3.70-unknown"):
+    def test_compatible_new_versions_require_and_pass_actual_schema(self):
+        for version in ("7.3.74", "8.0.0", "1:8.0.0~rc1+build.2-1"):
             seen = []
-            db = adapter(lambda sql: seen.append(sql) or "{}", version=version)
-            with self.assertRaises(SchemaError):
-                db.upsert_interval(INTERVAL)
-            self.assertFalse(seen)
+            db = adapter(lambda sql: seen.append(sql) or json.dumps(
+                schema_fixture() if "information_schema" in sql else {"id": INTERVAL["eventId"]}), version=version)
+            self.assertEqual(db.guard_schema()["protectVersion"], version)
+            self.assertEqual(db.protect_version, version)
+            self.assertEqual(len(seen), 1)
+            self.assertIn("BEGIN READ ONLY", seen[0])
+            db.upsert_interval(INTERVAL)
+            self.assertIn("INSERT INTO events", seen[-1])
+
+    def test_missing_or_malformed_metadata_requires_fresh_schema_but_does_not_block_function(self):
+        for version in (None, "", "unknown", "7.3.74\nsecret", "7.3.74;id", "7" * 65):
+            seen = []
+            db = adapter(lambda sql: seen.append(sql) or json.dumps(
+                schema_fixture() if "information_schema" in sql else {"id": INTERVAL["eventId"]}), version=version)
+            db.upsert_interval(INTERVAL)
+            db.upsert_interval(INTERVAL)
+            self.assertEqual(sum("BEGIN READ ONLY" in sql for sql in seen), 2)
+            self.assertIsNone(db.protect_version)
+            self.assertIsNone(db._guarded_at)
+
+    def test_schema_drift_prevents_write(self):
         for mutation in ("missing-column", "changed-type", "missing-index", "changed-index-semantics", "wrong-database"):
             schema = schema_fixture()
             if mutation == "missing-column":
@@ -160,10 +177,67 @@ class NativeContractTests(unittest.TestCase):
             self.assertEqual(len(seen), 1)
             self.assertNotIn("INSERT ", seen[0])
 
+    def test_version_change_invalidates_cached_schema_before_native_write(self):
+        version = ["7.3.70"]
+        schema = schema_fixture()
+        queries = []
+        def execute(sql):
+            queries.append(sql)
+            return json.dumps(schema if "information_schema" in sql else {"id": INTERVAL["eventId"]})
+        db = NativeAdapter(execute=execute, version_reader=lambda: version[0], guard_interval=3600)
+        db.guard_schema()
+        version[0] = "7.3.74"
+        schema["columns"].pop()
+        with self.assertRaises(SchemaError):
+            db.upsert_interval(INTERVAL)
+        self.assertEqual(len(queries), 2)
+        self.assertTrue(all("BEGIN READ ONLY" in sql for sql in queries))
+        self.assertIsNone(db._guarded_at)
+        # Fixing the capability, without any package/config pin edit, permits retry.
+        schema = schema_fixture()
+        db.upsert_interval(INTERVAL)
+        self.assertEqual(db._guarded_version, "7.3.74")
+        self.assertIn("INSERT INTO events", queries[-1])
+
+    def test_upgrade_during_schema_verification_never_populates_cache(self):
+        versions = iter(("7.3.70", "7.3.74"))
+        db = NativeAdapter(execute=lambda _: json.dumps(schema_fixture()), version_reader=lambda: next(versions))
+        self.assertTrue(db.guard_schema()["schemaVerified"])
+        self.assertIsNone(db._guarded_at)
+        self.assertIsNone(db._guarded_version)
+
+    def test_failed_metadata_read_requires_new_schema_instead_of_reusing_cache(self):
+        with patch("reolink_protect_events.native.NativeAdapter._installed_version", return_value="7.3.70"):
+            db = NativeAdapter(execute=lambda _: json.dumps(schema_fixture()))
+            db.guard_schema()
+        db.version_reader = lambda: None
+        with patch.object(db, "execute", return_value=json.dumps(schema_fixture())) as execute:
+            db._ensure_guard()
+            self.assertIn("information_schema", execute.call_args.args[0])
+        self.assertIsNone(db.protect_version)
+        self.assertIsNone(db._guarded_at)
+
     def test_schema_guard_accepts_actual_unquoted_label_index(self):
         schema = schema_fixture()
         schema["indexes"][0]["definition"] = schema["indexes"][0]["definition"].replace('"labels_name_key"', 'labels_name_key')
         self.assertTrue(adapter(lambda sql: json.dumps(schema)).guard_schema()["schemaVerified"])
+
+    def test_equivalent_renamed_indexes_are_capabilities_not_version_pins(self):
+        schema=schema_fixture()
+        for index in schema['indexes']:
+            old=index['name'];index['name']='new_'+old
+            index['definition']=index['definition'].replace(old,index['name'])
+        self.assertTrue(adapter(lambda _:json.dumps(schema),version='9.0.0').guard_schema()['schemaVerified'])
+
+    def test_malformed_or_ambiguous_capability_evidence_fails_closed(self):
+        for mutation in ('columns_missing','columns_invalid','columns_duplicate','indexes_invalid'):
+            schema=schema_fixture()
+            if mutation=='columns_missing':schema.pop('columns')
+            elif mutation=='columns_invalid':schema['columns']=[None]
+            elif mutation=='columns_duplicate':schema['columns'].append(schema['columns'][0])
+            else:schema['indexes']=[{'definition':None}]
+            with self.subTest(mutation=mutation),self.assertRaises(SchemaError):
+                adapter(lambda _:json.dumps(schema)).upsert_interval(INTERVAL)
 
     def test_interval_uses_real_classes_and_explicit_unknown_spatial_data(self):
         sql, event = adapter().build_interval_sql(INTERVAL)

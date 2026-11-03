@@ -23,7 +23,6 @@ import urllib.parse
 CONFIG = Path('/data/reolink-protect-connector/config.json')
 RPC_COMMAND = 'python3 /usr/local/lib/reolink-protect-connector.py'
 MAX_REQUEST = 12 * 1024 * 1024
-VERSION = '7.3.70'
 
 
 class ConnectorError(Exception):
@@ -109,11 +108,13 @@ def load_config(path=CONFIG):
 
 
 def installed_version():
-    response = subprocess.run(['dpkg-query', '--show', '--showformat=${Version}', 'unifi-protect'],
-                              capture_output=True, text=True, timeout=5)
-    need(response.returncode == 0 and response.stdout.strip() == VERSION,
-         'connector_protect_version_changed')
-    return response.stdout.strip()
+    try:
+        response = subprocess.run(['dpkg-query', '--show', '--showformat=${Version}', 'unifi-protect'],
+                                  capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    version = response.stdout.strip()
+    return version if response.returncode == 0 and re.fullmatch(r'[0-9][0-9A-Za-z.+:~_-]{0,63}', version) else None
 
 
 def validate_sql(value):
@@ -132,7 +133,6 @@ def validate_sql(value):
 
 
 def execute_sql(value):
-    installed_version()
     sql = validate_sql(value)
     response = subprocess.run(['runuser', '-u', 'postgres', '--', 'psql', '-h', '/run/postgresql',
         '-p', '5433', '-d', 'unifi-protect', '-w', '-X', '-q', '-A', '-t',
@@ -171,7 +171,6 @@ def api_request(config, request):
              and type(body['thirdPartyCameraInfo']['forceTcp']) in (type(None), bool)
              and body['thirdPartyCameraInfo']['forceTcp'] in (None, True),
              'connector_api_write_scope')
-        installed_version()
     else:
         raise ConnectorError('connector_api_method')
     timeout, limit = request.get('timeout', 8), request.get('limit', 10000000)

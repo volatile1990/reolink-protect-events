@@ -265,9 +265,9 @@ try:
  schema=adapter_for_config(config).guard_schema()
  bootstrap=protect_json(config,'/api/bootstrap',timeout=8)
  cameras=selected_cameras(config,bootstrap)
- if schema.get('schemaVerified') is not True or bootstrap.get('nvr',{}).get('version')!='7.3.70' or len(cameras)!=6:raise ValueError()
+ if schema.get('schemaVerified') is not True or len(cameras)!=6:raise ValueError()
  import PIL
- print(json.dumps({'ok':True,'remoteConfigured':True,'nativeSchemaVerified':True,'protectVersion':'7.3.70','cameraCount':6,'pillowVersion':PIL.__version__}))
+ print(json.dumps({'ok':True,'remoteConfigured':True,'nativeSchemaVerified':True,'protectVersion':schema.get('protectVersion'),'cameraCount':6,'pillowVersion':PIL.__version__}))
 except Exception:
  print(json.dumps({'ok':False,'errorCode':'heimserver_remote_contract_failed'}))
 '''

@@ -572,7 +572,7 @@ class StartupClock:
 
 
 def probe_fmp4(config, camera, channel, *, seconds=12, api=None, connector=None, clock=None):
-    """One local EMS session using effective browser flags, never a UI/auth claim."""
+    """Measure effective flags and media, independently of installation hashes."""
     options = configuration(config)
     need(options['enabled'], 'fmp4_probe_not_enabled')
     need(type(seconds) is int and 8 <= seconds <= 12, 'fmp4_duration_invalid')
@@ -583,7 +583,6 @@ def probe_fmp4(config, camera, channel, *, seconds=12, api=None, connector=None,
     began = clock(); deadline = began + 8; connection = None; started = None; received = 0
     collector = None; parser = None; first = None; failure = None; returned = None; observed_ended = None
     try:
-        verify_configuration(options, config, timeout=max(0.01, deadline - clock()))
         need(clock() < deadline, 'fmp4_setup_timeout')
         query = {'camera': camera['id'], 'channel': channel, 'lens': 0, 'type': 'fmp4', **flags}
         query = {k: str(v).lower() if type(v) is bool else v for k, v in query.items()}
@@ -634,11 +633,9 @@ def probe_fmp4(config, camera, channel, *, seconds=12, api=None, connector=None,
                 wire = framed if prelude[0] in framed.NAMES else parser
                 chunk = bytes(prelude); prelude.clear()
             wire.feed(chunk, now)
-        # End the bounded viewer session before a remote pin read. Its latency
-        # must neither keep the viewer open nor age already observed samples.
+        # End the bounded viewer session before evaluating observed samples.
         observed_ended = clock()
         connection.close(); connection = None
-        verify_configuration(options, config)
     except ProbeError as error:
         failure = str(error)  # Parser errors have a fixed vocabulary.
     except Exception as error:

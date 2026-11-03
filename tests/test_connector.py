@@ -77,10 +77,21 @@ class ConnectorContract(unittest.TestCase):
         with self.assertRaises(connector.ConnectorError):
             connector.file_hashes(self.config,{'paths':['/root/.ssh/id_ed25519']})
 
-    def test_version_pin_is_required(self):
-        with patch.object(connector.subprocess,'run',return_value=subprocess.CompletedProcess([],0,'7.4.0','')):
-            with self.assertRaises(connector.ConnectorError)as error:connector.installed_version()
-        self.assertEqual(error.exception.code,'connector_protect_version_changed')
+    def test_package_metadata_accepts_new_versions_and_rejects_ambiguous_values(self):
+        for version in ('7.3.74','8.0.0','1:8.0.0~rc1+build.2-1'):
+            with self.subTest(version=version),patch.object(connector.subprocess,'run',
+                    return_value=subprocess.CompletedProcess([],0,version,'')):
+                self.assertEqual(connector.installed_version(),version)
+        for version,code in (('',0),('unknown',0),('7.3.74\nsecret',0),('7.3.74;id',0),('7'*65,0),('7.3.74',1)):
+            with self.subTest(version=version),patch.object(connector.subprocess,'run',
+                    return_value=subprocess.CompletedProcess([],code,version,'')):
+                self.assertIsNone(connector.installed_version())
+
+    def test_sql_function_does_not_depend_on_package_metadata(self):
+        response=subprocess.CompletedProcess([],0,'[]','')
+        with patch.object(connector,'installed_version',side_effect=AssertionError('metadata must not gate SQL')), \
+                patch.object(connector.subprocess,'run',return_value=response):
+            self.assertEqual(connector.execute_sql('BEGIN READ ONLY; SELECT 1; ROLLBACK;'),'[]')
 
     def test_body_deadline_is_total_even_when_peer_keeps_sending(self):
         first,second=socket.socketpair();stop=threading.Event()

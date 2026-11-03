@@ -105,15 +105,16 @@ class FairMonitorTests(unittest.TestCase):
             {(kind,cid)for kind in ('ubv','fmp4')for cid in self.ids})
         self.assertTrue(report['activeCoverageVerified']);self.assertTrue(report['ok']);self.assertEqual(report['state'],'healthy')
 
-    def test_pin_drift_requires_attention_and_never_repairs_or_claims_startup_verified(self):
+    def test_pin_drift_does_not_override_successful_startup_probes(self):
         self.config['fmp4Startup']={'enabled':True}
         with patch.object(monitor,'verify_fmp4_configuration',side_effect=OperationError('fmp4_configuration_drift')):
             for i in range(13):
                 self.at=self.now+i*50000
                 report=self.sample(allow_repair=True,recover=lambda *_a,**_kw:self.fail('config drift cannot repair'))
-        self.assertEqual(report['state'],'attention');self.assertFalse(report['ok'])
-        self.assertFalse(any(kind=='fmp4'for kind,_ in self.calls))
-        self.assertFalse(any(r['fmp4StartupVerified']for r in report['cameras']))
+        self.assertEqual(report['state'],'healthy');self.assertTrue(report['ok'])
+        self.assertFalse(report['actionRequired']);self.assertIsNone(report['fmp4ConfigurationVerified'])
+        self.assertTrue(any(kind=='fmp4'for kind,_ in self.calls))
+        self.assertTrue(all(r['fmp4StartupVerified']for r in report['cameras']))
 
     def evidence_state(self):
         return {cid:{'connectionEpoch':1,'failureSourceEpoch':1,'failures':0,'repairAttempts':[],

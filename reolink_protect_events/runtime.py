@@ -99,8 +99,6 @@ def validate_config(config):
     stale = config.get("bridgeEventStaleSeconds", 120)
     if type(stale) is not int or not 5 <= stale <= 600:
         raise ValueError("invalid_stale_seconds")
-    if config.get("protectVersion", "7.3.70") != "7.3.70":
-        raise ValueError("unsupported_protect_version")
     from .thumbnails import settings
     settings(config)
     from .frigate import settings as frigate_settings
@@ -802,6 +800,7 @@ class Runtime:
                     last_media_future = worker._media_future
                     self._native_state = {"atMs": int(time.time() * 1000), "nativeReady": worker.native_ready,
                         "nativeError": worker.native_error, "nativeDurationMs": round((time.monotonic() - began) * 1000, 2),
+                        "protectVersion": getattr(worker.native, "protect_version", None),
                         "importErrors": worker.journal.counter("nativeImportErrors")}
                 self._native_wake.wait(worker._native_wait_seconds())
         except Exception as error:
@@ -956,7 +955,7 @@ class Runtime:
         health = self.journal.health()
         health.update(atMs=now_ms, mode="capture" if self.capture_only else "native", bridges=self.bridge_health,
                       importErrors=self.import_errors, nativeReady=self.native_ready, nativeError=self.native_error,
-                      protectVersion=self.config.get("protectVersion", "7.3.70"), pollDurationMs=self.last_poll_duration_ms)
+                      protectVersion=getattr(self.native, "protect_version", None), pollDurationMs=self.last_poll_duration_ms)
         if self._native_thread is not None:
             with self._state_lock:
                 native_state = dict(self._native_state)

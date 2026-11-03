@@ -1,6 +1,6 @@
-"""Truthful native event persistence for the inspected Protect 7.3.70 schema.
+"""Truthful native event persistence for a verified Protect database contract.
 
-This is a private, version-pinned PostgreSQL integration. It writes camera
+This is a private, capability-checked PostgreSQL integration. It writes camera
 classification intervals, never inferred confidence, boxes, embeddings or tracks.
 The caller owns source authentication, interval lifecycle and DS notifications.
 """
@@ -15,7 +15,6 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 
-SUPPORTED_PROTECT_VERSION = "7.3.70"
 OWNER = "reolink-protect-events"
 CLASSES = frozenset(("person", "vehicle", "animal"))
 # Protect 7.3.70 stores both visual and audio enum values in the event's
@@ -36,7 +35,12 @@ class NativeError(RuntimeError):
 
 
 class SchemaError(NativeError):
-    """The installed version/schema does not match the supported contract."""
+    """The required database capabilities cannot be verified."""
+
+
+def valid_package_version(value):
+    """Bounded Debian package metadata, never a compatibility allowlist."""
+    return isinstance(value, str) and re.fullmatch(r"[0-9][0-9A-Za-z.+:~_-]{0,63}", value) is not None
 
 
 class RetiredEventError(NativeError):
@@ -264,7 +268,7 @@ def adapter_for_config(config):
     """Keep native SQL/guards unchanged while selecting local or SSH execution."""
     from . import remote
     options = remote.settings(config)
-    version = config.get("protectVersion", SUPPORTED_PROTECT_VERSION)
+    version = config.get("protectVersion")
     if options is None:
         return NativeAdapter(protect_version=version)
 
@@ -283,20 +287,22 @@ def adapter_for_config(config):
         try:
             result = remote.rpc(config, "version", timeout=5)
         except remote.RemoteError:
-            raise SchemaError("Cannot verify the remote Protect version") from None
-        if not isinstance(result, str) or not result or len(result) > 64:
-            raise SchemaError("Cannot verify the remote Protect version")
+            return None
+        if not valid_package_version(result):
+            return None
         return result.strip()
 
     return NativeAdapter(protect_version=version, execute=execute, version_reader=installed_version)
 
 
 class NativeAdapter:
-    def __init__(self, protect_version=SUPPORTED_PROTECT_VERSION, execute=None,
+    def __init__(self, protect_version=None, execute=None,
                  psql_command=None, version_reader=None, timeout=15, guard_interval=60):
-        if protect_version != SUPPORTED_PROTECT_VERSION:
-            raise SchemaError("Only Protect " + SUPPORTED_PROTECT_VERSION + " is supported")
-        self.protect_version = protect_version
+        # Retain the historical configuration field for old deployments. The
+        # actual database contract authorizes operations; package metadata only
+        # invalidates cached evidence when the installed package changes.
+        self.protect_version = None
+        self._guarded_version = None
         self.timeout = timeout
         self.guard_interval = guard_interval
         self.psql_command = list(psql_command or ["runuser", "-u", "postgres", "--", "psql",
@@ -333,8 +339,9 @@ class NativeAdapter:
         return result.stdout.strip()
 
     def guard_schema(self):
-        if self.version_reader() != SUPPORTED_PROTECT_VERSION:
-            raise SchemaError("Installed Protect version changed; native writes are disabled")
+        self._guarded_at = None
+        self._guarded_version = None
+        version = self._read_version()
         tables = ",".join(sql_text(name) for name in sorted(_REQUIRED_COLUMNS))
         query = """BEGIN READ ONLY;
 SET LOCAL statement_timeout = '10s';
@@ -348,32 +355,57 @@ ROLLBACK;
         data = _read_json_output(self.execute(query))
         if not isinstance(data, dict) or data.get("database") != "unifi-protect":
             raise SchemaError("Unexpected Protect database")
+        for kind, fields in (("columns", ("table", "column", "type")),
+                             ("indexes", ("table", "name", "definition"))):
+            rows = data.get(kind)
+            if not isinstance(rows, list) or not all(isinstance(row, dict) and all(
+                    isinstance(row.get(field), str) for field in fields) for row in rows):
+                raise SchemaError("Protect database capability evidence is incomplete")
         columns = {(item.get("table"), item.get("column")): item.get("type") for item in data.get("columns", [])}
+        if len(columns) != len(data["columns"]):
+            raise SchemaError("Protect database column evidence is ambiguous")
         missing = [(table, column) for table, expected in _REQUIRED_COLUMNS.items()
                    for column, kind in expected.items() if columns.get((table, column)) != kind]
         if missing:
             raise SchemaError("Protect database column contract changed")
         # pg_get_indexdef quotes mixed-case names, but ordinary labels_name_key
         # is normally unquoted. Verify semantics, not the cosmetic quoting.
-        definitions = {(item.get("table"), item.get("name")):
-            re.sub(r"\s+", " ", item.get("definition", "").replace('"', '').lower()).strip()
-            for item in data.get("indexes", [])}
+        definitions = {(item["table"], re.sub(r"^create unique index [^ ]+ ", "create unique index ",
+            re.sub(r"\s+", " ", item["definition"].replace('"', '').lower()).strip()))
+            for item in data["indexes"]}
         required_indexes = {
-            ("labels", "labels_name_key"):
-                "create unique index labels_name_key on public.labels using btree (name)",
-            ("detectionLabels", "detectionLabels_eventId_index_unique"):
-                "create unique index detectionlabels_eventid_index_unique on public.detectionlabels using btree (eventid) where (objectid is null)",
-            ("detectionLabels", "detectionLabels_eventId_objectId_index_unique"):
-                "create unique index detectionlabels_eventid_objectid_index_unique on public.detectionlabels using btree (eventid, objectid) where (objectid is not null)",
+            ("labels", "create unique index on public.labels using btree (name)"),
+            ("detectionLabels", "create unique index on public.detectionlabels using btree (eventid) where (objectid is null)"),
+            ("detectionLabels", "create unique index on public.detectionlabels using btree (eventid, objectid) where (objectid is not null)"),
         }
-        if any(definitions.get(key) != expected for key, expected in required_indexes.items()):
+        if not required_indexes <= definitions:
             raise SchemaError("Protect database index contract changed")
-        self._guarded_at = time.monotonic()
-        return {"protectVersion": SUPPORTED_PROTECT_VERSION, "database": "unifi-protect",
+        current_version = self._read_version()
+        # Package metadata invalidates cached evidence; it never substitutes for
+        # or vetoes this actual database verification. Unavailable or changing
+        # metadata disables caching, so the next operation verifies again.
+        if version is not None and current_version == version:
+            self._guarded_version = version
+            self._guarded_at = time.monotonic()
+        return {"protectVersion": current_version, "database": "unifi-protect",
                 "schemaVerified": True}
 
+    def _read_version(self):
+        try:
+            version = self.version_reader()
+            if not valid_package_version(version):
+                version = None
+        except Exception:
+            version = None
+        self.protect_version = version
+        return version
+
     def _ensure_guard(self):
-        if self._guarded_at is None or time.monotonic() - self._guarded_at >= self.guard_interval:
+        if self._guarded_at is None:
+            self.guard_schema()
+            return
+        version = self._read_version()
+        if version is None or version != self._guarded_version or time.monotonic() - self._guarded_at >= self.guard_interval:
             self.guard_schema()
 
     def build_interval_sql(self, interval, thumbnail=None):

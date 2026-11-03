@@ -56,6 +56,12 @@ class VerificationTests(unittest.TestCase):
         checks = verify_checks(report(), EVENT, ['person'], [CAMERA])
         self.assertTrue(all(checks.values()), checks)
 
+    def test_actual_event_api_graph_and_thumbnail_results_ignore_package_metadata(self):
+        for version in ('7.3.74', '8.0.0', None):
+            value = report()
+            value['protectVersion'] = version
+            self.assertTrue(all(verify_checks(value, EVENT, ['person'], [CAMERA]).values()))
+
     def test_truthful_external_and_mixed_union_sources_are_verified(self):
         for types, origin, source in ((["frigate"], "external-model", "frigate-object-detection"),
                                       (["frigate", "reolink"], "mixed", "reolink-and-frigate")):
@@ -68,7 +74,7 @@ class VerificationTests(unittest.TestCase):
 
     def test_group_verifies_both_classes_at_their_actual_times_without_person_image(self):
         checks = verify_checks(group_report(), EVENT, ['person', 'vehicle'], [CAMERA])
-        self.assertEqual(len(checks), 14)
+        self.assertEqual(len(checks), 13)
         self.assertTrue(all(checks.values()), checks)
         value = group_report()
         value['event']['end'] = None
@@ -108,7 +114,6 @@ class VerificationTests(unittest.TestCase):
 
     def test_previously_ignored_failures_are_rejected_individually(self):
         for name, mutate in (
-            ('version', lambda r: r.update(protectVersion='new version')),
             ('bootstrap', lambda r: r.update(bootstrapApiStatus=503)),
             ('eventApi', lambda r: r['event'].update(id='5' * 24)),
             ('sourceOwnership', lambda r: r['event'].update(owner='other integration')),
