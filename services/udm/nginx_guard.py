@@ -420,6 +420,39 @@ def run(recipes_path, *, apply=False):
             'sharedSha256': digest(candidate), 'archiveConfigured': all(configured)}
 
 
+def watch(recipes_path, *, apply=False, watch_seconds=0):
+    """Wait briefly for native generated files without hiding missing recipes."""
+    need(0 <= watch_seconds <= 90, 'invalid_watch_duration')
+    deadline = time.monotonic() + (watch_seconds if apply else 0)
+    passes, restorations = 0, 0
+    while True:
+        try:
+            report = run(recipes_path, apply=apply)
+        except FileNotFoundError as error:
+            # Native Core creates these files asynchronously after Protect is
+            # ready. A missing private recipe/helper or parent directory is a
+            # different fault and must not be mislabeled as pending config.
+            missing = Path(error.filename) if error.filename is not None else None
+            if missing not in (MAIN, SHARED):
+                raise
+            report = {'ok': False, 'state': 'native_config_pending', 'changed': False,
+                      'pendingTarget': 'main' if missing == MAIN else 'shared',
+                      'healthBasis': 'functional_probes_required', 'protectRestarted': False}
+        except ContractError as error:
+            operation_failed = str(error) in ('nginx_syntax_failed', 'nginx_reload_failed',
+                'concurrent_main_change', 'concurrent_shared_change', 'nginx_rollback_conflict',
+                'nginx_rollback_failed')
+            report = {'ok': not operation_failed,
+                      'state': 'operation_failed' if operation_failed else 'contract_changed', 'changed': False,
+                      'contractDetail': str(error), 'healthBasis': 'functional_probes_required',
+                      'protectRestarted': False}
+        passes += 1
+        restorations += report.get('state') == 'restored'
+        if time.monotonic() >= deadline or restorations >= 3:
+            return dict(report, passes=passes, restorations=restorations)
+        time.sleep(min(2, max(0, deadline - time.monotonic())))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--recipes', type=Path, required=True)
@@ -427,11 +460,10 @@ def main():
     parser.add_argument('--watch-seconds', type=int, default=0)
     args = parser.parse_args()
     need(0 <= args.watch_seconds <= 90, 'invalid_watch_duration')
-    deadline = time.monotonic() + (0 if args.check else args.watch_seconds)
     # Serialize only this owned Nginx mutation, independently of Protect and its
     # native startup. Metadata incompatibility never stops the engine.
-    import fcntl
     if not args.check:
+        import fcntl
         secure_path(ROOT, private=True, directory=True)
     fd = os.open(ROOT / 'nginx-contract.lock', os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0), 0o600) if not args.check else None
     try:
@@ -440,24 +472,7 @@ def main():
             need(stat.S_ISREG(meta.st_mode) and meta.st_uid == 0 and meta.st_nlink == 1
                  and not meta.st_mode & 0o077, 'unsafe_lock')
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        passes, restorations = 0, 0
-        while True:
-            try:
-                report = run(args.recipes, apply=not args.check)
-            except ContractError as error:
-                operation_failed = str(error) in ('nginx_syntax_failed', 'nginx_reload_failed',
-                    'concurrent_main_change', 'concurrent_shared_change', 'nginx_rollback_conflict',
-                    'nginx_rollback_failed')
-                report = {'ok': not operation_failed,
-                          'state': 'operation_failed' if operation_failed else 'contract_changed', 'changed': False,
-                          'contractDetail': str(error), 'healthBasis': 'functional_probes_required',
-                          'protectRestarted': False}
-            passes += 1
-            restorations += report.get('state') == 'restored'
-            if time.monotonic() >= deadline or restorations >= 3:
-                break
-            time.sleep(min(2, max(0, deadline - time.monotonic())))
-        print(json.dumps(dict(report, passes=passes, restorations=restorations)))
+        print(json.dumps(watch(args.recipes, apply=not args.check, watch_seconds=args.watch_seconds)))
     finally:
         if fd is not None:
             os.close(fd)

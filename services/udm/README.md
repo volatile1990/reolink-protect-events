@@ -30,6 +30,10 @@ Nginx and reloads it. A failed transaction rolls back only its own unchanged
 candidates in both files. It never restarts Protect.
 `--watch-seconds 45` handles bounded native regeneration after startup. Both
 mutating helpers serialize their own operations and preserve root ownership.
+Missing native root/shared configuration is reported as `native_config_pending`
+and retried within that window. Missing private recipes or source directories
+remain errors. The existing path unit watches both native files and can restore
+their owned fragments when Core generates them after the startup window.
 
 ## Required modules survive firmware replacement
 

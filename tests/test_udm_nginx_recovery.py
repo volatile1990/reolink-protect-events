@@ -1,6 +1,9 @@
 """Recover owned routes after native root/shared Nginx regeneration."""
 import base64
+import contextlib
+import errno
 import importlib.util
+import io
 import json
 from pathlib import Path
 import sys
@@ -354,6 +357,7 @@ class ArchiveRecoveryTests(unittest.TestCase):
         self.assertEqual(fixture.data[nginx.MAIN], ROOT)
         self.assertEqual(fixture.data[nginx.SHARED], FULL_SHARED)
 
+
     def test_incomplete_archive_recipe_prevents_every_write(self):
         fixture = self.fixture()
         config = json.loads(fixture.data[fixture.path])
@@ -387,6 +391,95 @@ class ArchiveRecoveryTests(unittest.TestCase):
         self.assertEqual(fixture.data[nginx.MAIN], foreign)
         self.assertEqual(fixture.data[nginx.SHARED], FULL_SHARED)
 
+
+class NativeConfigStartupTests(unittest.TestCase):
+    class Clock:
+        def __init__(self):
+            self.now = 0
+            self.sleeps = []
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.sleeps.append(seconds)
+            self.now += seconds
+
+    def watch(self, callback, *, apply=True, seconds=45):
+        self.clock = self.Clock()
+        with mock.patch.object(nginx.time, 'monotonic', side_effect=self.clock.monotonic), \
+                mock.patch.object(nginx.time, 'sleep', side_effect=self.clock.sleep), \
+                mock.patch.object(nginx, 'run', side_effect=callback) as runner:
+            report = nginx.watch(Path('/private/recipes.json'), apply=apply, watch_seconds=seconds)
+        self.calls = runner.call_args_list
+        return report
+
+    def missing(self, path):
+        return FileNotFoundError(errno.ENOENT, 'synthetic file not created yet', str(path))
+
+    def test_pending_native_shared_then_present_retries_inside_bounded_watch(self):
+        results = iter([self.missing(nginx.SHARED),
+                        {'ok': True, 'state': 'present', 'archiveConfigured': True}])
+        def run(*args, **kwargs):
+            result = next(results)
+            if isinstance(result, Exception):
+                raise result
+            return result
+        report = self.watch(run, seconds=2)
+        self.assertEqual(report['state'], 'present')
+        self.assertEqual(report['passes'], 2)
+        self.assertEqual(self.clock.sleeps, [2])
+        self.assertTrue(all(call.kwargs == {'apply': True} for call in self.calls))
+
+    def test_persistent_native_missing_is_reported_after_exact_bounded_deadline(self):
+        def missing(*args, **kwargs):
+            raise self.missing(nginx.SHARED)
+        report = self.watch(missing)
+        self.assertFalse(report['ok'])
+        self.assertEqual(report['state'], 'native_config_pending')
+        self.assertEqual(report['pendingTarget'], 'shared')
+        self.assertEqual(report['healthBasis'], 'functional_probes_required')
+        self.assertFalse(report['protectRestarted'])
+        self.assertEqual(report['passes'], 24)
+        self.assertEqual(sum(self.clock.sleeps), 45)
+
+    def test_only_exact_native_main_and_shared_paths_are_transient(self):
+        for path in (Path('/private/recipes.json'), nginx.SHARED.parent,
+                     Path('/unknown/helper.py')):
+            with self.subTest(path=path), self.assertRaises(FileNotFoundError):
+                self.watch(lambda *args, **kwargs: (_ for _ in ()).throw(self.missing(path)))
+            self.assertEqual(self.clock.sleeps, [])
+
+    def test_check_of_missing_native_main_does_not_wait_or_apply(self):
+        def missing(*args, **kwargs):
+            raise self.missing(nginx.MAIN)
+        report = self.watch(missing, apply=False)
+        self.assertEqual(report['pendingTarget'], 'main')
+        self.assertEqual(report['passes'], 1)
+        self.assertEqual(self.clock.sleeps, [])
+        self.assertEqual(self.calls[0].kwargs, {'apply': False})
+
+    def test_check_cli_never_opens_mutation_lock_or_writes(self):
+        argv = ['nginx_guard.py', '--recipes', '/private/recipes.json', '--check', '--watch-seconds', '45']
+        missing = self.missing(nginx.SHARED)
+        with mock.patch.object(sys, 'argv', argv), \
+                mock.patch.object(nginx, 'run', side_effect=missing) as runner, \
+                mock.patch.object(nginx.os, 'open') as opened, \
+                mock.patch.object(nginx, 'secure_path') as secured, \
+                mock.patch.object(nginx, 'atomic') as written, \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            nginx.main()
+        self.assertEqual(json.loads(output.getvalue())['state'], 'native_config_pending')
+        runner.assert_called_once_with(Path('/private/recipes.json'), apply=False)
+        opened.assert_not_called()
+        secured.assert_not_called()
+        written.assert_not_called()
+
+    def test_existing_maximum_three_restorations_is_retained(self):
+        report = self.watch(lambda *args, **kwargs: {'ok': True, 'state': 'restored'}, seconds=90)
+        self.assertEqual(report['restorations'], 3)
+        self.assertEqual(report['passes'], 3)
+        self.assertEqual(sum(self.clock.sleeps), 4)
 
 if __name__ == '__main__':
     unittest.main()
