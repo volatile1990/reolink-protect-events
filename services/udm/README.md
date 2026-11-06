@@ -18,14 +18,56 @@ Dependent transformations are grouped; an incompatible group is left untouched
 while independent functions remain available. The helper never restarts Protect
 or prevents its native startup. Runtime health comes from actual function probes.
 
-`nginx_guard.py --recipes PATH --check` verifies the existing owned query map and
-plans three precisely owned live routes. Applying it copies the *current* native
-Protect authentication block, retains unrelated locations, rejects overlapping
-foreign routes and validates nginx before reloading. It never restarts Protect.
+`nginx_guard.py --recipes PATH --check` plans restoration of the owned query map
+and three precisely owned live routes even when firmware regenerated the root
+configuration. The optional paired private fields `nginxOwnedArchiveMaps` and
+`nginxOwnedArchiveRoute` retain the existing scoped archive bridge to port 7712.
+`archive_recipe_fragments` extracts these fragments only from independently
+verified historical snapshots and requires both existing ownership hashes.
+Applying recovery copies the *current* native Protect authentication blocks,
+retains unrelated locations, rejects overlapping foreign routes, validates
+Nginx and reloads it. A failed transaction rolls back only its own unchanged
+candidates in both files. It never restarts Protect.
 `--watch-seconds 45` handles bounded native regeneration after startup. Both
 mutating helpers serialize their own operations and preserve root ownership.
 
-Install these three scripts together in a root-owned mode-0700 directory. Their
+## Required modules survive firmware replacement
+
+`runtime_assets.py` is part of startup recovery, before the service/UI
+transformations. The private `assets.json` beside `recipes.json` describes
+exactly four owned dependencies: `protect-hook.cjs`, the two
+`ubv-aac-clock-compat*.cjs` modules and `reolink-protect-connector.py`. Their
+verified source files live in the adjacent private `assets/` directory.
+Directories are root-owned 0700; the manifest and saved sources are 0600.
+Restored runtime programs under `/usr/local/lib` are root-owned 0644.
+
+Every row has `target`, `source` (the target basename), `sha256` and
+`allowedBefore` (explicit hashes of older owned bytes, normally empty). No
+additional target or arbitrary source path is accepted. Hashes apply only to
+our own module bytes; Protect version numbers and complete vendor bundles do
+not determine compatibility. Prepare the saved connector from the current
+canonical `reolink_protect_events/connector.py`, not an older legacy snapshot.
+Update the private saved sources and their manifest together when publishing
+new owned module code. An unknown existing target is a conflict, not permission
+to replace another operator's changes.
+
+Before the first write, recovery checks the complete source set, current target
+ownership, permissions, links and syntax. Missing files and their one approved
+directory are restored atomically with compare-and-swap and directory fsync.
+The runtime guard then verifies the installed dependencies before adding their
+callers. If a required runtime module remains unavailable, only an exact,
+unambiguous owned caller can be reversed so native Protect can start without a
+dangling `require`. A bad saved copy alone does not remove callers whose current
+installed modules still match their approved hashes. The report distinguishes
+backup readiness from actual runtime readiness.
+
+`runtime_contracts.py --recipes PATH --check` checks both the saved sources and
+the installed dependencies without restoring files. The normal startup command
+uses the same manifest and restores absent modules first. The existing
+root-private recipe lock serializes both stages. The old `runtime_restore.py`
+must not be reinstated: it also contains old complete vendor bundles.
+
+Install all four scripts together in a root-owned mode-0700 directory. Their
 startup commands use `python3 -B`. Replace only the existing owned runtime,
 Automatic-input and nginx drop-ins; preserve native service configuration and
 unrelated drop-ins. The separate Automatic-input pre-hook is redundant because

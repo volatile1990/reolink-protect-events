@@ -24,6 +24,11 @@ MAX_FILE = 32 * 1024 * 1024
 MAX_FRAGMENT = 256 * 1024
 CAPABILITIES = frozenset(('controls_http', 'live_aac', 'automatic_input',
     'event_cleanup', 'alarm_scope', 'event_search', 'controls_ui'))
+DEPENDENCIES = {
+    'controls_http': frozenset(('/usr/local/lib/reolink-protect-controls/protect-hook.cjs',)),
+    'live_aac': frozenset(('/usr/local/lib/reolink-protect-controls/ubv-aac-clock-compat.cjs',
+                           '/usr/local/lib/reolink-protect-controls/ubv-aac-clock-compat-all.cjs')),
+}
 
 
 class ContractError(Exception):
@@ -163,6 +168,58 @@ def transform(data, recipes):
     return candidate, results
 
 
+def reverse_owned_group(data, recipes):
+    """Remove only exact, unique owned callers of unavailable dependencies."""
+    candidate = data
+    for row in reversed(recipes):
+        after, before = row['after'], row['before']
+        occurrences = candidate.count(after)
+        if not occurrences:
+            continue
+        need(occurrences == 1 and all(candidate.count(context) == 1 for context in row['contexts']),
+             'dependency_owned_reversal_ambiguous')
+        if row['kind'] == 'prefix':
+            need(candidate.startswith(after), 'dependency_owned_reversal_ambiguous')
+            candidate = candidate[len(after):]
+        else:
+            changed = candidate.replace(after, before, 1)
+            need(changed.count(before) == 1, 'dependency_owned_reversal_ambiguous')
+            candidate = changed
+    return candidate
+
+
+def transform_with_dependencies(data, recipes, assets):
+    """Backup failure must not remove callers whose installed files are valid."""
+    ready = set(assets.get('runtimeReady', []))
+    unavailable = set(assets.get('runtimeUnavailable', []))
+    candidate, results, groups = data, [], {}
+    for row in recipes:
+        groups.setdefault(row['capability'], []).append(row)
+    for capability, rows in groups.items():
+        required = set(DEPENDENCIES.get(capability, frozenset()))
+        # A future recipe must register every external helper it introduces;
+        # a matching JavaScript anchor alone is not proof of that dependency.
+        for row in rows:
+            references = re.findall(rb'require\(\s*[\'"](/usr/local/lib/[^\'"]+)[\'"]\s*\)', row['after'])
+            for reference in references:
+                dependency = reference.decode('utf-8')
+                need(dependency in set().union(*DEPENDENCIES.values()), 'unregistered_dependency_reference')
+                required.add(dependency)
+        if required <= ready:
+            candidate, reports = _transform_group(candidate, rows)
+            results.extend(reports)
+            continue
+        missing = required & unavailable
+        previous = candidate
+        if missing:
+            candidate = reverse_owned_group(candidate, rows)
+        state = ('dependency_unavailable_removed' if candidate != previous else
+                 'dependency_unavailable' if missing else 'dependency_not_verified')
+        results.extend({'id': row['id'], 'capability': row['capability'], 'state': state}
+                       for row in rows)
+    return candidate, results
+
+
 def targets():
     yield 'service', SERVICE
     for path in sorted(UI.glob('swai*.js')):
@@ -197,12 +254,18 @@ def replace_checked(path, old, new, meta, *, syntax_check=None):
             os.unlink(temporary)
 
 
-def _run(recipe_path, *, apply=False):
+def _run(recipe_path, *, apply=False, assets_path=None, asset_prepare=None):
     raw, _ = read_secure(recipe_path, private=True)
     try:
         recipes = recipes_from_json(json.loads(raw))
     except (ValueError, UnicodeError):
         raise ContractError('invalid_recipe_json') from None
+    if asset_prepare is None:
+        from runtime_assets import prepare as asset_prepare
+    assets_path = Path(assets_path) if assets_path is not None else Path(recipe_path).with_name('assets.json')
+    need(assets_path.parent == Path(recipe_path).parent and assets_path.name == 'assets.json',
+         'invalid_asset_manifest_location')
+    assets = asset_prepare(assets_path, apply=apply)
     reports = []
     for kind, path in targets():
         selected = [row for row in recipes if row['target'] == kind]
@@ -210,7 +273,7 @@ def _run(recipe_path, *, apply=False):
             continue
         try:
             old, meta = read_secure(path)
-            candidate, rows = transform(old, selected)
+            candidate, rows = transform_with_dependencies(old, selected, assets)
             changed = apply and candidate != old
             if changed:
                 replace_checked(path, old, candidate, meta)
@@ -221,14 +284,14 @@ def _run(recipe_path, *, apply=False):
                             'operationError': str(error) if isinstance(error, ContractError) else 'operation_failed'})
     # Contract metadata alone is not an operational camera failure. Callers
     # determine health from real API, stream, recording and event probes.
-    return {'ok': not any('operationError' in row for row in reports), 'schema': 1,
+    return {'ok': assets.get('ok') is True and not any('operationError' in row for row in reports), 'schema': 1,
             'protectRestarted': False, 'files': reports,
-            'healthBasis': 'functional_probes_required', 'recipeSha256': digest(raw)}
+            'assets': assets, 'healthBasis': 'functional_probes_required', 'recipeSha256': digest(raw)}
 
 
-def run(recipe_path, *, apply=False):
+def run(recipe_path, *, apply=False, assets_path=None):
     if not apply:
-        return _run(recipe_path, apply=False)
+        return _run(recipe_path, apply=False, assets_path=assets_path)
     import fcntl
     parent = secure_path(Path(recipe_path).parent, private=True, directory=True)
     fd = os.open(parent / 'runtime-contract.lock', os.O_RDWR | os.O_CREAT
@@ -238,7 +301,7 @@ def run(recipe_path, *, apply=False):
         need(stat.S_ISREG(meta.st_mode) and meta.st_uid == 0 and meta.st_nlink == 1
              and not meta.st_mode & 0o077, 'unsafe_lock')
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return _run(recipe_path, apply=True)
+        return _run(recipe_path, apply=True, assets_path=assets_path)
     finally:
         os.close(fd)
 
@@ -246,10 +309,11 @@ def run(recipe_path, *, apply=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--recipes', type=Path, required=True)
+    parser.add_argument('--assets', type=Path, help='Pinned assets.json beside the recipes (default).')
     parser.add_argument('--check', action='store_true')
     args = parser.parse_args()
     try:
-        report = run(args.recipes, apply=not args.check)
+        report = run(args.recipes, apply=not args.check, assets_path=args.assets)
     except Exception as error:
         report = {'ok': False, 'operationError': str(error) if isinstance(error, ContractError) else 'guard_failed',
                   'protectRestarted': False}
